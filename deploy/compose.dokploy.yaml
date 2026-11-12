@@ -1,0 +1,54 @@
+x-scrs-storage-env: &scrs-storage-env
+  SCRS_DATABASE_URL: ${SCRS_DATABASE_URL:?Set SCRS_DATABASE_URL}
+  SCRS_DATABASE_SCHEMA: ${SCRS_DATABASE_SCHEMA:-scrs}
+  SCRS_REDIS_QUEUE_URL: ${SCRS_REDIS_QUEUE_URL:?Set SCRS_REDIS_QUEUE_URL}
+  SCRS_REDIS_CACHE_URL: ${SCRS_REDIS_CACHE_URL:-}
+  SCRS_S3_ENDPOINT: ${SCRS_S3_ENDPOINT:?Set SCRS_S3_ENDPOINT}
+  SCRS_S3_REGION: ${SCRS_S3_REGION:?Set SCRS_S3_REGION}
+  SCRS_S3_BUCKET: ${SCRS_S3_BUCKET:?Set SCRS_S3_BUCKET}
+  SCRS_S3_ACCESS_KEY: ${SCRS_S3_ACCESS_KEY:?Set SCRS_S3_ACCESS_KEY}
+  SCRS_S3_SECRET_KEY: ${SCRS_S3_SECRET_KEY:?Set SCRS_S3_SECRET_KEY}
+  SCRS_S3_FORCE_PATH_STYLE: ${SCRS_S3_FORCE_PATH_STYLE:-true}
+
+services:
+  scrs-storage-init:
+    image: ${SCRS_IMAGE:?Set SCRS_IMAGE to your published Docker Hub tag}
+    command: ["init"]
+    environment:
+      <<: *scrs-storage-env
+      SCRS_DATABASE_ADMIN_URL: ${SCRS_DATABASE_ADMIN_URL:-}
+      SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY to base64 of 32 bytes}
+    restart: "no"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  scrs-api:
+    image: ${SCRS_IMAGE:?Set SCRS_IMAGE to your published Docker Hub tag}
+    restart: unless-stopped
+    environment:
+      <<: *scrs-storage-env
+      SCRS_HTTP_ADDR: ":8080"
+      SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY}
+      SCRS_BOOTSTRAP_API_TOKEN: ${SCRS_BOOTSTRAP_API_TOKEN:?Set SCRS_BOOTSTRAP_API_TOKEN}
+    depends_on:
+      scrs-storage-init:
+        condition: service_completed_successfully
+    expose:
+      - "8080"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/scrs", "healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+# In Dokploy's Compose Domains UI, route your HTTPS domain to scrs-api:8080.
+# The API owns /scrs/v1; do not configure a Traefik StripPrefix middleware.

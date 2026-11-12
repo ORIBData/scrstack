@@ -5,3 +5,8 @@ clamrest
 __debug*
 .vscode
 clamav-rest
+bin/
+__pycache__/
+.env
+.env.*
+!.env.example

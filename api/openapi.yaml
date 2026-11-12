@@ -1,0 +1,182 @@
+openapi: 3.1.0
+info:
+  title: Supply Chain Risk Stack API
+  version: 0.1.0
+  description: Foundation API with provider connection management. Assessment and remediation operations are not yet implemented.
+servers:
+  - url: /scrs/v1
+paths:
+  /assets:
+    get:
+      operationId: listAssets
+      summary: Page through discovered assets with connection and in-scope flags
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': { description: Asset page with items and next_cursor }
+        '401': { description: Missing or invalid admin token }
+  /connections:
+    get:
+      operationId: listConnections
+      summary: List provider connections without credentials
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Connection list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Connection' }
+        '401': { description: Missing or invalid admin token }
+    post:
+      operationId: createConnection
+      summary: Create a provider connection
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConnection' }
+      responses:
+        '201':
+          description: Connection created; credential omitted from response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Connection' }
+        '400': { description: Invalid connection }
+        '401': { description: Missing or invalid admin token }
+        '409': { description: Connection name already exists }
+  /connections/{id}:
+    get:
+      operationId: getConnection
+      summary: Get one connection without its credential
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200':
+          description: Connection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Connection' }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+  /connections/{id}:test:
+    post:
+      operationId: testConnection
+      summary: Test credential and count visible resources
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': { description: Credential accepted and resource count returned }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+        '502': { description: Provider test failed }
+  /connections/{id}:discover:
+    post:
+      operationId: discoverConnection
+      summary: Discover accessible resources and mark matching assets in scope
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': { description: Discovery result }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+        '502': { description: Provider discovery failed }
+  /system/healthz:
+    get:
+      operationId: getHealth
+      summary: Process liveness
+      responses:
+        '200':
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /system/readyz:
+    get:
+      operationId: getReadiness
+      summary: PostgreSQL, Redis and S3 readiness
+      responses:
+        '200':
+          description: Configured backing services are available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: A backing service is unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+  /docs/openapi.yaml:
+    get:
+      operationId: getOpenAPI
+      summary: Download this OpenAPI contract
+      responses:
+        '200':
+          description: OpenAPI YAML document
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      operationId: getSwaggerUI
+      summary: Swagger UI
+      responses:
+        '200':
+          description: Interactive API documentation
+          content:
+            text/html:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Scope:
+      type: object
+      required: [include]
+      properties:
+        include: {type: array, items: {type: string}}
+        exclude: {type: array, items: {type: string}}
+    Connection:
+      type: object
+      required: [id, provider, name, config, scope, status]
+      properties:
+        id: {type: string, format: uuid}
+        provider: {type: string, enum: [github, dockerhub, gar]}
+        name: {type: string}
+        config: {type: object, additionalProperties: true}
+        scope: { $ref: '#/components/schemas/Scope' }
+        status: {type: object, additionalProperties: true}
+    CreateConnection:
+      type: object
+      required: [provider, name, config, scope, credential]
+      properties:
+        provider: {type: string, enum: [github, dockerhub, gar]}
+        name: {type: string}
+        config: {type: object, additionalProperties: true}
+        scope: { $ref: '#/components/schemas/Scope' }
+        credential:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
