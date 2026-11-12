@@ -21,6 +21,7 @@ class DeploymentTest(unittest.TestCase):
             'SCRS_S3_ENDPOINT': 'https://s3.example.com',
             'SCRS_S3_REGION': 'test-region', 'SCRS_S3_BUCKET': 'test-bucket',
             'SCRS_S3_ACCESS_KEY': 'synthetic', 'SCRS_S3_SECRET_KEY': 'synthetic',
+            'SCRS_SCANNER_API_TOKEN': 'synthetic-scanner-token-at-least-32-characters',
             'SCRS_MASTER_KEY': 'synthetic', 'SCRS_BOOTSTRAP_API_TOKEN': 'synthetic-token',
         }
         with tempfile.NamedTemporaryFile(mode='w') as env:
@@ -37,3 +38,12 @@ class DeploymentTest(unittest.TestCase):
         self.assertEqual(labels['traefik.http.middlewares.scrs-staging-https.redirectscheme.scheme'],'https')
         self.assertFalse(any('stripprefix' in key.lower() for key in labels))
         self.assertEqual(config['services']['scrs-storage-init']['labels']['traefik.enable'],'false')
+
+        scanner=config['services']['scrs-scanner']
+        self.assertEqual(set(scanner['networks']), {'scanning'})
+        self.assertTrue(config['networks']['scanning']['internal'])
+        for service in ['scrs-scanner', 'scrs-feed-sync', 'scrs-egress-proxy']:
+            env=config['services'][service].get('environment', {})
+            self.assertFalse(set(env) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN'})
+            self.assertNotIn('ports', config['services'][service])
+        self.assertEqual(scanner['environment']['SCRS_REMEDIATION_ENABLED'], 'false')

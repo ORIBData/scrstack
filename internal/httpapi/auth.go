@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
@@ -24,6 +25,11 @@ type TokenStore interface {
 }
 type principalKey struct{}
 type Security struct {
+	RemediationEnabled bool
+	Assessments        *assessments.Store
+	Artifacts          interface {
+		GetSBOM(context.Context, string) ([]byte, error)
+	}
 	Store          TokenStore
 	Redis          *redis.Client
 	DocsPublic     bool
@@ -57,6 +63,16 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
 	mux.Handle(BasePath+"/tokens", security.protect("admin", http.HandlerFunc(security.tokens)))
 	mux.Handle(BasePath+"/tokens/", security.protect("admin", http.HandlerFunc(security.tokens)))
+	if security.Assessments != nil {
+		h := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts, remediationEnabled: security.RemediationEnabled}
+		mux.Handle("POST "+BasePath+"/assessments", security.protect("write|trigger", h))
+		mux.Handle("GET "+BasePath+"/assessments", security.protect("read|write|trigger", h))
+		mux.Handle(BasePath+"/assessments/", security.protect("read|write|trigger", h))
+		mux.Handle("GET "+BasePath+"/remediation/capabilities", security.protect("read|write", h))
+		mux.Handle("POST "+BasePath+"/assets/{id}/remediations", security.protect("write", h))
+		mux.Handle(BasePath+"/register", security.protect("read|write", h))
+		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
+	}
 	return security.cors(mux)
 }
 func (s Security) protect(scope string, next http.Handler) http.Handler {
@@ -87,7 +103,13 @@ func (s Security) protect(scope string, next http.Handler) http.Handler {
 			}
 			return
 		}
-		if scope != "" && !principal.Allows(scope) {
+		allowedScope := scope == ""
+		for _, value := range strings.Split(scope, "|") {
+			if principal.Allows(value) {
+				allowedScope = true
+			}
+		}
+		if !allowedScope {
 			writeError(w, 403, "insufficient scope")
 			return
 		}

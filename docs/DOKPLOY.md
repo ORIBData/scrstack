@@ -87,3 +87,14 @@ characters to use streaming scan routes. `/scanFile` and `/scanPath` are retired
 with HTTP 410; clients must upload content. The SCRS API image contains none of
 these legacy routes. Older upstream Kubernetes manifests/documentation are not a
 supported SCRS production deployment and must not be deployed as this product.
+
+## Assessment services
+
+The Compose file now also starts worker, offline scanner, OSV feed synchronization
+and a restricted remediation egress proxy using the same SCRS image. Set a distinct
+random `SCRS_SCANNER_API_TOKEN`; set `SCRS_OSV_ECOSYSTEMS` to the required package
+ecosystems. Keep `SCRS_REMEDIATION_ENABLED=false` until staging acceptance. Only the
+API joins Traefik's external network. Feed download must complete before scanner
+readiness allows the worker to start. PostgreSQL, Redis and evidence S3 stay external.
+The rebuildable feed cache is a local Docker volume. Review scanner resource limits
+and [pipeline operating constraints](ASSESSMENT_PIPELINE.md) before deploying.

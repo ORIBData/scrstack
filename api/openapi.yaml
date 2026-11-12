@@ -2,10 +2,199 @@ openapi: 3.1.0
 info:
   title: Supply Chain Risk Stack API
   version: 0.1.0
-  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. Assessment and remediation operations are not yet implemented.
+  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. GitHub assessment jobs provide offline OSV matching, CycloneDX SBOMs and persisted findings. Missing malware, IOC and integrity stages force incomplete verdicts. Guided npm remediation is opt-in advice only.
 servers:
   - url: /scrs/v1
 paths:
+  /assessments:
+    post:
+      operationId: createAssessment
+      summary: Queue assessment of a discovered, permitted GitHub repository (write or trigger)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}, description: Actor-scoped replay key retained for 24 hours}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target]
+              properties:
+                connection: {type: string, description: Connection name or UUID; required when ambiguous}
+                target:
+                  type: object
+                  additionalProperties: false
+                  required: [type, repository]
+                  properties:
+                    type: {type: string, enum: [git]}
+                    repository: {type: string, example: organization/repository}
+                    ref: {type: string, default: HEAD}
+                    commit: {type: string, pattern: '^[a-fA-F0-9]{40}$'}
+                trigger:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    origin: {type: string, maxLength: 100}
+                    event: {type: string, maxLength: 100}
+                    delivery_id: {type: string, maxLength: 128}
+                    actor: {type: string, maxLength: 100}
+      responses:
+        '202': {description: Durably queued; Location identifies the assessment}
+        '200': {description: Idempotent replay}
+        '400': {description: Invalid or unsupported target}
+        '404': {description: Asset not registered or outside scope}
+        '409': {description: Idempotency key reused for different request}
+        '422': {description: Multiple connections match}
+        '429': {description: Queue capacity or token rate limit reached}
+    get:
+      operationId: listAssessments
+      summary: List jobs; trigger-only callers see only their own jobs
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+        - {name: status, in: query, schema: {type: string, enum: [queued, running, succeeded, failed, cancelled, superseded]}}
+      responses:
+        '200': {description: Up to 100 items with next_cursor}
+  /assessments/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getAssessment
+      summary: Read status, immutable revision, coverage, counts and verdict
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Assessment; succeeded describes execution and does not imply a pass verdict}
+        '404': {description: Assessment unavailable to caller}
+    delete:
+      operationId: cancelAssessment
+      summary: Cancel a pending job without deleting history (write or own trigger job)
+      security: [{bearerAuth: []}]
+      responses:
+        '204': {description: Cancelled; stale workers cannot publish results}
+        '409': {description: Job already terminal}
+  /register:
+    get:
+      operationId: listFindings
+      summary: Persistent finding register (read or write)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Up to 100 findings with next_cursor}
+  /register/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    patch:
+      operationId: transitionFinding
+      summary: Audit a status change; accepted, suppressed and false_positive require admin
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [status, reason]
+              properties:
+                status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive]}
+                reason: {type: string, minLength: 8, maxLength: 2000}
+                expires_at: {type: string, format: date-time, description: Required only for accepted; future and at most 90 days}
+      responses:
+        '204': {description: Status and audit event persisted atomically}
+        '400': {description: Invalid transition or expiry}
+        '403': {description: Insufficient scope}
+  /register/{id}/events:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: findingEvents
+      security: [{bearerAuth: []}]
+      summary: Latest 100 detection and status events
+      responses:
+        '200': {description: Events newest first}
+  /remediation/capabilities:
+    get:
+      operationId: remediationCapabilities
+      security: [{bearerAuth: []}]
+      summary: Runtime capability and enablement; npm in-place only, Maven unavailable
+      responses:
+        '200': {description: Capability matrix; repository_writes is always false}
+  /assets/{id}/remediations:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: createRemediationPlan
+      security: [{bearerAuth: []}]
+      summary: Queue advice for a prior assessed npm package-lock.json at its exact commit (write)
+      parameters: [{name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [assessment_id, manifest]
+              properties:
+                assessment_id: {type: string, format: uuid}
+                manifest: {type: string, example: package-lock.json}
+                strategy: {type: string, enum: [in-place], default: in-place}
+      responses:
+        '202': {description: Plan queued with assessment Location}
+        '200': {description: Idempotent replay}
+        '400': {description: Unsupported manifest or parent assessment}
+        '503': {description: Remediation sandbox disabled}
+  /assessments/{id}/components:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentComponents
+      security: [{bearerAuth: []}]
+      summary: Component inventory with ordinal cursor
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/findings:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentFindings
+      security: [{bearerAuth: []}]
+      summary: Immutable detection snapshots with UUID cursor
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/sbom:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentSbom
+      security: [{bearerAuth: []}]
+      summary: CycloneDX 1.6 JSON with SHA256 ETag; format=cyclonedx-json
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/report:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentReport
+      security: [{bearerAuth: []}]
+      summary: Assessment summary in JSON or format=md; coverage remains explicit
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/remediation:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentRemediation
+      security: [{bearerAuth: []}]
+      summary: Guided remediation JSON advice; never applies changes to the provider
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
   /tokens:
     get:
       operationId: listTokens

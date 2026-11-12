@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
@@ -111,6 +112,7 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 		)`,
 		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true`,
 		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1`,
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS configuration_revision bigint NOT NULL DEFAULT 1`,
 		`ALTER TABLE ` + schema + `.assets DROP CONSTRAINT IF EXISTS assets_type_locator_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS assets_connection_locator_uq ON ` + schema + `.assets(connection_id,type,locator)`,
 		`CREATE INDEX IF NOT EXISTS assets_connection_idx ON ` + schema + `.assets(connection_id)`,
@@ -131,7 +133,12 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			return errors.New("PostgreSQL connection migration failed; check schema ownership and CREATE permission")
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111202) ON CONFLICT DO NOTHING`); err != nil {
+	for _, ddl := range assessments.Schema(schema) {
+		if _, err := tx.Exec(ctx, ddl); err != nil {
+			return errors.New("assessment schema migration failed")
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111204) ON CONFLICT DO NOTHING`); err != nil {
 		return errors.New("PostgreSQL migration version record failed")
 	}
 	if err := tx.Commit(ctx); err != nil {

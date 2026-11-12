@@ -18,15 +18,16 @@ import (
 )
 
 type Connection struct {
-	ID        uuid.UUID       `json:"id"`
-	Provider  string          `json:"provider"`
-	Name      string          `json:"name"`
-	Config    json.RawMessage `json:"config"`
-	Scope     Scope           `json:"scope"`
-	Status    json.RawMessage `json:"status"`
-	UpdatedAt time.Time       `json:"-"`
-	Revision  int64           `json:"-"`
-	Enabled   bool            `json:"enabled"`
+	ConfigurationRevision int64           `json:"-"`
+	ID                    uuid.UUID       `json:"id"`
+	Provider              string          `json:"provider"`
+	Name                  string          `json:"name"`
+	Config                json.RawMessage `json:"config"`
+	Scope                 Scope           `json:"scope"`
+	Status                json.RawMessage `json:"status"`
+	UpdatedAt             time.Time       `json:"-"`
+	Revision              int64           `json:"-"`
+	Enabled               bool            `json:"enabled"`
 }
 
 type Scope struct {
@@ -169,7 +170,7 @@ func (s *Store) Put(ctx context.Context, c Connection, credential json.RawMessag
 	if replace {
 		query += `UPDATE SET config=EXCLUDED.config,
 			scope=EXCLUDED.scope, credential_ciphertext=EXCLUDED.credential_ciphertext,
-			status=CASE WHEN connections.enabled THEN '{"state":"pending"}'::jsonb ELSE '{"state":"disabled"}'::jsonb END, updated_at=clock_timestamp(), revision=connections.revision+1 WHERE connections.provider=EXCLUDED.provider RETURNING id`
+			status=CASE WHEN connections.enabled THEN '{"state":"pending"}'::jsonb ELSE '{"state":"disabled"}'::jsonb END, updated_at=clock_timestamp(), revision=connections.revision+1,configuration_revision=connections.configuration_revision+1 WHERE connections.provider=EXCLUDED.provider RETURNING id`
 	} else {
 		query += `NOTHING RETURNING id`
 	}
@@ -267,8 +268,8 @@ func (s *Store) listConnections(ctx context.Context, after string, limit int) ([
 func (s *Store) Get(ctx context.Context, name string) (Connection, json.RawMessage, error) {
 	var c Connection
 	var rawScope, ciphertext []byte
-	err := s.pool.QueryRow(ctx, `SELECT id, provider, name, config, scope, status, credential_ciphertext, updated_at, enabled, revision FROM `+s.schema+`.connections WHERE name=$1`, name).
-		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &ciphertext, &c.UpdatedAt, &c.Enabled, &c.Revision)
+	err := s.pool.QueryRow(ctx, `SELECT id, provider, name, config, scope, status, credential_ciphertext, updated_at, enabled, revision, configuration_revision FROM `+s.schema+`.connections WHERE name=$1`, name).
+		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &ciphertext, &c.UpdatedAt, &c.Enabled, &c.Revision, &c.ConfigurationRevision)
 	if err != nil {
 		return c, nil, errors.New("connection not found")
 	}

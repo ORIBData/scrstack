@@ -56,7 +56,7 @@ func (s *Store) Change(ctx context.Context, id uuid.UUID, scope *Scope, enabled 
 		return c, errors.New("connection change transaction failed")
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET scope=$2,enabled=$3,credential_ciphertext=$4,status=$5,updated_at=clock_timestamp(),revision=revision+1 WHERE id=$1 AND revision=$6`, id, scopeJSON, c.Enabled, encrypted, status, c.Revision)
+	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET scope=$2,enabled=$3,credential_ciphertext=$4,status=$5,updated_at=clock_timestamp(),revision=revision+1,configuration_revision=configuration_revision+1 WHERE id=$1 AND revision=$6`, id, scopeJSON, c.Enabled, encrypted, status, c.Revision)
 	if err != nil {
 		return c, errors.New("connection change failed")
 	}

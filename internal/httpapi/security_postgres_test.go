@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/google/uuid"
@@ -55,7 +56,12 @@ func TestPostgresManagedSecurityAndLifecycle(t *testing.T) {
 	}
 	client := redis.NewClient(opts)
 	defer client.Close()
-	handler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: client})
+	jobs, err := assessments.Open(ctx, databaseURL, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobs.Close()
+	handler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: client, Assessments: jobs})
 	request := func(method, path, token, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, BasePath+path, strings.NewReader(body))
 		r.RemoteAddr = "192.0.2.1:1234"
@@ -133,6 +139,41 @@ func TestPostgresManagedSecurityAndLifecycle(t *testing.T) {
 	if _, err := store.Discover(ctx, "test", fixtureInventory{}); err != nil {
 		t.Fatal(err)
 	}
+
+	trigger, triggerSecret, err := store.CreateToken(ctx, connections.Token{Name: "trigger", Scopes: []string{"trigger"}}, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherTrigger, err := store.CreateToken(ctx, connections.Token{Name: "other-trigger", Scopes: []string{"trigger"}}, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, readerSecret, err := store.CreateToken(ctx, connections.Token{Name: "job-reader", Scopes: []string{"read"}}, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"target":{"type":"git","repository":"org/api"}}`
+	mustStatus(request("POST", "/assessments", readerSecret, body), 403)
+	w = request("POST", "/assessments", triggerSecret, body)
+	mustStatus(w, 202)
+	var job assessments.Assessment
+	if err := json.Unmarshal(w.Body.Bytes(), &job); err != nil {
+		t.Fatal(err)
+	}
+	jobPath := "/assessments/" + job.ID.String()
+	mustStatus(request("GET", jobPath, otherTrigger, ""), 404)
+	mustStatus(request("GET", jobPath+"/findings", otherTrigger, ""), 404)
+	mustStatus(request("DELETE", jobPath, readerSecret, ""), 403)
+	mustStatus(request("POST", "/assessments", triggerSecret, `{"target":{"type":"git","repository":"org/api"},"remediation":{"manifest":"package-lock.json"}}`), 400)
+	mustStatus(request("GET", "/register", triggerSecret, ""), 403)
+	mustStatus(request("POST", "/assets/"+job.AssetID.String()+"/remediations", triggerSecret, `{}`), 403)
+	mustStatus(request("GET", jobPath, triggerSecret, ""), 200)
+	mustStatus(request("DELETE", jobPath, triggerSecret, ""), 204)
+	savedJob, err := jobs.Get(ctx, job.ID)
+	if err != nil || savedJob.Status != "cancelled" || savedJob.ActorID != trigger.ID {
+		t.Fatal("job cancellation not persisted", err)
+	}
+	mustStatus(request("POST", "/assessments", admin, `{"target":{"type":"git","repository":"outside/repo"}}`), 404)
 	mustStatus(request("PATCH", "/connections/"+c.ID.String(), admin, `{"enabled":false}`), 200)
 	stored, _, err := store.Get(ctx, "test")
 	if err != nil || stored.Enabled {

@@ -19,6 +19,7 @@ SCRS_REPO_TAG_PREFIX ?= scrs_
 help:
 	@echo 'build           Build the SCRS API binary locally'
 	@echo 'test            Run Go tests and the race detector'
+	@echo 'scanner-test    Run pinned upstream OSV against adversarial offline fixtures'
 	@echo 'lint            Format check and go vet'
 	@echo 'contract-check  Validate the published OpenAPI route paths'
 	@echo 'image           Build a local SCRS API image'
@@ -110,3 +111,11 @@ qa: test lint contract-check
 legacy-integration:
 	$(DOCKER) build -f Dockerfile.test -t scrs:legacy-test .
 	$(DOCKER) run --rm --memory=2g --cpus=2 scrs:legacy-test
+
+# Build the exact dependency graph used in the shipped scanner, then run a real
+# offline scan against synthetic advisories. Does not use .env or live stores.
+.PHONY: scanner-test
+scanner-test:
+	@mkdir -p bin
+	cd tools/osv && $(GO) build -trimpath -o ../../bin/osv-scanner github.com/google/osv-scanner/v2/cmd/osv-scanner
+	SCRS_TEST_OSV_BINARY="$(CURDIR)/bin/osv-scanner" $(GO) test -race -count=1 ./internal/scanner

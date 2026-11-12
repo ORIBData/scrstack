@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/httpapi"
 	"github.com/ORIBData/scrstack/internal/storage"
@@ -21,6 +22,14 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy") {
+		if err := pipelineCommand(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	if len(os.Args) > 1 && (os.Args[1] == "init" || os.Args[1] == "connections") {
 		if err := manageConnections(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -95,6 +104,17 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	assessmentStore, err := assessments.Open(context.Background(), cfg.DatabaseURL, cfg.DatabaseSchema)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "assessment store unavailable")
+		os.Exit(1)
+	}
+	defer assessmentStore.Close()
+	artifacts, err := storage.NewArtifacts(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "artifact store unavailable")
+		os.Exit(1)
+	}
 	authCtx, authCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	generated, err := store.SyncBootstrap(authCtx, bootstrapToken)
 	authCancel()
@@ -144,7 +164,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Assessments: assessmentStore, Artifacts: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

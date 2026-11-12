@@ -21,12 +21,17 @@ jobs:
           cache: true
       - name: Race tests, lint, contracts and deployment configuration
         run: make qa
+      - name: Pinned upstream scanner and untrusted repository regressions
+        run: make scanner-test
       - name: PostgreSQL, Redis, authorization and restore regressions
         run: make database-test
       - name: API image and disposable hosted-storage integration
         run: make storage-integration
       - name: Go vulnerability assessment
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: Scanner dependency vulnerability assessment
+        working-directory: tools/osv
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 github.com/google/osv-scanner/v2/cmd/osv-scanner
   images:
     runs-on: ubuntu-latest
     timeout-minutes: 20
