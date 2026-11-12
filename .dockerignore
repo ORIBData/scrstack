@@ -4,3 +4,6 @@
 bin
 *.test
 Gopkg.lock
+
+!eicar.test
+artifacts

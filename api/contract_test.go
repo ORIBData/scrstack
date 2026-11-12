@@ -22,7 +22,7 @@ func TestOpenAPIUsesSCRSModulePaths(t *testing.T) {
 		t.Fatalf("unexpected OpenAPI version or server: %#v", contract)
 	}
 	for path := range contract.Paths {
-		if !strings.HasPrefix(path, "/system/") && !strings.HasPrefix(path, "/docs") && !strings.HasPrefix(path, "/connections") && !strings.HasPrefix(path, "/assets") {
+		if !strings.HasPrefix(path, "/system/") && !strings.HasPrefix(path, "/docs") && !strings.HasPrefix(path, "/connections") && !strings.HasPrefix(path, "/assets") && !strings.HasPrefix(path, "/tokens") {
 			t.Errorf("path %q does not use a module", path)
 		}
 	}

@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from image_reference import configured_image, valid_repository
 
 
 def docker(*args):
@@ -16,14 +17,9 @@ def docker(*args):
 
 def configured_repository():
     """Read only the image reference; never load the entire dotenv as shell."""
-    path = Path(".env")
-    if not path.is_file():
-        return ""
-    for line in path.read_text().splitlines():
-        if line.startswith("SCRS_IMAGE="):
-            image = line.split("=", 1)[1].strip().strip("\"'")
-            return image.rsplit(":", 1)[0] if ":" in image else image
-    return ""
+    image = configured_image()
+    return image.rsplit(":", 1)[0] if ":" in image.rsplit("/", 1)[-1] else image
+
 
 
 def main():
@@ -36,8 +32,8 @@ def main():
     if not args.image_name or "/" in args.image_name or ":" in args.image_name:
         parser.error("--image-name must be a local repository name")
     repository = args.repository or configured_repository()
-    if repository and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*/[a-z0-9]+(?:[._-][a-z0-9]+)*", repository):
-        parser.error("--repository must be a Docker Hub namespace/repository")
+    if repository and not valid_repository(repository):
+        parser.error("--repository must be a full registry repository")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.repository_tag_prefix):
         parser.error("--repository-tag-prefix must be a nonempty Docker tag prefix")
 

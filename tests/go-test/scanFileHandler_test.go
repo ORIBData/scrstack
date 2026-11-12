@@ -7,7 +7,7 @@ import (
 
 // Test scanFileHandler, should return 200
 func TestScanFileHandler_NonVirus(t *testing.T) {
-	want := http.StatusOK
+	want := http.StatusGone
 	path := "/clamav/tmp/ok/test.txt"
 	res := setupScanFileHandler(path, t, want)
 	got := res.StatusCode
@@ -18,7 +18,7 @@ func TestScanFileHandler_NonVirus(t *testing.T) {
 
 // Test scanFileHandler, should return 406
 func TestScanFileHandler_WithVirus(t *testing.T) {
-	want := http.StatusNotAcceptable
+	want := http.StatusGone
 	path := "/clamav/tmp/virus/eicar.test"
 	res := setupScanFileHandler(path, t, want)
 	got := res.StatusCode

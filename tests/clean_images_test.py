@@ -29,7 +29,7 @@ class CleanImagesTest(unittest.TestCase):
                 return json.dumps([{"Image": "sha256:used"}])
             raise AssertionError(args)
 
-        with mock.patch.object(clean_images, "docker", side_effect=fake_docker), mock.patch.object(clean_images.subprocess, "run") as remove, mock.patch.object(sys, "argv", ["clean_images.py", "--image-name", "scrs"]), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(clean_images, "docker", side_effect=fake_docker), mock.patch.object(clean_images.subprocess, "run") as remove, mock.patch.object(sys, "argv", ["clean_images.py", "--image-name", "scrs", "--repository", "example/scrs"]), contextlib.redirect_stdout(io.StringIO()):
             remove.return_value.returncode = 0
             self.assertEqual(clean_images.main(), 0)
         remove.assert_called_once()

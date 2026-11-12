@@ -42,6 +42,12 @@ class ReleaseTest(unittest.TestCase):
             self.assertIn("use a tag beginning scrs_", output.decode(errors="replace"))
 
     def test_uses_explicit_repo_and_preserves_engine_with_isolated_login(self):
+        self.check_registry_release(False)
+
+    def test_gar_login_and_repository(self):
+        self.check_registry_release(True)
+
+    def check_registry_release(self, gar):
         with tempfile.TemporaryDirectory() as directory:
             fake_docker = pathlib.Path(directory, "docker")
             log = pathlib.Path(directory, "calls.jsonl")
@@ -56,11 +62,13 @@ if args == ['info']:
     assert pathlib.Path(os.environ['DOCKER_CONFIG']).is_dir()
 if args[:1] == ['login']:
     assert sys.stdin.read() == 'synthetic-pat'
+    if os.environ.get('GAR_TEST'):
+        assert args[1:4] == ['europe-west2-docker.pkg.dev', '--username', 'oauth2accesstoken']
     print('Login Succeeded')
 if args[:2] == ['buildx', 'build']:
     assert os.environ.get('DOCKER_HOST') == 'unix:///tmp/synthetic-docker.sock'
     assert '--push' in args
-    assert args[args.index('-t')+1] == 'oribdata/zerorate-stg:scrs_staging'
+    assert args[args.index('-t')+1] == os.environ['EXPECTED_IMAGE']
     assert args[args.index('--platform')+1] == 'linux/amd64'
 with open(os.environ['RELEASE_TEST_LOG'], 'a') as output:
     output.write(json.dumps({'args': args, 'config': os.environ.get('DOCKER_CONFIG')})+'\\n')
@@ -71,9 +79,14 @@ with open(os.environ['RELEASE_TEST_LOG'], 'a') as output:
             env.update(DOCKER=str(fake_docker), DOCKERHUB_REPO="oribdata/zerorate-stg", VERSION="scrs_staging", PLATFORMS="linux/amd64", RELEASE_TEST_LOG=str(log))
             env.pop("DOCKER_HOST", None)
             env.pop("DOCKER_CONTEXT", None)
+            env["EXPECTED_IMAGE"] = "oribdata/zerorate-stg:scrs_staging"
+            env["SCRS_IMAGE"] = ""
+            if gar:
+                env.update(GAR_TEST="1", DOCKERHUB_REPO="", SCRS_IMAGE="europe-west2-docker.pkg.dev/project/repository/scrs:scrs_staging")
+                env["EXPECTED_IMAGE"] = env["SCRS_IMAGE"]
             process = subprocess.Popen(["bash", str(RELEASE)], stdin=slave, stdout=slave, stderr=slave, env=env, cwd=RELEASE.parent.parent)
             os.close(slave)
-            os.write(master, b"orishane\nsynthetic-pat\n")
+            os.write(master, b"synthetic-pat\n" if gar else b"orishane\nsynthetic-pat\n")
             output = bytearray()
             deadline = time.monotonic() + 10
             while process.poll() is None and time.monotonic() < deadline:

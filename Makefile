@@ -1,9 +1,14 @@
 SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
+.PHONY: database-test
+database-test:
+	DOCKER=$(DOCKER) GO=$(GO) bash scripts/test_database.sh
+
 GO ?= go
 DOCKER ?= docker
-VERSION ?= dev
+VERSION ?=
+SCRS_IMAGE ?=
 IMAGE_NAME ?= scrs
 PLATFORMS ?= linux/amd64,linux/arm64
 DOCKERHUB_REPO ?=
@@ -17,6 +22,11 @@ help:
 	@echo 'lint            Format check and go vet'
 	@echo 'contract-check  Validate the published OpenAPI route paths'
 	@echo 'image           Build a local SCRS API image'
+	@echo 'image-reference Print the resolved SCRS_IMAGE release tag'
+	@echo 'image-audit     Generate SBOM and vulnerability evidence for a local image'
+	@echo 'database-test   Exercise concurrency, tokens, lifecycle and PostgreSQL restore'
+	@echo 'legacy-integration  Test the internal legacy scanner with ClamAV fixtures'
+	@echo 'qa              Run local tests, lint, contracts and tooling checks'
 	@echo 'clean           Remove older local SCRS images; keep newest and container-used images'
 	@echo 'clean-dry-run   Preview which local SCRS image tags would be removed'
 	@echo 'storage-check   Test the configured PostgreSQL, Redis and S3 stores'
@@ -26,7 +36,7 @@ help:
 	@echo 'connections-test  Test one provider connection (CONNECTION=github-primary)'
 	@echo 'connections-discover  Discover one or all connections (CONNECTION=all)'
 	@echo 'storage-integration  Test bootstrap and connection checks with disposable Docker services'
-	@echo 'release         Push DOCKERHUB_REPO=namespace/name:VERSION using an interactive Docker Hub login'
+	@echo 'release         Push SCRS_IMAGE using interactive registry credentials'
 
 build:
 	@mkdir -p bin
@@ -37,19 +47,19 @@ test:
 
 lint:
 	@test -z "$$(find cmd/scrs internal api -name '*.go' -print0 | xargs -0 gofmt -l)" || { echo 'Go files needed formatting'; exit 1; }
-	$(GO) vet ./cmd/scrs/... ./internal/... ./api/...
+	$(GO) vet ./...
 
 contract-check:
 	$(GO) test ./internal/httpapi/... ./api/...
 
 image:
-	$(DOCKER) build -f deploy/Dockerfile.scrs -t $(IMAGE_NAME):$(VERSION) .
+	@SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py bash -c '"$$0" build -f deploy/Dockerfile.scrs -t "$$SCRS_IMAGE" .' "$(DOCKER)"
 
 clean:
-	DOCKER=$(DOCKER) python3 scripts/clean_images.py --image-name "$(IMAGE_NAME)" --repository "$(DOCKERHUB_REPO)" --repository-tag-prefix "$(SCRS_REPO_TAG_PREFIX)"
+	SCRS_IMAGE="$(SCRS_IMAGE)" DOCKER=$(DOCKER) python3 scripts/clean_images.py --image-name "$(IMAGE_NAME)" --repository "$(DOCKERHUB_REPO)" --repository-tag-prefix "$(SCRS_REPO_TAG_PREFIX)"
 
 clean-dry-run:
-	DOCKER=$(DOCKER) python3 scripts/clean_images.py --image-name "$(IMAGE_NAME)" --repository "$(DOCKERHUB_REPO)" --repository-tag-prefix "$(SCRS_REPO_TAG_PREFIX)" --dry-run
+	SCRS_IMAGE="$(SCRS_IMAGE)" DOCKER=$(DOCKER) python3 scripts/clean_images.py --image-name "$(IMAGE_NAME)" --repository "$(DOCKERHUB_REPO)" --repository-tag-prefix "$(SCRS_REPO_TAG_PREFIX)" --dry-run
 
 storage-check: build
 	@python3 scripts/run_with_env.py bin/scrs storage check
@@ -70,7 +80,7 @@ connections-discover: build
 	@python3 scripts/run_with_env.py bin/scrs connections discover "$(or $(CONNECTION),all)"
 
 storage-integration:
-	@$(MAKE) image VERSION=storage-test
+	@$(DOCKER) build -f deploy/Dockerfile.scrs -t scrs:storage-test .
 	@set -e; \
 	  compose='$(DOCKER) compose -p scrs-storage-qa -f tests/integration/storage.compose.yaml'; \
 	  trap "$$compose down -v" EXIT; \
@@ -82,4 +92,21 @@ storage-integration:
 	  $$compose run --rm --no-deps storage-bootstrap
 
 release:
-	DOCKER=$(DOCKER) VERSION=$(VERSION) PLATFORMS=$(PLATFORMS) DOCKERHUB_REPO=$(DOCKERHUB_REPO) SCRS_REPO_TAG_PREFIX=$(SCRS_REPO_TAG_PREFIX) ./scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_IMAGE)" PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py bash scripts/release.sh
+
+.PHONY: image-reference
+image-reference:
+	@SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py
+
+.PHONY: image-audit qa
+image-audit:
+	@DOCKER="$(DOCKER)" SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py python3 scripts/audit_image.py
+
+qa: test lint contract-check
+	$(GO) test -race . -run 'TestLegacySecurity|TestMalformedMultipart'
+	python3 -m unittest discover -s tests -p '*_test.py'
+
+.PHONY: legacy-integration
+legacy-integration:
+	$(DOCKER) build -f Dockerfile.test -t scrs:legacy-test .
+	$(DOCKER) run --rm --memory=2g --cpus=2 scrs:legacy-test

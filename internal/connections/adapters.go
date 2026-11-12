@@ -330,6 +330,9 @@ func (a NativeAdapters) gar(ctx context.Context, c Connection, secret json.RawMe
 				return nil, err
 			}
 			resources = append(resources, images...)
+			if len(resources) > 10000 {
+				return nil, errors.New("GAR inventory exceeds 10000 resources")
+			}
 		}
 		if result.Next == "" {
 			return resources, nil

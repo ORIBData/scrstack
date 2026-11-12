@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
@@ -33,8 +34,8 @@ func HandlerWithConnections(check func(context.Context) error, store ConnectionS
 	mux.Handle("GET "+BasePath+"/docs/swagger-ui.css", swaggerAsset("swagger/swagger-ui.css", "text/css; charset=utf-8"))
 	mux.Handle("GET "+BasePath+"/docs/swagger-ui-bundle.js", swaggerAsset("swagger/swagger-ui-bundle.js", "text/javascript; charset=utf-8"))
 	mux.Handle("GET "+BasePath+"/docs/init.js", swaggerAsset("swagger/init.js", "text/javascript; charset=utf-8"))
-	if store != nil {
-		connections := connectionHandler{store: store, tokenHash: hashToken(bootstrapToken)}
+	if store != nil && len(bootstrapToken) >= 32 {
+		connections := connectionHandler{store: store, tokenHash: hashToken(bootstrapToken), providerSlots: make(chan struct{}, 4)}
 		mux.Handle("GET "+BasePath+"/connections", connections)
 		mux.Handle("POST "+BasePath+"/connections", connections)
 		mux.Handle(BasePath+"/connections/", connections)
@@ -47,15 +48,21 @@ func readiness(check func(context.Context) error) http.Handler {
 	var mu sync.Mutex
 	var checkedAt time.Time
 	var lastErr error
+	var checking bool
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
-		if check != nil && time.Since(checkedAt) >= 10*time.Second {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			lastErr = check(ctx)
-			checkedAt = time.Now()
-			cancel()
-		}
 		err := lastErr
+		if check != nil && time.Since(checkedAt) >= 10*time.Second && !checking {
+			checking = true
+			mu.Unlock()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			err = check(ctx)
+			cancel()
+			mu.Lock()
+			lastErr, checkedAt, checking = err, time.Now(), false
+		} else if check != nil && checkedAt.IsZero() {
+			err = errors.New("initial readiness check in progress")
+		}
 		mu.Unlock()
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")

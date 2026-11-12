@@ -1,0 +1,89 @@
+# Dokploy deployment contract
+
+Use `deploy/compose.dokploy.yaml` with a concrete published `SCRS_IMAGE`. Run
+`make image-reference` before building/releasing, then copy the resolved value
+into Dokploy. The date/hash placeholders are a Make template, not Compose syntax.
+
+Set the following for each environment:
+
+```dotenv
+SCRS_DOMAIN=your-staging-domain.example
+SCRS_ROUTER_NAME=scrs-staging
+SCRS_TRAEFIK_NETWORK=dokploy-network
+SCRS_HTTP_ENTRYPOINT=web
+SCRS_HTTPS_ENTRYPOINT=websecure
+SCRS_CERT_RESOLVER=letsencrypt
+SCRS_DOCS_PUBLIC=true
+SCRS_CORS_ORIGINS=
+SCRS_TRUSTED_PROXY_CIDRS=
+```
+
+Use a different domain and unique router name for production on the same VPS.
+The hostname has no scheme, path, port or wildcard. DNS must resolve to the VPS.
+Match the network, entrypoints and resolver to your existing Traefik configuration.
+
+The Compose labels expose only `/scrs/v1` and `/scrs/v1/*` on the selected host,
+redirect HTTP to HTTPS, enable TLS with the named ACME resolver, and send traffic
+to port 8080 without stripping the path. Swagger UI is at `/scrs/v1/docs`; its
+contract is `/scrs/v1/docs/openapi.yaml`. No application port is published on the
+host. The init service is explicitly hidden from Traefik and receives the optional
+PostgreSQL bootstrap administrator URL; the API does not receive that URL.
+
+Dokploy's existing Traefik must configure the Let's Encrypt resolver, ACME account
+email, reachable challenge ports/DNS credentials and persistent certificate storage.
+Traefik owns issuance and renewal. Labels select an existing resolver; they do not
+create it. Do not also configure a second router through Dokploy's Domains UI for
+this service. See [Dokploy's label example](https://docs.dokploy.com/docs/core/docker-compose/example)
+and [Traefik TLS routing](https://doc.traefik.io/traefik/reference/routing-configuration/http/tls/overview/).
+
+Keep public docs enabled for normal browser access. If `SCRS_DOCS_PUBLIC=false`,
+the docs document and all assets require bearer authentication; an authenticated
+client/proxy must supply headers before the Swagger page can load. API management
+routes always require authentication regardless of the docs setting.
+
+`SCRS_TRUSTED_PROXY_CIDRS` is an explicit comma-separated list of trusted proxy
+peer networks. Leave it empty to ignore forwarded IP headers. For per-token client
+IP restrictions behind Traefik, configure its exact peer IP range and ensure other
+untrusted containers cannot join that trusted range. Never trust a default route.
+The API walks X-Forwarded-For from right to left and stops at the first untrusted
+hop. `SCRS_CORS_ORIGINS` accepts exact browser origins; empty disables cross-origin
+browser access. Wildcards are not allowed.
+
+Before accepting the deployment, verify public HTTPS trust, HTTP redirect,
+readiness, unauthenticated API denial, authenticated access, private registry pull,
+restart recovery and certificate renewal configuration on the actual VPS. These
+checks have not been performed against a live SCRS domain in this workspace.
+
+## Token lifecycle and recovery
+
+Set a random bootstrap token of 32–512 non-whitespace characters and the same
+value on every API replica. Startup stores only its SHA-256 hash. Changing it and
+restarting replaces the stored value globally; old replicas with a stale env value
+must not be restarted later. Changing deployment settings must be coordinated.
+
+Admin tokens can create/list/revoke `/scrs/v1/tokens`. Token creation returns the
+secret once. Connection management requires admin; asset listing requires read or
+admin. Narrow `trigger` and `ingest:relay` scopes grant no management access; their
+product endpoints are not yet implemented. Revocation is checked in PostgreSQL
+on every request. Redis enforces 120 admitted requests per token per sliding minute;
+Redis outages fail closed. Token IP lists accept CIDRs and token expiry is optional.
+The bootstrap token cannot be revoked through the API; rotate it via the environment.
+
+Back up PostgreSQL with a provider-supported consistent snapshot or `pg_dump -Fc`.
+Store `SCRS_MASTER_KEY` separately in secure recovery storage: a database backup
+cannot recover encrypted provider credentials without the same key. Do not rotate
+that key by simply replacing the env value. Restore into a separate empty database,
+validate decryption, token revocation and asset state, then perform a controlled
+cutover. `make database-test` exercises a real dump/restore of synthetic records.
+Hosted database failover, S3 object/version recovery and full recovery-time targets
+still require environment-specific acceptance.
+
+## Legacy scanner compatibility
+
+The root `docker-compose*.yml` examples are internal legacy scanner examples,
+not SCRS API deployments. They now build this repository's protected scanner and
+bind ports to loopback. Supply a separate `SCRS_SCANNER_API_TOKEN` of at least 32
+characters to use streaming scan routes. `/scanFile` and `/scanPath` are retired
+with HTTP 410; clients must upload content. The SCRS API image contains none of
+these legacy routes. Older upstream Kubernetes manifests/documentation are not a
+supported SCRS production deployment and must not be deployed as this product.

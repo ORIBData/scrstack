@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -28,8 +29,9 @@ type ConnectionStore interface {
 }
 
 type connectionHandler struct {
-	store     ConnectionStore
-	tokenHash [32]byte
+	store         ConnectionStore
+	tokenHash     [32]byte
+	providerSlots chan struct{}
 }
 
 func hashToken(token string) [32]byte { return sha256.Sum256([]byte(token)) }
@@ -40,12 +42,16 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	const prefix = "Bearer "
 	authorization := r.Header.Get("Authorization")
 	providedHash := hashToken(strings.TrimPrefix(authorization, prefix))
-	if !strings.HasPrefix(authorization, prefix) || len(authorization) > 2048 || subtle.ConstantTimeCompare(providedHash[:], h.tokenHash[:]) != 1 {
+	_, managed := r.Context().Value(principalKey{}).(connections.Token)
+	if !managed && (!strings.HasPrefix(authorization, prefix) || len(authorization) > 2048 || subtle.ConstantTimeCompare(providedHash[:], h.tokenHash[:]) != 1) {
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	if principal, ok := r.Context().Value(principalKey{}).(connections.Token); ok {
+		ctx = connections.WithActor(ctx, principal.ID)
+	}
 	defer cancel()
 	if r.URL.Path == BasePath+"/assets" {
 		limit := 100
@@ -87,7 +93,37 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if segment == "" {
 		switch r.Method {
 		case http.MethodGet:
-			list, err := h.store.List(ctx)
+			limit := 100
+			if raw := r.URL.Query().Get("limit"); raw != "" {
+				value, err := strconv.Atoi(raw)
+				if err != nil || value < 1 || value > 500 {
+					writeError(w, 400, "limit must be between 1 and 500")
+					return
+				}
+				limit = value
+			}
+			after := ""
+			if raw := r.URL.Query().Get("cursor"); raw != "" {
+				value, err := base64.RawURLEncoding.DecodeString(raw)
+				if err != nil || len(raw) > 256 || len(value) > 100 {
+					writeError(w, 400, "invalid connection cursor")
+					return
+				}
+				after = string(value)
+			}
+			var list []connections.Connection
+			var err error
+			if paged, ok := h.store.(interface {
+				ListPage(context.Context, string, int) ([]connections.Connection, error)
+			}); ok {
+				list, err = paged.ListPage(ctx, after, limit+1)
+			} else {
+				list, err = h.store.List(ctx)
+			}
+			if len(list) > limit {
+				list = list[:limit]
+				w.Header().Set("X-Next-Cursor", base64.RawURLEncoding.EncodeToString([]byte(list[limit-1].Name)))
+			}
 			if err != nil {
 				writeError(w, 500, "connection list failed")
 				return
@@ -124,6 +160,10 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, c)
 		return
 	}
+	if (action == "" && (r.Method == http.MethodPatch || r.Method == http.MethodDelete)) || (action == "rotate-credential" && r.Method == http.MethodPost) {
+		h.change(ctx, w, r, id, action)
+		return
+	}
 	if r.Method != http.MethodPost || (action != "test" && action != "discover") {
 		writeError(w, 405, "method not allowed")
 		return
@@ -131,6 +171,14 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name, err := h.store.NameByID(ctx, id)
 	if err != nil {
 		writeError(w, 404, "connection not found")
+		return
+	}
+	select {
+	case h.providerSlots <- struct{}{}:
+		defer func() { <-h.providerSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusTooManyRequests, "provider operation capacity reached")
 		return
 	}
 	adapter := connections.NewNativeAdapters()
@@ -207,4 +255,69 @@ func writeError(w http.ResponseWriter, status int, message string) {
 		message = "request failed"
 	}
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+// Lifecycle changes retain assets and audit history; DELETE disables the connection.
+func (h connectionHandler) change(ctx context.Context, w http.ResponseWriter, r *http.Request, id uuid.UUID, action string) {
+	store, ok := h.store.(interface {
+		Change(context.Context, uuid.UUID, *connections.Scope, *bool, json.RawMessage) (connections.Connection, error)
+	})
+	if !ok {
+		writeError(w, 503, "connection lifecycle unavailable")
+		return
+	}
+	if _, err := h.store.PublicByID(ctx, id); err != nil {
+		writeError(w, 404, "connection not found")
+		return
+	}
+	var scope *connections.Scope
+	var enabled *bool
+	var credential json.RawMessage
+	if r.Method == http.MethodDelete {
+		value := false
+		enabled = &value
+	} else {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 96<<10))
+		decoder.DisallowUnknownFields()
+		var err error
+		if action == "rotate-credential" {
+			var input struct {
+				Credential json.RawMessage `json:"credential"`
+			}
+			err = decoder.Decode(&input)
+			credential = input.Credential
+			if len(credential) == 0 || string(credential) == "null" {
+				writeError(w, 400, "credential is required")
+				return
+			}
+		} else {
+			var input struct {
+				Scope   *connections.Scope `json:"scope"`
+				Enabled *bool              `json:"enabled"`
+			}
+			err = decoder.Decode(&input)
+			scope, enabled = input.Scope, input.Enabled
+			if scope == nil && enabled == nil {
+				writeError(w, 400, "scope or enabled is required")
+				return
+			}
+		}
+		if err != nil || decoder.Decode(new(any)) != io.EOF {
+			writeError(w, 400, "invalid lifecycle request")
+			return
+		}
+	}
+	c, err := store.Change(ctx, id, scope, enabled, credential)
+	if err != nil {
+		switch {
+		case errors.Is(err, connections.ErrConflict):
+			writeError(w, 409, "connection changed concurrently; retry")
+		case errors.Is(err, connections.ErrInvalidChange):
+			writeError(w, 400, err.Error())
+		default:
+			writeError(w, 500, "connection change failed")
+		}
+		return
+	}
+	writeJSON(w, 200, c)
 }

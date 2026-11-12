@@ -16,6 +16,33 @@ type fakeConnectionStore struct {
 	items []connections.Connection
 }
 
+func TestProviderAdmissionRejectsExcessWork(t *testing.T) {
+	id := uuid.New()
+	store := &fakeConnectionStore{items: []connections.Connection{{ID: id, Name: "test"}}}
+	token := strings.Repeat("x", 40)
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+	h := connectionHandler{store: store, tokenHash: hashToken(token), providerSlots: slots}
+	r := httptest.NewRequest("POST", BasePath+"/connections/"+id.String()+":test", nil)
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("unexpected admission response: %d", w.Code)
+	}
+}
+
+func TestManagementRoutesFailClosedWithoutBootstrapToken(t *testing.T) {
+	h := HandlerWithConnections(nil, &fakeConnectionStore{}, "")
+	r := httptest.NewRequest("GET", BasePath+"/connections", nil)
+	r.Header.Set("Authorization", "Bearer ")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 404 {
+		t.Fatalf("management route available without token: %d", w.Code)
+	}
+}
+
 func (s *fakeConnectionStore) List(context.Context) ([]connections.Connection, error) {
 	return s.items, nil
 }

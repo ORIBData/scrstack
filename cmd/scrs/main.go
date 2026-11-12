@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/httpapi"
 	"github.com/ORIBData/scrstack/internal/storage"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -83,7 +85,7 @@ func main() {
 		os.Exit(1)
 	}
 	bootstrapToken := os.Getenv("SCRS_BOOTSTRAP_API_TOKEN")
-	if len(bootstrapToken) < 32 {
+	if bootstrapToken != "" && len(bootstrapToken) < 32 {
 		fmt.Fprintln(os.Stderr, "SCRS_BOOTSTRAP_API_TOKEN must be at least 32 characters")
 		os.Exit(2)
 	}
@@ -93,16 +95,59 @@ func main() {
 		os.Exit(1)
 	}
 	defer store.Close()
+	authCtx, authCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	generated, err := store.SyncBootstrap(authCtx, bootstrapToken)
+	authCancel()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "token bootstrap failed; run scrs init to apply migrations")
+		os.Exit(1)
+	}
+	if generated != "" {
+		fmt.Fprintln(os.Stderr, "SCRS initial bootstrap token (shown once): "+generated)
+	}
+	redisOptions, err := redis.ParseURL(cfg.RedisCacheURL)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "invalid Redis cache URL")
+		os.Exit(2)
+	}
+	rateClient := redis.NewClient(redisOptions)
+	defer rateClient.Close()
+	docsPublic := os.Getenv("SCRS_DOCS_PUBLIC") == "true"
+	if value := os.Getenv("SCRS_DOCS_PUBLIC"); value != "" && value != "true" && value != "false" {
+		fmt.Fprintln(os.Stderr, "SCRS_DOCS_PUBLIC must be true or false")
+		os.Exit(2)
+	}
+	var origins []string
+	for _, value := range strings.Split(os.Getenv("SCRS_CORS_ORIGINS"), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			origins = append(origins, value)
+		}
+	}
 
+	var trustedProxies []netip.Prefix
+	for _, value := range strings.Split(os.Getenv("SCRS_TRUSTED_PROXY_CIDRS"), ",") {
+		if value = strings.TrimSpace(value); value != "" {
+			prefix, err := netip.ParsePrefix(value)
+			if err != nil || prefix.Bits() == 0 {
+				fmt.Fprintln(os.Stderr, "SCRS_TRUSTED_PROXY_CIDRS must contain specific trusted proxy CIDRs, not a default route")
+				os.Exit(2)
+			}
+			trustedProxies = append(trustedProxies, prefix)
+		}
+	}
+	readinessCheck, closeReadiness, err := storage.NewReadiness(context.Background(), cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "readiness initialization failed")
+		os.Exit(1)
+	}
+	defer closeReadiness()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server := &http.Server{
-		Addr: addr,
-		Handler: httpapi.HandlerWithConnections(func(ctx context.Context) error {
-			return storage.Ready(ctx, cfg)
-		}, store, bootstrapToken),
+		Addr:              addr,
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      190 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}

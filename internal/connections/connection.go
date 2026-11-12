@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"path"
 	"strings"
 	"time"
@@ -26,6 +25,8 @@ type Connection struct {
 	Scope     Scope           `json:"scope"`
 	Status    json.RawMessage `json:"status"`
 	UpdatedAt time.Time       `json:"-"`
+	Revision  int64           `json:"-"`
+	Enabled   bool            `json:"enabled"`
 }
 
 type Scope struct {
@@ -166,9 +167,9 @@ func (s *Store) Put(ctx context.Context, c Connection, credential json.RawMessag
 		(id, provider, name, config, scope, credential_ciphertext, secret_key_id)
 		VALUES ($1,$2,$3,$4,$5,$6,'v1') ON CONFLICT (name) DO `
 	if replace {
-		query += `UPDATE SET provider=EXCLUDED.provider, config=EXCLUDED.config,
+		query += `UPDATE SET config=EXCLUDED.config,
 			scope=EXCLUDED.scope, credential_ciphertext=EXCLUDED.credential_ciphertext,
-			status='{}', updated_at=now() RETURNING id`
+			status=CASE WHEN connections.enabled THEN '{"state":"pending"}'::jsonb ELSE '{"state":"disabled"}'::jsonb END, updated_at=clock_timestamp(), revision=connections.revision+1 WHERE connections.provider=EXCLUDED.provider RETURNING id`
 	} else {
 		query += `NOTHING RETURNING id`
 	}
@@ -179,8 +180,13 @@ func (s *Store) Put(ctx context.Context, c Connection, credential json.RawMessag
 	if err != nil {
 		return false, errors.New("connection save failed")
 	}
+	if replace {
+		if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.assets SET flags=flags || '{"in_scope":false}'::jsonb WHERE connection_id=$1`, id); err != nil {
+			return false, errors.New("asset scope invalidation failed")
+		}
+	}
 	details, _ := json.Marshal(map[string]any{"name": c.Name, "provider": c.Provider})
-	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ('connection.saved',$1,$2)`, id, details); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ('connection.saved',$1,$2)`, id, auditDetails(ctx, details)); err != nil {
 		return false, errors.New("connection audit failed")
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -200,8 +206,8 @@ func (s *Store) NameByID(ctx context.Context, id uuid.UUID) (string, error) {
 func (s *Store) PublicByID(ctx context.Context, id uuid.UUID) (Connection, error) {
 	var c Connection
 	var rawScope []byte
-	if err := s.pool.QueryRow(ctx, `SELECT id,provider,name,config,scope,status FROM `+s.schema+`.connections WHERE id=$1`, id).
-		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT id,provider,name,config,scope,status,enabled FROM `+s.schema+`.connections WHERE id=$1`, id).
+		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled); err != nil {
 		return c, errors.New("connection not found")
 	}
 	if err := json.Unmarshal(rawScope, &c.Scope); err != nil {
@@ -225,7 +231,17 @@ func (s *Store) Has(ctx context.Context, name string) (bool, error) {
 }
 
 func (s *Store) List(ctx context.Context) ([]Connection, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status FROM `+s.schema+`.connections ORDER BY name`)
+	return s.listConnections(ctx, "", 10001)
+}
+
+func (s *Store) ListPage(ctx context.Context, after string, limit int) ([]Connection, error) {
+	if limit < 1 || limit > 501 || len(after) > 100 {
+		return nil, errors.New("invalid connection page")
+	}
+	return s.listConnections(ctx, after, limit)
+}
+func (s *Store) listConnections(ctx context.Context, after string, limit int) ([]Connection, error) {
+	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status, enabled FROM `+s.schema+`.connections WHERE name>$1 ORDER BY name LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, errors.New("connection list failed")
 	}
@@ -234,7 +250,7 @@ func (s *Store) List(ctx context.Context) ([]Connection, error) {
 	for rows.Next() {
 		var c Connection
 		var rawScope []byte
-		if err := rows.Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status); err != nil {
+		if err := rows.Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled); err != nil {
 			return nil, errors.New("connection list scan failed")
 		}
 		if err := json.Unmarshal(rawScope, &c.Scope); err != nil {
@@ -242,14 +258,17 @@ func (s *Store) List(ctx context.Context) ([]Connection, error) {
 		}
 		result = append(result, c)
 	}
+	if len(result) > 10000 {
+		return nil, errors.New("too many connections; use pagination")
+	}
 	return result, rows.Err()
 }
 
 func (s *Store) Get(ctx context.Context, name string) (Connection, json.RawMessage, error) {
 	var c Connection
 	var rawScope, ciphertext []byte
-	err := s.pool.QueryRow(ctx, `SELECT id, provider, name, config, scope, status, credential_ciphertext, updated_at FROM `+s.schema+`.connections WHERE name=$1`, name).
-		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &ciphertext, &c.UpdatedAt)
+	err := s.pool.QueryRow(ctx, `SELECT id, provider, name, config, scope, status, credential_ciphertext, updated_at, enabled, revision FROM `+s.schema+`.connections WHERE name=$1`, name).
+		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &ciphertext, &c.UpdatedAt, &c.Enabled, &c.Revision)
 	if err != nil {
 		return c, nil, errors.New("connection not found")
 	}
@@ -320,28 +339,35 @@ func (s *Store) Test(ctx context.Context, name string, adapter Adapter) (int, er
 	if err != nil {
 		return 0, err
 	}
+	if !c.Enabled {
+		return 0, errors.New("connection is disabled")
+	}
 	resources, err := adapter.List(ctx, c, secret)
 	state := "ok"
 	if err != nil {
 		state = "failed"
 	}
 	status, _ := json.Marshal(map[string]any{"state": state, "checked_at": time.Now().UTC(), "resource_count": len(resources)})
-	if recordErr := s.recordCheck(ctx, c.ID, "connection.tested", status); recordErr != nil {
+	if recordErr := s.recordCheck(ctx, c, "connection.tested", status); recordErr != nil {
 		return 0, recordErr
 	}
 	return len(resources), err
 }
 
-func (s *Store) recordCheck(ctx context.Context, id uuid.UUID, action string, status []byte) error {
+func (s *Store) recordCheck(ctx context.Context, c Connection, action string, status []byte) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return errors.New("connection audit transaction failed")
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET status=$2, updated_at=now() WHERE id=$1`, id, status); err != nil {
+	updated, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET status=$2, updated_at=clock_timestamp(), revision=revision+1 WHERE id=$1 AND revision=$3`, c.ID, status, c.Revision)
+	if err != nil {
 		return errors.New("connection status update failed")
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ($1,$2,$3)`, action, id, status); err != nil {
+	if updated.RowsAffected() != 1 {
+		return errors.New("connection changed during check; retry")
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ($1,$2,$3)`, action, c.ID, auditDetails(ctx, status)); err != nil {
 		return errors.New("connection audit failed")
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -355,10 +381,13 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 	if err != nil {
 		return DiscoveryResult{}, err
 	}
+	if !c.Enabled {
+		return DiscoveryResult{}, errors.New("connection is disabled")
+	}
 	resources, err := adapter.List(ctx, c, secret)
 	if err != nil {
 		status, _ := json.Marshal(map[string]any{"state": "failed", "checked_at": time.Now().UTC()})
-		if recordErr := s.recordCheck(ctx, c.ID, "connection.discovery_failed", status); recordErr != nil {
+		if recordErr := s.recordCheck(ctx, c, "connection.discovery_failed", status); recordErr != nil {
 			return DiscoveryResult{}, recordErr
 		}
 		return DiscoveryResult{}, err
@@ -375,40 +404,44 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 	// in flight. Lock and compare the connection before applying that inventory.
 	scopeJSON, _ := json.Marshal(c.Scope)
 	var current bool
-	if err := tx.QueryRow(ctx, `SELECT config=$2::jsonb AND scope=$3::jsonb AND updated_at=$4 FROM `+s.schema+`.connections WHERE id=$1 FOR UPDATE`, c.ID, c.Config, scopeJSON, c.UpdatedAt).Scan(&current); err != nil || !current {
+	if err := tx.QueryRow(ctx, `SELECT config=$2::jsonb AND scope=$3::jsonb AND revision=$4 FROM `+s.schema+`.connections WHERE id=$1 FOR UPDATE`, c.ID, c.Config, scopeJSON, c.Revision).Scan(&current); err != nil || !current {
 		return DiscoveryResult{}, errors.New("connection changed during discovery; retry")
 	}
 	result := DiscoveryResult{Connection: name}
+	batch := &pgx.Batch{}
+	// A complete successful inventory must withdraw eligibility from resources
+	// that disappeared or became inaccessible. Preserve their history.
+	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.assets SET flags=flags || '{"in_scope":false,"accessible":false}'::jsonb WHERE connection_id=$1`, c.ID); err != nil {
+		return DiscoveryResult{}, errors.New("asset reconciliation failed")
+	}
 	for _, resource := range resources {
 		if resource.Locator == "" || (resource.Type != "github_repo" && resource.Type != "container_image") {
 			return DiscoveryResult{}, errors.New("provider returned invalid resource")
 		}
 		inScope := c.Scope.matchesResource(resource)
-		flags, _ := json.Marshal(map[string]any{"discovered": true, "in_scope": inScope})
+		flags, _ := json.Marshal(map[string]any{"discovered": true, "accessible": true, "in_scope": inScope})
 		metadata := resource.Metadata
 		if len(metadata) == 0 {
 			metadata = json.RawMessage(`{}`)
 		}
-		var id uuid.UUID
-		err := tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.assets(id,type,locator,connection_id,flags,metadata)
+		batch.Queue(`INSERT INTO `+s.schema+`.assets(id,type,locator,connection_id,flags,metadata)
 			VALUES ($1,$2,$3,$4,$5,$6)
-			ON CONFLICT (connection_id,type,locator) DO UPDATE SET flags=EXCLUDED.flags, metadata=EXCLUDED.metadata,
-			last_discovered_at=now()
-			RETURNING id`, uuid.New(), resource.Type, resource.Locator, c.ID, flags, metadata).Scan(&id)
-		if err != nil {
-			return DiscoveryResult{}, fmt.Errorf("asset discovery conflict for %s", resource.Locator)
-		}
+			ON CONFLICT (connection_id,type,locator) DO UPDATE SET flags=assets.flags || EXCLUDED.flags, metadata=EXCLUDED.metadata,
+			last_discovered_at=now()`, uuid.New(), resource.Type, resource.Locator, c.ID, flags, metadata)
 		result.Discovered++
 		if inScope {
 			result.InScope++
 		}
 	}
+	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
+		return DiscoveryResult{}, errors.New("asset discovery batch failed")
+	}
 	details, _ := json.Marshal(result)
 	status, _ := json.Marshal(map[string]any{"state": "ok", "checked_at": time.Now().UTC(), "resource_count": result.Discovered, "in_scope_count": result.InScope})
-	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET status=$2, updated_at=now() WHERE id=$1`, c.ID, status); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.connections SET status=$2, updated_at=clock_timestamp(), revision=revision+1 WHERE id=$1`, c.ID, status); err != nil {
 		return DiscoveryResult{}, errors.New("connection status update failed")
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ('connection.discovered',$1,$2)`, c.ID, details); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ('connection.discovered',$1,$2)`, c.ID, auditDetails(ctx, details)); err != nil {
 		return DiscoveryResult{}, errors.New("asset discovery audit failed")
 	}
 	if err := tx.Commit(ctx); err != nil {

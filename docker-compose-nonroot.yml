@@ -2,10 +2,16 @@ services:
   clamav-rest:
     mem_reservation: "2G"
     mem_limit: "3G"
-    image: ajilaag/clamav-rest
+    # Legacy internal scanner only; SCRS API deployment is deploy/compose.dokploy.yaml.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: scrs-legacy:local
+    environment:
+      SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set a separate internal scanner token of at least 32 characters}
     ports:
-      - "9000:9000"
-      - "9443:9443"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9443:9443"
     read_only: true
     user: 100:101
     volumes:

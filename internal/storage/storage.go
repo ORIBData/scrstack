@@ -23,6 +23,14 @@ func Bootstrap(ctx context.Context, c Config) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
+	if err := BootstrapDatabase(ctx, c); err != nil {
+		return err
+	}
+	return bootstrapObjects(ctx, c)
+}
+
+// BootstrapDatabase initializes only the configured SCRS database/schema.
+func BootstrapDatabase(ctx context.Context, c Config) error {
 	if err := ensureDatabase(ctx, c); err != nil {
 		return err
 	}
@@ -35,17 +43,29 @@ func Bootstrap(ctx context.Context, c Config) error {
 		return errors.New("PostgreSQL connection failed; check SCRS_DATABASE_URL, network and TLS")
 	}
 	name := pgx.Identifier{c.DatabaseSchema}.Sanitize()
-	_, err = pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+name)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return errors.New("PostgreSQL schema transaction failed")
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, name+".scrs_schema"); err != nil {
+		return errors.New("PostgreSQL schema lock failed")
+	}
+	_, err = tx.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS "+name)
 	if err != nil {
 		return errors.New("PostgreSQL schema creation failed; the application role needs CREATE on its database")
 	}
-	_, err = pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+name+".schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
+	_, err = tx.Exec(ctx, "CREATE TABLE IF NOT EXISTS "+name+".schema_migrations (version bigint PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
 	if err != nil {
 		return errors.New("PostgreSQL migration-table creation failed; check schema ownership and CREATE permission")
 	}
-	if err := bootstrapConnectionTables(ctx, pool, name); err != nil {
-		return err
+	if err := tx.Commit(ctx); err != nil {
+		return errors.New("PostgreSQL schema commit failed")
 	}
+	return bootstrapConnectionTables(ctx, pool, name)
+}
+
+func bootstrapObjects(ctx context.Context, c Config) error {
 	client, err := s3Client(c)
 	if err != nil {
 		return err
@@ -71,6 +91,9 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 		return errors.New("PostgreSQL connection migration failed")
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, schema+".scrs_migrations"); err != nil {
+		return errors.New("PostgreSQL migration lock failed")
+	}
 	for _, ddl := range []string{
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.connections (
 			id uuid PRIMARY KEY, provider text NOT NULL, name text NOT NULL UNIQUE,
@@ -86,10 +109,19 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			last_discovered_at timestamptz NOT NULL DEFAULT now(),
 			UNIQUE (connection_id, type, locator)
 		)`,
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS enabled boolean NOT NULL DEFAULT true`,
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1`,
 		`ALTER TABLE ` + schema + `.assets DROP CONSTRAINT IF EXISTS assets_type_locator_key`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS assets_connection_locator_uq ON ` + schema + `.assets(connection_id,type,locator)`,
 		`CREATE INDEX IF NOT EXISTS assets_connection_idx ON ` + schema + `.assets(connection_id)`,
 		`CREATE INDEX IF NOT EXISTS assets_locator_id_idx ON ` + schema + `.assets(locator,id)`,
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.api_tokens (
+   id uuid PRIMARY KEY, name text NOT NULL UNIQUE, prefix text NOT NULL,
+   secret_hash bytea NOT NULL UNIQUE CHECK(octet_length(secret_hash)=32),
+   scopes jsonb NOT NULL, ip_allow_list jsonb NOT NULL DEFAULT '[]',
+   expires_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(),
+   last_used_at timestamptz, revoked_at timestamptz
+  )`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.audit_log (
 			id bigserial PRIMARY KEY, occurred_at timestamptz NOT NULL DEFAULT now(),
 			action text NOT NULL, target_id uuid, details jsonb NOT NULL DEFAULT '{}'
@@ -98,6 +130,9 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 		if _, err := tx.Exec(ctx, ddl); err != nil {
 			return errors.New("PostgreSQL connection migration failed; check schema ownership and CREATE permission")
 		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111202) ON CONFLICT DO NOTHING`); err != nil {
+		return errors.New("PostgreSQL migration version record failed")
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return errors.New("PostgreSQL connection migration commit failed")

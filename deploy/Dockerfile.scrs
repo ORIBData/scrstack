@@ -1,4 +1,4 @@
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -10,12 +10,13 @@ ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/scrs ./cmd/scrs
 
-FROM alpine:3.24
+FROM alpine:3.24 AS certificates
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
 LABEL io.scrs.project="scrstack"
-RUN apk add --no-cache ca-certificates \
-    && addgroup -S scrs \
-    && adduser -S -G scrs scrs
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/scrs /usr/local/bin/scrs
-USER scrs
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/scrs"]
