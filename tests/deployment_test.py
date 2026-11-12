@@ -42,8 +42,8 @@ class DeploymentTest(unittest.TestCase):
         scanner=config['services']['scrs-scanner']
         self.assertEqual(set(scanner['networks']), {'scanning'})
         self.assertTrue(config['networks']['scanning']['internal'])
-        for service in ['scrs-scanner', 'scrs-feed-sync', 'scrs-egress-proxy']:
+        for service in ['scrs-scanner', 'scrs-feed-sync', 'scrs-egress-proxy', 'scrs-clamav']:
             env=config['services'][service].get('environment', {})
             self.assertFalse(set(env) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN'})
             self.assertNotIn('ports', config['services'][service])
-        self.assertEqual(scanner['environment']['SCRS_REMEDIATION_ENABLED'], 'false')
+        self.assertEqual(scanner['environment']['SCRS_REMEDIATION_ENABLED'], 'true')

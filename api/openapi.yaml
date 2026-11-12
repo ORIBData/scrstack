@@ -2,10 +2,122 @@ openapi: 3.1.0
 info:
   title: Supply Chain Risk Stack API
   version: 0.1.0
-  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. GitHub assessment jobs provide offline OSV matching, CycloneDX SBOMs and persisted findings. Missing malware, IOC and integrity stages force incomplete verdicts. Guided npm remediation is opt-in advice only.
+  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. GitHub assessment jobs provide offline OSV matching, CycloneDX SBOMs and persisted findings. Missing malware, IOC and integrity stages force incomplete verdicts. Guided npm remediation is enabled by deployment configuration and automatically queued for supported npm manifests; plans never write to repositories.
 servers:
   - url: /scrs/v1
 paths:
+  /webhooks/github:
+    post:
+      operationId: githubPushWebhook
+      summary: Verify HMAC-SHA256 and enqueue a discovered in-scope GitHub push
+      description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. Only push and ping are supported. Delivery replay is idempotent for 24 hours. No bearer token is used on this provider endpoint.
+      responses:
+        '202': {description: Push durably queued with raw event}
+        '200': {description: Replay, ping or deleted-ref acknowledgement}
+        '401': {description: Invalid provider signature}
+        '404': {description: Repository outside registered scope}
+        '409': {description: Same delivery ID with different payload}
+        '422': {description: Unsupported event or ambiguous connection}
+        '503': {description: Webhook secret not configured}
+  /feeds/indicators:
+    get:
+      operationId: activeIndicators
+      security: [{bearerAuth: []}]
+      summary: Read active versioned IOC bundle (admin)
+      responses:
+        '200': {description: Version and normalized indicators}
+        '404': {description: No active bundle}
+    put:
+      operationId: importIndicators
+      security: [{bearerAuth: []}]
+      summary: Atomically import and activate immutable IOC version (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version, indicators]
+              properties:
+                version: {type: string, minLength: 1, maxLength: 128}
+                indicators:
+                  type: array
+                  maxItems: 10000
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [id, type, value, valid_until]
+                    properties:
+                      id: {type: string, maxLength: 128}
+                      type: {type: string, enum: [sha256, domain]}
+                      value: {type: string}
+                      valid_until: {type: string, format: date-time}
+      responses:
+        '201': {description: Activated and audited; previous version retained}
+        '400': {description: Invalid indicators}
+        '409': {description: Version already exists}
+  /assessments/{id}/files:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentFiles
+      summary: File hash, size and malware status; source content is excluded
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Bounded file evidence inventory}
+        '409': {description: File evidence unavailable}
+  /assessments/{id}/remediations:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: automaticRemediationPlans
+      summary: Automatic child plans and dispatch state for this assessment
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Manifest, child assessment ID, dispatch state and job status}
+  /settings/retention:
+    get:
+      operationId: getRetention
+      security: [{bearerAuth: []}]
+      summary: Read raw-ingress retention policy and ETag (admin)
+      responses:
+        '200': {description: revision and inbound_event_days; zero keeps forever}
+    put:
+      operationId: setRetention
+      security: [{bearerAuth: []}]
+      summary: Update raw-ingress retention policy atomically (admin)
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+      responses:
+        '200': {description: Saved policy with new ETag}
+        '409': {description: Policy revision changed}
+        '428': {description: If-Match required}
+  /settings/retention:preview:
+    post:
+      operationId: previewRetention
+      security: [{bearerAuth: []}]
+      summary: Count raw events eligible for removal and stored JSON bytes (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+      responses:
+        '200': {description: rows and bytes; excludes pending/running assessment events}
+  /settings/retention:purge:
+    post:
+      operationId: purgeIngressEvents
+      security: [{bearerAuth: []}]
+      summary: Purge at most 1000 eligible raw events under the saved policy (admin)
+      description: Preserves assessments, findings, audit records and all S3 artifacts. Default policy keeps forever. Scheduling and other retention classes are not supported yet.
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: deleted_events count; purge audited atomically}
+        '409': {description: Stale policy revision}
+        '428': {description: If-Match required}
   /assessments:
     post:
       operationId: createAssessment

@@ -93,8 +93,34 @@ supported SCRS production deployment and must not be deployed as this product.
 The Compose file now also starts worker, offline scanner, OSV feed synchronization
 and a restricted remediation egress proxy using the same SCRS image. Set a distinct
 random `SCRS_SCANNER_API_TOKEN`; set `SCRS_OSV_ECOSYSTEMS` to the required package
-ecosystems. Keep `SCRS_REMEDIATION_ENABLED=false` until staging acceptance. Only the
+ecosystems. `SCRS_REMEDIATION_ENABLED=true` enables the validated npm advice path. Only the
 API joins Traefik's external network. Feed download must complete before scanner
 readiness allows the worker to start. PostgreSQL, Redis and evidence S3 stay external.
 The rebuildable feed cache is a local Docker volume. Review scanner resource limits
 and [pipeline operating constraints](ASSESSMENT_PIPELINE.md) before deploying.
+
+## External HTTPS acceptance and optional HTTP node port
+
+Set `SCRS_PUBLIC_BASE_URL=https://your-domain` (or the same URL with `/scrs/v1`)
+in the deployment dotenv. `make deployment-acceptance` uses that value to verify
+TLS, public health/readiness, unauthorized rejection, authorized assessment reads,
+Swagger/OpenAPI and active remediation capabilities. It uses
+`SCRS_ACCEPTANCE_API_TOKEN` (read scope) or falls back to the bootstrap token.
+Credentials are not printed and cross-origin redirects are rejected.
+
+The API listens on HTTP port 8080 inside Docker. Traefik terminates external HTTPS
+and preserves `/scrs/v1/*`. A published host port is unnecessary for that routing.
+If an HTTP node port is needed for local VPS diagnostics, add
+`deploy/compose.nodeport.yaml`; it binds `SCRS_HTTP_NODE_PORT` to **127.0.0.1** only.
+Keep external consumers on the HTTPS domain. Certificate renewal remains owned by
+Dokploy/Traefik and needs operational verification separately.
+
+Remediation is now enabled by default in Compose and dotenv. Supported npm manifests
+produce automatic advice jobs after assessment completion; inspect
+`GET /scrs/v1/assessments/{id}/remediations`. Source repositories are never modified.
+The ClamAV service uses the pinned official 1.5.4 Debian image with native AMD64/ARM64 support, running as
+its unprivileged user with capabilities dropped. `SCRS_CLAMAV_MEMORY` defaults to 4 GiB
+to allow signature-reload headroom; this is a memory limit, not a reservation. ClamAV exposes no host port and stores only signature data in
+its volume. Freshclam needs outbound access for signature updates. Stale signatures
+make malware coverage partial and create a posture finding. YARA remains separate
+and is not implemented by loading rules into ClamAV.

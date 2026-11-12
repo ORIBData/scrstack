@@ -3,7 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http/httptest"
@@ -61,7 +64,7 @@ func TestPostgresManagedSecurityAndLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer jobs.Close()
-	handler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: client, Assessments: jobs})
+	handler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: client, Assessments: jobs, GitHubWebhookSecret: strings.Repeat("h", 40)})
 	request := func(method, path, token, body string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, BasePath+path, strings.NewReader(body))
 		r.RemoteAddr = "192.0.2.1:1234"
@@ -140,6 +143,26 @@ func TestPostgresManagedSecurityAndLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	delivery := uuid.NewString()
+	hook := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", BasePath+"/webhooks/github", strings.NewReader(body))
+		r.Header.Set("X-GitHub-Delivery", delivery)
+		r.Header.Set("X-GitHub-Event", "push")
+		mac := hmac.New(sha256.New, []byte(strings.Repeat("h", 40)))
+		_, _ = mac.Write([]byte(body))
+		r.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		return w
+	}
+	push := `{"ref":"refs/heads/main","after":"` + strings.Repeat("a", 40) + `","repository":{"full_name":"org/api"}}`
+	mustStatus(hook(push), 202)
+	mustStatus(hook(push), 200)
+	mustStatus(hook(strings.Replace(push, "refs/heads/main", "refs/heads/changed", 1)), 409)
+	var rawCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+schema+".inbound_events WHERE body->'repository'->>'full_name'='org/api'").Scan(&rawCount); err != nil || rawCount != 1 {
+		t.Fatal("raw webhook persistence/replay failed", err)
+	}
 	trigger, triggerSecret, err := store.CreateToken(ctx, connections.Token{Name: "trigger", Scopes: []string{"trigger"}}, uuid.Nil)
 	if err != nil {
 		t.Fatal(err)

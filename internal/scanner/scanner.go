@@ -23,11 +23,14 @@ import (
 )
 
 type Engine struct {
-	Binary, WorkRoot, Database string
-	RemediationEnabled         bool
-	RemediationProxy           string
+	Indicators                  *IndicatorBundle
+	Binary, WorkRoot, Database  string
+	RemediationEnabled          bool
+	RemediationProxy            string
+	ClamdAddress, IndicatorFile string
 }
 type Output struct {
+	Files      []FileEvidence          `json:"files"`
 	Components []assessments.Component `json:"components"`
 	Findings   []assessments.Finding   `json:"findings"`
 	SBOM       json.RawMessage         `json:"sbom"`
@@ -126,12 +129,7 @@ func Extract(data []byte, root string) error {
 	}
 	return nil
 }
-func (e Engine) Run(ctx context.Context, archive []byte) (Output, error) {
-	var out Output
-	database, err := pinnedFeed(e.Database)
-	if err != nil {
-		return out, err
-	}
+func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error) {
 	directory, err := os.MkdirTemp(e.WorkRoot, "scrs-scan-")
 	if err != nil {
 		return out, err
@@ -142,6 +140,32 @@ func (e Engine) Run(ctx context.Context, archive []byte) (Output, error) {
 		return out, err
 	}
 	if err := Extract(archive, source); err != nil {
+		return out, err
+	}
+	contentCtx, done := context.WithTimeout(ctx, 90*time.Second)
+	files, findings, stages := e.inspectContent(contentCtx, source)
+	done()
+	out.Files = files
+	out.Findings = findings
+	defer func() {
+		out.Stages = append(out.Stages, stages...)
+		if len(out.Findings) > 10000 {
+			out.Findings = out.Findings[:10000]
+			err = errors.New("finding limit exceeded")
+		}
+		if len(out.Components) > 20000 {
+			out.Components = out.Components[:20000]
+			err = errors.New("component limit exceeded")
+		}
+		if err != nil {
+			out.Stages = append(out.Stages, assessments.Stage{Name: "inventory", Status: "failed", Detail: "SCA extraction or matching failed; file findings retained"})
+			err = nil
+		}
+	}()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	database, err := pinnedFeed(e.Database)
+	if err != nil {
 		return out, err
 	}
 	config := filepath.Join(directory, "policy.toml")
@@ -299,7 +323,8 @@ func (e Engine) Run(ctx context.Context, archive []byte) (Output, error) {
 	}
 	// Never expose ephemeral filesystem paths from the scanner's document.
 	out.SBOM = bytes.ReplaceAll(out.SBOM, []byte(source+string(os.PathSeparator)), []byte(""))
-	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV malicious-package records in configured offline feeds"}, {Name: "malware", Status: "skipped", Detail: "ClamAV/YARA stage not configured"}, {Name: "ioc", Status: "skipped", Detail: "IOC ruleset not configured"}, {Name: "integrity", Status: "skipped", Detail: "integrity baseline unavailable"}}
+	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}}
+
 	return out, nil
 }
 func (e Engine) Handler(token string) http.Handler {
@@ -330,8 +355,7 @@ func (e Engine) Handler(token string) http.Handler {
 			http.Error(w, "scanner busy", 429)
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, 64<<20)
-		body, err := io.ReadAll(r.Body)
+		body, indicators, err := scanInput(w, r)
 		if err != nil {
 			http.Error(w, "archive too large", 413)
 			return
@@ -348,7 +372,9 @@ func (e Engine) Handler(token string) http.Handler {
 			_, _ = w.Write(result)
 			return
 		}
-		result, err := e.Run(ctx, body)
+		engine := e
+		engine.Indicators = indicators
+		result, err := engine.Run(ctx, body)
 		if err != nil {
 			http.Error(w, "scan failed or incomplete", 422)
 			return

@@ -119,3 +119,15 @@ scanner-test:
 	@mkdir -p bin
 	cd tools/osv && $(GO) build -trimpath -o ../../bin/osv-scanner github.com/google/osv-scanner/v2/cmd/osv-scanner
 	SCRS_TEST_OSV_BINARY="$(CURDIR)/bin/osv-scanner" $(GO) test -race -count=1 ./internal/scanner
+
+.PHONY: deployment-acceptance
+deployment-acceptance:
+	@python3 scripts/run_with_env.py python3 scripts/deployment_acceptance.py
+
+.PHONY: malware-test
+malware-test:
+	DOCKER=$(DOCKER) GO=$(GO) bash scripts/test_malware.sh
+
+.PHONY: remediation-live-test
+remediation-live-test: scanner-test
+	SCRS_TEST_OSV_BINARY="$(CURDIR)/bin/osv-scanner" SCRS_TEST_LIVE_REMEDIATION=1 $(GO) test -race -count=1 ./internal/scanner -run TestUpstreamRemediation

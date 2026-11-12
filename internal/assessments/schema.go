@@ -27,6 +27,13 @@ func Schema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.assessment_findings(assessment_id uuid NOT NULL REFERENCES ` + s + `.assessments(id),finding_id uuid NOT NULL REFERENCES ` + s + `.findings(id),snapshot jsonb NOT NULL,PRIMARY KEY(assessment_id,finding_id))`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.finding_events(id bigserial PRIMARY KEY,finding_id uuid NOT NULL REFERENCES ` + s + `.findings(id),actor_id uuid,action text NOT NULL,details jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE INDEX IF NOT EXISTS finding_events_history_idx ON ` + s + `.finding_events(finding_id,id DESC)`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.retention_policy(singleton boolean PRIMARY KEY DEFAULT true CHECK(singleton),revision bigint NOT NULL DEFAULT 1,inbound_event_days integer NOT NULL DEFAULT 0 CHECK(inbound_event_days BETWEEN 0 AND 36500))`,
+		`INSERT INTO ` + s + `.retention_policy(singleton) VALUES(true) ON CONFLICT DO NOTHING`,
+		`CREATE INDEX IF NOT EXISTS inbound_events_age_idx ON ` + s + `.inbound_events(created_at)`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.indicator_bundles(id uuid PRIMARY KEY,version text NOT NULL UNIQUE,body jsonb NOT NULL,active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS indicator_bundles_active_uq ON ` + s + `.indicator_bundles(active) WHERE active`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.automatic_remediations(parent_id uuid NOT NULL REFERENCES ` + s + `.assessments(id),manifest text NOT NULL,status text NOT NULL DEFAULT 'pending',assessment_id uuid REFERENCES ` + s + `.assessments(id),error text NOT NULL DEFAULT '',PRIMARY KEY(parent_id,manifest))`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.assessment_files(assessment_id uuid PRIMARY KEY REFERENCES ` + s + `.assessments(id),body jsonb NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.remediation_results(assessment_id uuid PRIMARY KEY REFERENCES ` + s + `.assessments(id),artifact_key text NOT NULL,sha256 text NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.advisories(id text PRIMARY KEY,body jsonb NOT NULL,imported_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 	}

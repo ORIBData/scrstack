@@ -138,7 +138,7 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			return errors.New("assessment schema migration failed")
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111204) ON CONFLICT DO NOTHING`); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111205) ON CONFLICT DO NOTHING`); err != nil {
 		return errors.New("PostgreSQL migration version record failed")
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -1,5 +1,9 @@
 # SCRS production gate status — 2026-11-12
 
+**Latest implementation status:** see [PRD expansion audit](PRD_EXPANSION_AUDIT.md).
+It supersedes this report for malware, IOC, workflow ingress, retention and active
+automatic remediation. The evidence below records the earlier baseline.
+
 Production sign-off remains withheld. This report supersedes the remaining-gate
 list in the earlier AUDIT_2026-11-12.md. It reflects repository implementation and
 local evidence, not a live VPS assessment.

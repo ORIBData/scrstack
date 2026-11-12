@@ -3,6 +3,7 @@ package assessments
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,7 +11,7 @@ import (
 )
 
 func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
-	if !commitPattern.MatchString(r.Commit) || len(r.Components) > 20000 || len(r.Findings) > 10000 || !digestPattern.MatchString(r.SBOMSHA256) || r.SBOMKey != "sbom/"+r.SBOMSHA256+".cdx.json" {
+	if !commitPattern.MatchString(r.Commit) || len(r.Components) > 20000 || len(r.Findings) > 10000 || len(r.Files) > 10000 {
 		return ErrInput
 	}
 	required := map[string]bool{"resolve": false, "fetch": false, "inventory": false, "sbom": false, "match_vuln": false, "match_malicious": false, "malware": false, "ioc": false, "integrity": false}
@@ -23,6 +24,14 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		if !ok {
 			r.Complete = false
 		}
+	}
+	if r.SBOMKey == "" {
+		r.Complete = false
+		if r.SBOMSHA256 != "" {
+			return ErrInput
+		}
+	} else if !digestPattern.MatchString(r.SBOMSHA256) || r.SBOMKey != "sbom/"+r.SBOMSHA256+".cdx.json" {
+		return ErrInput
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -50,6 +59,59 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	}
 	if !valid {
 		return ErrScope
+	}
+	// Compare immutable file inventories within the same asset/ref. This is a
+	// change baseline, not a last-known-good security designation.
+	if len(r.Files) > 0 {
+		var previous []byte
+		previousErr := tx.QueryRow(ctx, `SELECT f.body FROM `+s.schema+`.assessment_files f JOIN `+s.schema+`.assessments p ON p.id=f.assessment_id WHERE p.asset_id=$1 AND p.request->'target'->>'ref'=$2 AND p.status='succeeded' AND p.request->'remediation' IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT 1`, a.AssetID, a.Request.Target.Ref).Scan(&previous)
+		if previousErr != nil && previousErr != pgx.ErrNoRows {
+			return previousErr
+		}
+		if previousErr == nil {
+			var prior []FileEvidence
+			if json.Unmarshal(previous, &prior) != nil {
+				return ErrInput
+			}
+			before := map[string]string{}
+			after := map[string]string{}
+			for _, f := range prior {
+				if strings.HasPrefix(f.Path, ".github/workflows/") {
+					before[f.Path] = f.SHA256
+				}
+			}
+			for _, f := range r.Files {
+				if strings.HasPrefix(f.Path, ".github/workflows/") {
+					after[f.Path] = f.SHA256
+				}
+			}
+			changes := map[string]string{}
+			for path, digest := range after {
+				if before[path] != digest {
+					changes[path] = "added_or_modified"
+				}
+			}
+			for path := range before {
+				if after[path] == "" {
+					changes[path] = "deleted"
+				}
+			}
+			for path, change := range changes {
+				if len(r.Findings) >= 10000 {
+					r.Complete = false
+					break
+				}
+				evidence, _ := json.Marshal(map[string]string{"path": path, "change": change, "before_sha256": before[path], "after_sha256": after[path]})
+				r.Findings = append(r.Findings, Finding{Type: "integrity", AdvisoryID: "SCRS-WORKFLOW-CHANGE", Title: "Workflow file changed since prior assessed revision", Severity: "high", Score: 60, Component: Component{Path: path}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Review workflow permissions, secret access, external actions and triggering branches before promotion.","automatic_changes":false}`)})
+			}
+		}
+	}
+	files, err := json.Marshal(r.Files)
+	if err != nil {
+		return ErrInput
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessment_files(assessment_id,body) VALUES($1,$2)`, a.ID, files); err != nil {
+		return err
 	}
 	batch := &pgx.Batch{}
 	for i, component := range r.Components {
@@ -79,6 +141,17 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		batch.Queue(`INSERT INTO `+s.schema+`.findings(id,asset_id,fingerprint,ref,type,advisory_id,title,severity,score,component,evidence,guidance,last_assessment_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(fingerprint) DO UPDATE SET last_seen=clock_timestamp(),last_assessment_id=EXCLUDED.last_assessment_id,evidence=EXCLUDED.evidence,guidance=EXCLUDED.guidance,severity=EXCLUDED.severity,score=EXCLUDED.score,status=CASE WHEN findings.status='fixed' OR (findings.status='accepted' AND findings.waiver_until<=clock_timestamp()) THEN 'open' ELSE findings.status END,revision=findings.revision+1`, f.ID, f.AssetID, f.Fingerprint, f.Ref, f.Type, f.AdvisoryID, f.Title, f.Severity, f.Score, component, f.Evidence, f.Guidance, a.ID)
 		batch.Queue(`INSERT INTO `+s.schema+`.assessment_findings(assessment_id,finding_id,snapshot) VALUES($1,$2,$3)`, a.ID, f.ID, snapshot)
 		batch.Queue(`INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) VALUES($1,'detected',$2)`, f.ID, json.RawMessage(`{"assessment_id":"`+a.ID.String()+`"}`))
+	}
+	if a.Request.AutoRemediation && a.Request.Remediation == nil {
+		manifests := map[string]bool{}
+		for _, c := range r.Components {
+			if c.Ecosystem == "npm" && (c.Path == "package-lock.json" || strings.HasSuffix(c.Path, "/package-lock.json")) {
+				manifests[c.Path] = true
+			}
+		}
+		for manifest := range manifests {
+			batch.Queue(`INSERT INTO `+s.schema+`.automatic_remediations(parent_id,manifest) VALUES($1,$2) ON CONFLICT DO NOTHING`, a.ID, manifest)
+		}
 	}
 	if err = tx.SendBatch(ctx, batch).Close(); err != nil {
 		return err
@@ -216,4 +289,10 @@ func (s *Store) FindingHistory(ctx context.Context, id uuid.UUID) ([]json.RawMes
 		out = append(out, raw)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) Files(ctx context.Context, id uuid.UUID) (json.RawMessage, error) {
+	var body json.RawMessage
+	err := s.pool.QueryRow(ctx, `SELECT body FROM `+s.schema+`.assessment_files WHERE assessment_id=$1`, id).Scan(&body)
+	return body, err
 }

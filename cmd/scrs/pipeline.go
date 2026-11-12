@@ -76,7 +76,7 @@ func pipelineCommand() error {
 		if len(token) < 32 || strings.HasPrefix(token, "REPLACE") {
 			return errors.New("set a random SCRS_SCANNER_API_TOKEN of at least 32 characters")
 		}
-		engine := scanner.Engine{RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RemediationProxy: os.Getenv("SCRS_REMEDIATION_PROXY"), Binary: setting("SCRS_OSV_BINARY", "/usr/local/bin/osv-scanner"), WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Database: setting("SCRS_OSV_DB", "/feeds/current")}
+		engine := scanner.Engine{ClamdAddress: os.Getenv("SCRS_CLAMD_ADDRESS"), IndicatorFile: os.Getenv("SCRS_INDICATOR_FILE"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RemediationProxy: os.Getenv("SCRS_REMEDIATION_PROXY"), Binary: setting("SCRS_OSV_BINARY", "/usr/local/bin/osv-scanner"), WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Database: setting("SCRS_OSV_DB", "/feeds/current")}
 		if _, err := os.Stat(engine.Binary); err != nil {
 			return errors.New("pinned OSV-Scanner binary unavailable")
 		}
@@ -111,7 +111,7 @@ func pipelineCommand() error {
 		if err != nil {
 			return err
 		}
-		w := worker.Worker{Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger}
+		w := worker.Worker{AutoRemediation: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger}
 		return w.Run(ctx)
 	}
 	return errors.New("unknown pipeline command")

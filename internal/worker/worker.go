@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"time"
@@ -30,6 +31,7 @@ type Worker struct {
 	Artifacts                Artifacts
 	ScannerURL, ScannerToken string
 	Logger                   *slog.Logger
+	AutoRemediation          bool
 }
 
 func (w Worker) Run(ctx context.Context) error {
@@ -42,6 +44,14 @@ func (w Worker) Run(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+		if w.AutoRemediation {
+			dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := w.Store.DispatchAutomaticPlan(dispatchCtx)
+			cancel()
+			if err != nil {
+				w.Logger.Warn("automatic remediation dispatch deferred")
+			}
 		}
 		a, err := w.Store.Claim(ctx)
 		if err != nil {
@@ -107,12 +117,39 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 		target.RawQuery = query.Encode()
 		endpoint = target.String()
 	}
-	request, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(archive))
+	payload := archive
+	contentType := "application/gzip"
+	if a.Request.Remediation == nil {
+		bundle, err := w.Store.ActiveIndicators(ctx)
+		if err != nil {
+			return err
+		}
+		if len(bundle) > 0 {
+			var body bytes.Buffer
+			m := multipart.NewWriter(&body)
+			part, err := m.CreateFormFile("archive", "snapshot.tar.gz")
+			if err != nil {
+				return err
+			}
+			if _, err = part.Write(archive); err != nil {
+				return err
+			}
+			if err = m.WriteField("indicators", string(bundle)); err != nil {
+				return err
+			}
+			if err = m.Close(); err != nil {
+				return err
+			}
+			payload = body.Bytes()
+			contentType = m.FormDataContentType()
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	request.Header.Set("Authorization", "Bearer "+w.ScannerToken)
-	request.Header.Set("Content-Type", "application/gzip")
+	request.Header.Set("Content-Type", contentType)
 	client := &http.Client{Timeout: 4 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(request)
 	if err != nil {
@@ -140,11 +177,14 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if json.Unmarshal(data, &output) != nil {
 		return errors.New("invalid scanner result")
 	}
-	key, digest, err := w.Artifacts.PutSBOM(ctx, output.SBOM)
-	if err != nil {
-		return err
+	var key, digest string
+	if len(output.SBOM) > 0 {
+		key, digest, err = w.Artifacts.PutSBOM(ctx, output.SBOM)
+		if err != nil {
+			return err
+		}
 	}
 	stages := []assessments.Stage{{Name: "resolve", Status: "ok"}, {Name: "fetch", Status: "ok"}}
 	stages = append(stages, output.Stages...)
-	return w.Store.Complete(ctx, *a, assessments.Result{Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
+	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
 }

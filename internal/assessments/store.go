@@ -57,6 +57,15 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID) (Assessment, error) {
 	return scan(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, id))
 }
 func (s *Store) Enqueue(ctx context.Context, request Request, actor uuid.UUID, name, key string) (Assessment, bool, error) {
+	return s.enqueue(ctx, request, actor, name, key, nil)
+}
+func (s *Store) EnqueueWebhook(ctx context.Context, request Request, actor uuid.UUID, name, key string, raw []byte) (Assessment, bool, error) {
+	if !json.Valid(raw) || len(raw) > 1<<20 {
+		return Assessment{}, false, ErrInput
+	}
+	return s.enqueue(ctx, request, actor, name, key, raw)
+}
+func (s *Store) enqueue(ctx context.Context, request Request, actor uuid.UUID, name, key string, raw []byte) (Assessment, bool, error) {
 	if err := request.Validate(); err != nil {
 		return Assessment{}, false, err
 	}
@@ -68,6 +77,9 @@ func (s *Store) Enqueue(ctx context.Context, request Request, actor uuid.UUID, n
 	}
 	body, _ := json.Marshal(request)
 	hash := Hash(body)
+	if raw != nil {
+		hash = Hash(append(append([]byte{}, body...), raw...))
+	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Assessment{}, false, err
@@ -146,7 +158,11 @@ func (s *Store) Enqueue(ctx context.Context, request Request, actor uuid.UUID, n
 			return a, false, err
 		}
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.inbound_events(id,assessment_id,actor_id,body) VALUES($1,$2,$3,$4)`, uuid.New(), a.ID, actor, body); err != nil {
+	eventBody := body
+	if raw != nil {
+		eventBody = raw
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.inbound_events(id,assessment_id,actor_id,body) VALUES($1,$2,$3,$4)`, uuid.New(), a.ID, actor, eventBody); err != nil {
 		return a, false, err
 	}
 	details, _ := json.Marshal(map[string]any{"actor_id": actor, "requested_by": name})

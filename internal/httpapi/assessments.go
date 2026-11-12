@@ -108,6 +108,7 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 400, "use the scoped remediation endpoint")
 				return
 			}
+			input.AutoRemediation = h.remediationEnabled
 			a, replayed, err := h.store.Enqueue(ctx, input, principal.ID, principal.Name, r.Header.Get("Idempotency-Key"))
 			if err != nil {
 				assessmentError(w, err)
@@ -194,6 +195,20 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch parts[1] {
+	case "remediations":
+		plans, err := h.store.AutomaticPlans(ctx, id)
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		writeJSON(w, 200, plans)
+	case "files":
+		data, err := h.store.Files(ctx, id)
+		if err != nil {
+			writeError(w, 409, "file evidence unavailable")
+			return
+		}
+		writeJSON(w, 200, data)
 	case "components":
 		after := -1
 		if raw := r.URL.Query().Get("cursor"); raw != "" {

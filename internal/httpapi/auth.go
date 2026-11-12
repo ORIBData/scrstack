@@ -25,9 +25,10 @@ type TokenStore interface {
 }
 type principalKey struct{}
 type Security struct {
-	RemediationEnabled bool
-	Assessments        *assessments.Store
-	Artifacts          interface {
+	GitHubWebhookSecret string
+	RemediationEnabled  bool
+	Assessments         *assessments.Store
+	Artifacts           interface {
 		GetSBOM(context.Context, string) ([]byte, error)
 	}
 	Store          TokenStore
@@ -64,6 +65,43 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle(BasePath+"/tokens", security.protect("admin", http.HandlerFunc(security.tokens)))
 	mux.Handle(BasePath+"/tokens/", security.protect("admin", http.HandlerFunc(security.tokens)))
 	if security.Assessments != nil {
+		for _, path := range []string{"/settings/retention", "/settings/retention:preview", "/settings/retention:purge"} {
+			mux.Handle(BasePath+path, security.protect("admin", retentionHandler(security.Assessments)))
+		}
+		mux.Handle("POST "+BasePath+"/webhooks/github", githubWebhook(security.Assessments, security.GitHubWebhookSecret, security.RemediationEnabled))
+		mux.Handle(BasePath+"/feeds/indicators", security.protect("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+			defer cancel()
+			if r.Method == "GET" {
+				body, err := security.Assessments.ActiveIndicators(ctx)
+				if err != nil {
+					assessmentError(w, err)
+					return
+				}
+				if len(body) == 0 {
+					writeError(w, 404, "no active indicators")
+					return
+				}
+				writeJSON(w, 200, body)
+				return
+			}
+			if r.Method != "PUT" {
+				writeError(w, 405, "method not allowed")
+				return
+			}
+			body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4<<20))
+			if err != nil {
+				writeError(w, 413, "indicator bundle too large")
+				return
+			}
+			actor := r.Context().Value(principalKey{}).(connections.Token)
+			version, err := security.Assessments.ImportIndicators(ctx, actor.ID, body)
+			if err != nil {
+				assessmentError(w, err)
+				return
+			}
+			writeJSON(w, 201, map[string]string{"version": version})
+		})))
 		h := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts, remediationEnabled: security.RemediationEnabled}
 		mux.Handle("POST "+BasePath+"/assessments", security.protect("write|trigger", h))
 		mux.Handle("GET "+BasePath+"/assessments", security.protect("read|write|trigger", h))

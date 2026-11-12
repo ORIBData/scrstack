@@ -27,6 +27,8 @@ jobs:
         run: make database-test
       - name: API image and disposable hosted-storage integration
         run: make storage-integration
+      - name: Private ClamAV clean and EICAR fixtures
+        run: make malware-test
       - name: Go vulnerability assessment
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
       - name: Scanner dependency vulnerability assessment

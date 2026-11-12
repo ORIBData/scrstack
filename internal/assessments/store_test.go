@@ -174,6 +174,53 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	if err := s.CompletePlan(ctx, runningPlan, key, digest); !errors.Is(err, assessments.ErrLease) {
 		t.Fatal("stale plan accepted", err)
 	}
+	// Indicator imports preserve version history; duplicate versions cannot deactivate the current bundle.
+	bundle := `{"version":"test-v1","indicators":[{"id":"ioc-1","type":"domain","value":"bad.example","valid_until":"2099-01-01T00:00:00Z"}]}`
+	if _, err := s.ImportIndicators(ctx, actor, []byte(bundle)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ImportIndicators(ctx, actor, []byte(bundle)); !errors.Is(err, assessments.ErrConflict) {
+		t.Fatal("indicator version mutated", err)
+	}
+	if raw, err := s.ActiveIndicators(ctx); err != nil || !strings.Contains(string(raw), "test-v1") {
+		t.Fatal("active bundle lost", err)
+	}
+	// Completion durably schedules automatic remediation; repeated dispatch creates one child.
+	autoRequest := request
+	autoRequest.AutoRemediation = true
+	if _, _, err := s.Enqueue(ctx, autoRequest, actor, "automation", "automatic"); err != nil {
+		t.Fatal(err)
+	}
+	auto, err := s.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(ctx, auto, result); err != nil {
+		t.Fatal(err)
+	}
+	dispatchErrors := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); dispatchErrors <- s.DispatchAutomaticPlan(ctx) }()
+	}
+	wg.Wait()
+	close(dispatchErrors)
+	for err := range dispatchErrors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plans, err := s.AutomaticPlans(ctx, auto.ID)
+	if err != nil || len(plans) != 1 {
+		t.Fatal("automatic plan missing", err)
+	}
+	child, err := s.Claim(ctx)
+	if err != nil || child.Request.Remediation == nil || child.Request.Remediation.Parent != auto.ID {
+		t.Fatal("automatic child missing", err)
+	}
+	if err := s.Cancel(ctx, child.ID, actor); err != nil {
+		t.Fatal(err)
+	}
 	// An incomplete follow-up with no detections must not erase prior findings.
 	if _, _, err := s.Enqueue(ctx, request, actor, "automation", "followup"); err != nil {
 		t.Fatal(err)
@@ -190,6 +237,40 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	current, err := s.Findings(ctx, uuid.Nil, a.AssetID, uuid.Nil)
 	if err != nil || len(current) != 1 || current[0].Status != "accepted" {
 		t.Fatal("incomplete scan erased finding", err)
+	}
+
+	policy, err := s.Retention(ctx)
+	if err != nil || policy.InboundEventDays != 0 {
+		t.Fatal("unsafe retention default", err)
+	}
+	policy, err = s.SetRetention(ctx, actor, policy.Revision, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetRetention(ctx, actor, policy.Revision-1, 2); !errors.Is(err, assessments.ErrConflict) {
+		t.Fatal("stale retention write accepted", err)
+	}
+	pending, _, err := s.Enqueue(ctx, request, actor, "automation", "retention-protected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE "+schema+".inbound_events SET created_at=now()-interval '2 days'"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := s.PreviewRetention(ctx, 1)
+	if err != nil || preview["rows"] == 0 {
+		t.Fatal("retention preview empty", err)
+	}
+	purged, err := s.PurgeEvents(ctx, actor, policy.Revision)
+	if err != nil || purged != preview["rows"] {
+		t.Fatal("purge differs from preview", err)
+	}
+	var protected int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+schema+".inbound_events WHERE assessment_id=$1", pending.ID).Scan(&protected); err != nil || protected != 1 {
+		t.Fatal("pending event lost", err)
+	}
+	if records, err := s.Findings(ctx, uuid.Nil, a.AssetID, uuid.Nil); err != nil || len(records) != 1 {
+		t.Fatal("retention erased findings", err)
 	}
 	if err := s.Complete(ctx, a, result); !errors.Is(err, assessments.ErrLease) {
 		t.Fatal("completed job accepted duplicate result", err)

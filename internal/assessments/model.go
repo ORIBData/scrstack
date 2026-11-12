@@ -38,10 +38,11 @@ type RemediationRequest struct {
 }
 
 type Request struct {
-	Remediation *RemediationRequest `json:"remediation,omitempty"`
-	Target      Target              `json:"target"`
-	Connection  string              `json:"connection,omitempty"`
-	Trigger     struct {
+	AutoRemediation bool                `json:"auto_remediation,omitempty"`
+	Remediation     *RemediationRequest `json:"remediation,omitempty"`
+	Target          Target              `json:"target"`
+	Connection      string              `json:"connection,omitempty"`
+	Trigger         struct {
 		Origin     string `json:"origin,omitempty"`
 		Event      string `json:"event,omitempty"`
 		DeliveryID string `json:"delivery_id,omitempty"`
@@ -119,7 +120,15 @@ type Finding struct {
 	LastSeen    time.Time       `json:"last_seen"`
 	WaiverUntil *time.Time      `json:"waiver_until,omitempty"`
 }
+type FileEvidence struct {
+	Path    string `json:"path"`
+	SHA256  string `json:"sha256"`
+	Size    int64  `json:"size"`
+	Malware string `json:"malware"`
+}
+
 type Result struct {
+	Files      []FileEvidence
 	Commit     string
 	RefMoved   bool
 	Stages     []Stage
@@ -139,7 +148,7 @@ func verdict(r Result) (string, map[string]int) {
 	counts := map[string]int{"total": len(r.Findings)}
 	for _, f := range r.Findings {
 		counts[f.Severity]++
-		if f.Severity == "critical" || f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "integrity" {
+		if f.Severity == "critical" || f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "ioc_match" {
 			v = "fail"
 		} else if f.Severity == "high" && v == "pass" {
 			v = "warn"

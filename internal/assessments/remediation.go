@@ -3,6 +3,8 @@ package assessments
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/jackc/pgx/v5"
 	"path"
 	"strings"
 
@@ -82,4 +84,75 @@ func (s *Store) PlanKey(ctx context.Context, id uuid.UUID) (string, error) {
 	var key string
 	err := s.pool.QueryRow(ctx, `SELECT artifact_key FROM `+s.schema+`.remediation_results WHERE assessment_id=$1`, id).Scan(&key)
 	return key, err
+}
+
+// DispatchAutomaticPlan uses a durable outbox. A crash after enqueue is recovered
+// by looking up the parent/manifest pair before enqueueing again.
+func (s *Store) DispatchAutomaticPlan(ctx context.Context) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	// A dispatcher calls admission on another pooled connection. Let competing
+	// dispatchers return immediately instead of each holding a pool slot waiting.
+	var dispatch bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext($1))`, s.schema+".automatic_remediation_dispatch").Scan(&dispatch); err != nil {
+		return err
+	}
+	if !dispatch {
+		return nil
+	}
+	var parent uuid.UUID
+	var manifest string
+	err = tx.QueryRow(ctx, `SELECT parent_id,manifest FROM `+s.schema+`.automatic_remediations WHERE status='pending' ORDER BY parent_id,manifest LIMIT 1 FOR UPDATE SKIP LOCKED`).Scan(&parent, &manifest)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var id uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT id FROM `+s.schema+`.assessments WHERE request->'remediation'->>'parent_assessment_id'=$1 AND request->'remediation'->>'manifest'=$2 LIMIT 1`, parent.String(), manifest).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		a, loadErr := s.Get(ctx, parent)
+		if loadErr != nil {
+			return loadErr
+		}
+		plan, _, enqueueErr := s.EnqueuePlan(ctx, parent, a.AssetID, a.ActorID, a.RequestedBy, "auto-"+Hash([]byte(parent.String()+manifest)), manifest, "in-place")
+		if enqueueErr != nil {
+			if errors.Is(enqueueErr, ErrScope) || errors.Is(enqueueErr, ErrInput) {
+				_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.automatic_remediations SET status='blocked',error='Asset scope or parent eligibility changed' WHERE parent_id=$1 AND manifest=$2`, parent, manifest)
+				if err != nil {
+					return err
+				}
+				return tx.Commit(ctx)
+			}
+			return enqueueErr
+		}
+		id = plan.ID
+	} else if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.automatic_remediations SET status='queued',assessment_id=$3 WHERE parent_id=$1 AND manifest=$2`, parent, manifest, id)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+func (s *Store) AutomaticPlans(ctx context.Context, parent uuid.UUID) ([]json.RawMessage, error) {
+	rows, err := s.pool.Query(ctx, `SELECT jsonb_build_object('manifest',p.manifest,'dispatch_status',p.status,'assessment_id',p.assessment_id,'job_status',a.status,'error',p.error) FROM `+s.schema+`.automatic_remediations p LEFT JOIN `+s.schema+`.assessments a ON a.id=p.assessment_id WHERE p.parent_id=$1 ORDER BY manifest`, parent)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []json.RawMessage{}
+	for rows.Next() {
+		var raw json.RawMessage
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		out = append(out, raw)
+	}
+	return out, rows.Err()
 }

@@ -57,8 +57,7 @@ register statuses change. Accepted risk requires admin and a future expiry of at
 closes findings after a complete current-ref assessment; partial results retain history.
 
 S3 success followed by a database failure can leave an unreferenced immutable object.
-This is intentional to avoid a database reference to a missing artifact. No garbage
-collection or destructive retention action is enabled. A production retention feature
+This is intentional to avoid a database reference to a missing artifact. S3 garbage collection is not enabled. Raw webhook-event retention is available separately and defaults to keep forever. A production retention feature
 must reference-check objects and preserve audit/history before deletion.
 
 ## Deployment and resource boundaries
@@ -86,7 +85,7 @@ per file and 10,000 files. Unsupported/oversized inputs fail rather than pass si
 
 ## Guided remediation
 
-`SCRS_REMEDIATION_ENABLED=false` is the default. `/remediation/capabilities` exposes
+`SCRS_REMEDIATION_ENABLED=true` is now configured in dotenv and Compose. `/remediation/capabilities` exposes
 runtime enablement. The implemented adapter accepts only npm `package-lock.json` with
 `in-place` strategy. A write token posts to `/assets/{id}/remediations` with
 `assessment_id`, `manifest` and optional `strategy`. The manifest must occur in that
@@ -98,22 +97,25 @@ configured egress is a CONNECT proxy restricted to public IPs for deps.dev and t
 public npm registry on port 443. Plans go to content-addressed S3 storage. No commit,
 PR or repository write occurs. Plan completion is never a security pass; proposed
 changes need review and a fresh assessment. Maven and other strategies are unavailable.
-The provider-backed fix path and deployed egress controls have not passed acceptance;
-leave this feature disabled until those tests are completed.
+The actual upstream command passed synthetic empty-plan and vulnerable-lodash tests
+through the allowlisted proxy with public deps.dev data. Automatic plans are scheduled
+through a transactional outbox for supported npm manifests after assessments complete.
+`GET /assessments/{id}/remediations` shows child job and dispatch state. Disabled or
+changed provider scope blocks dispatch. Unsupported ecosystems remain unsupported.
+Deployed egress isolation and representative private-provider acceptance are still open.
 
 ## Remaining product gates
 
-- Direct/relay webhook authentication, batch triggers and outbound delivery/outbox.
+- Relay adapters, other GitHub event types, batch triggers and outbound delivery/outbox. Signed direct GitHub pushes now work.
 - Full OSV advisory JSONB mirror and provenance, KEV/EPSS, NVD/CVE/VEX and custom feeds.
-- Integrated ClamAV/YARA, IOC rules, integrity baselines/events and malicious response.
+- Independent YARA, wider indicator types, full provider integrity signals and malicious-response notifications. ClamAV, SHA256/domain IOCs and workflow checks are now integrated.
 - OCI image/digest fetching, layer attribution, registry event adapters and PR assessment.
-- Owners, maintenance/retention previews, metrics/alerts and full contextual reports.
+- Owners, remaining retention classes and scheduling, metrics/alerts and full contextual reports.
 - Licensing/SPDX/compliance, SAST analyzers and reachability.
 - Real GitHub/private-repository acceptance; hosted backup/restore and failure/load tests;
   exact published image, signature, Dokploy domain/TLS and deployed restart recovery.
 
-Consequently successful execution currently returns `incomplete`: malware, IOC and
-integrity coverage is explicitly skipped. Do not interpret it as a clean repository.
+Consequently successful execution can still return `incomplete`: independent YARA and full integrity coverage remain missing; absent/expired IOC bundles and unavailable or stale ClamAV also prevent complete coverage. Do not interpret incomplete as a clean repository.
 
 ## Verification
 
@@ -130,3 +132,39 @@ Upstream contracts: [OSV offline mode](https://google.github.io/osv-scanner/usag
 [OSV configuration override](https://google.github.io/osv-scanner/configuration/),
 [guided remediation](https://github.com/google/osv-scanner/blob/v2.7.1/docs/guided-remediation.md),
 and [GitHub repository contents/archive API](https://docs.github.com/en/rest/repos/contents).
+
+
+## Content inspection, inbound events and bounded retention
+
+The file pass runs before dependency analysis, with a 90-second budget. SCA then has
+a two-minute budget. Missing manifests or OSV failures retain file detections rather
+than discard them. The internal scanner accepts bounded multipart archive plus the
+active IOC bundle, supplied by the trusted worker. `GET /assessments/{id}/files`
+returns path, SHA256, size and malware status; source content is never persisted.
+ClamAV streams regular files up to 25 MiB via INSTREAM. Errors, engine limits,
+oversize files and stale/unavailable signature dates make coverage partial.
+Signature versions older than 26 hours produce posture findings. See the upstream
+[ClamD protocol](https://docs.clamav.net/manual/Usage/ClamdProtocol.html).
+
+An admin can `PUT /feeds/indicators` with an immutable version and up to 10,000
+SHA256/domain indicators, each with an ID and expiry. Import atomically replaces the
+active version while retaining prior JSONB and audit history. Expired indicators do
+not match. Text-domain extraction is capped at 1 MiB per file; skipped text means
+partial coverage. Other feed types and automatic remote feed synchronization remain
+unimplemented. Workflow `toJSON(secrets)` matches are critical; changes to workflow
+file hashes compared with the prior assessment raise high-severity integrity entries.
+This is a change baseline, not a last-known-good declaration.
+
+`POST /webhooks/github` verifies GitHub's HMAC-SHA256 against the exact raw body,
+requires a delivery UUID and only admits pushes for discovered in-scope repositories.
+Raw JSON, job and replay record commit atomically. Delivery replay is protected for
+24 hours; unsupported events are explicit 422 responses. Deleted branches are ignored.
+Set `SCRS_GITHUB_WEBHOOK_SECRET` to the same random 32+ character value in GitHub;
+blank disables ingress. Body and concurrent-handler limits apply before parsing.
+
+Raw ingress retention is managed by admin-only `/settings/retention`, `:preview` and
+`:purge`. Set `inbound_event_days` (zero keeps forever), using the policy ETag in
+`If-Match` on updates and purge. Preview counts eligible rows and stored JSON bytes.
+Purge removes at most 1000 old events and excludes queued/running assessment events.
+It never deletes assessments, findings, audit history or S3 artifacts. Scheduled purge,
+per-class PRD retention defaults and artifact garbage collection remain open.

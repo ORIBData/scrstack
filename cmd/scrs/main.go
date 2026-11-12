@@ -164,7 +164,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Assessments: assessmentStore, Artifacts: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Assessments: assessmentStore, Artifacts: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,
