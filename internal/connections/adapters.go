@@ -293,7 +293,7 @@ func (a NativeAdapters) gar(ctx context.Context, c Connection, secret json.RawMe
 	if json.Unmarshal(cred.ServiceAccountJSON, &keyInfo) != nil || keyInfo.Type != "service_account" || keyInfo.TokenURI != "https://oauth2.googleapis.com/token" {
 		return nil, errors.New("GAR credential must be a Google service account JSON key with the official token URI")
 	}
-	googleCreds, err := google.CredentialsFromJSON(ctx, cred.ServiceAccountJSON, "https://www.googleapis.com/auth/cloud-platform.read-only")
+	googleCreds, err := google.CredentialsFromJSONWithType(ctx, cred.ServiceAccountJSON, google.ServiceAccount, "https://www.googleapis.com/auth/cloud-platform.read-only")
 	if err != nil {
 		return nil, errors.New("GAR service account JSON invalid")
 	}

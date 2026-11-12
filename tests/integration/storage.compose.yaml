@@ -110,7 +110,7 @@ services:
       - "Content-Type: application/json"
       - --data
       - '{"provider":"github","name":"github-second-org","config":{"organization":"second-org","auth_type":"fine_grained_pat"},"scope":{"include":["second-org/*"]},"credential":{"token":"synthetic-test-only-token"}}'
-      - http://api:8080/scrs/v1/connections
+      - http://api:7000/scrs/v1/connections
     depends_on:
       api:
         condition: service_healthy

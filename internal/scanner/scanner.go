@@ -10,11 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -193,7 +195,7 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 		}
 		// Warnings may signal partial package extraction; fail closed rather than
 		// treating a parse failure as a successful clean assessment.
-		if strings.Contains(strings.ToLower(stderr.String()), "error") || strings.Contains(strings.ToLower(stderr.String()), "warning") {
+		if reportsProblem(stderr.String()) {
 			return nil, errors.New("scanner reported incomplete coverage")
 		}
 		if !json.Valid(stdout.Bytes()) {
@@ -327,6 +329,24 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 
 	return out, nil
 }
+
+// OSV-Scanner progress lines echo repository paths, which are attacker-chosen
+// text: a lockfile under "packages/error-pages/" must not mark coverage partial.
+var progressLine = regexp.MustCompile(`^(Scanning dir .+|Scanned .+ file and found \d+ packages?)$`)
+
+func reportsProblem(stderr string) bool {
+	for _, line := range strings.Split(stderr, "\n") {
+		if progressLine.MatchString(strings.TrimSpace(line)) {
+			continue
+		}
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "error") || strings.Contains(lower, "warning") {
+			return true
+		}
+	}
+	return false
+}
+
 func (e Engine) Handler(token string) http.Handler {
 	expected := sha256.Sum256([]byte(token))
 	slots := make(chan struct{}, 1)
@@ -357,6 +377,7 @@ func (e Engine) Handler(token string) http.Handler {
 		}
 		body, indicators, err := scanInput(w, r)
 		if err != nil {
+			slog.Warn("scan input rejected", "error", err)
 			http.Error(w, "archive too large", 413)
 			return
 		}
@@ -365,6 +386,7 @@ func (e Engine) Handler(token string) http.Handler {
 		if r.URL.Path == "/remediate" {
 			result, err := e.Remediate(ctx, body, r.URL.Query().Get("manifest"), r.URL.Query().Get("strategy"))
 			if err != nil {
+				slog.Warn("remediation failed", "error", err)
 				http.Error(w, "remediation unavailable or failed", 422)
 				return
 			}
@@ -376,6 +398,7 @@ func (e Engine) Handler(token string) http.Handler {
 		engine.Indicators = indicators
 		result, err := engine.Run(ctx, body)
 		if err != nil {
+			slog.Warn("scan failed", "error", err)
 			http.Error(w, "scan failed or incomplete", 422)
 			return
 		}

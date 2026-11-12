@@ -32,7 +32,7 @@ services:
     restart: unless-stopped
     environment:
       <<: *scrs-storage-env
-      SCRS_HTTP_ADDR: ":8080"
+      SCRS_HTTP_ADDR: ":7000"
       SCRS_GITHUB_WEBHOOK_SECRET: ${SCRS_GITHUB_WEBHOOK_SECRET:-}
       SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY}
       SCRS_BOOTSTRAP_API_TOKEN: ${SCRS_BOOTSTRAP_API_TOKEN:?Set SCRS_BOOTSTRAP_API_TOKEN}
@@ -54,7 +54,7 @@ services:
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}.tls=true"
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}.tls.certresolver=${SCRS_CERT_RESOLVER:-letsencrypt}"
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}.service=${SCRS_ROUTER_NAME:-scrs}"
-      - "traefik.http.services.${SCRS_ROUTER_NAME:-scrs}.loadbalancer.server.port=8080"
+      - "traefik.http.services.${SCRS_ROUTER_NAME:-scrs}.loadbalancer.server.port=7000"
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}-http.rule=Host(`${SCRS_DOMAIN}`) && (Path(`/scrs/v1`) || PathPrefix(`/scrs/v1/`))"
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}-http.entrypoints=${SCRS_HTTP_ENTRYPOINT:-web}"
       - "traefik.http.routers.${SCRS_ROUTER_NAME:-scrs}-http.middlewares=${SCRS_ROUTER_NAME:-scrs}-https"
@@ -62,7 +62,7 @@ services:
       - "traefik.http.middlewares.${SCRS_ROUTER_NAME:-scrs}-https.redirectscheme.scheme=https"
       - "traefik.http.middlewares.${SCRS_ROUTER_NAME:-scrs}-https.redirectscheme.permanent=true"
     expose:
-      - "8080"
+      - "7000"
     read_only: true
     cap_drop:
       - ALL
@@ -125,7 +125,10 @@ services:
       interval: 30s
       timeout: 3s
       retries: 3
-      start_period: 120s
+      # First deploy waits for feed-sync to download and validate the OSV
+      # archives (npm alone is ~220 MiB); the worker starts once this is healthy.
+      start_period: 15m
+      start_interval: 10s
 
   scrs-clamav:
     user: clamav

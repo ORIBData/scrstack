@@ -64,8 +64,14 @@ func githubWebhook(store *assessments.Store, secret string, remediation bool) ht
 				FullName string `json:"full_name"`
 			} `json:"repository"`
 		}
-		if json.Unmarshal(body, &payload) != nil || !strings.HasPrefix(payload.Ref, "refs/heads/") {
+		if json.Unmarshal(body, &payload) != nil || !strings.HasPrefix(payload.Ref, "refs/") {
 			writeError(w, 400, "invalid push payload")
+			return
+		}
+		// Tag and other non-branch pushes are valid GitHub deliveries; acknowledge
+		// them so GitHub does not record failures. Only branches are assessed.
+		if !strings.HasPrefix(payload.Ref, "refs/heads/") {
+			writeJSON(w, 200, map[string]string{"status": "ignored_non_branch_ref"})
 			return
 		}
 		if payload.Deleted {

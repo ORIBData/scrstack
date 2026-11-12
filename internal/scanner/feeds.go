@@ -105,13 +105,18 @@ func SyncFeeds(ctx context.Context, root string, ecosystems []string) error {
 	}
 	return nil
 }
+
+const maxFeedEntries = 1_000_000
+
 func validateFeed(filename string) error {
 	archive, err := zip.OpenReader(filename)
 	if err != nil {
 		return errors.New("invalid feed archive")
 	}
 	defer archive.Close()
-	if len(archive.File) == 0 || len(archive.File) > 200000 {
+	// The npm archive alone held ~232k records in Nov 2026 (mostly MAL- reports),
+	// so the cap leaves growth headroom; size limits below bound the expansion.
+	if len(archive.File) == 0 || len(archive.File) > maxFeedEntries {
 		return errors.New("feed entry count exceeded")
 	}
 	var total uint64

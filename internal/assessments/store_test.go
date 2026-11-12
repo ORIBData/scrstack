@@ -114,11 +114,10 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	for _, aid := range []uuid.UUID{id, second.ID} {
 		_ = s.Cancel(ctx, aid, actor)
 	}
-	a, _, err := s.Enqueue(ctx, request, actor, "automation", "complete")
-	if err != nil {
+	if _, _, err := s.Enqueue(ctx, request, actor, "automation", "complete"); err != nil {
 		t.Fatal(err)
 	}
-	a, err = s.Claim(ctx)
+	a, err := s.Claim(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +127,8 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, err := s.Get(ctx, a.ID)
-	if err != nil || saved.Status != "succeeded" || saved.Verdict != "incomplete" || saved.Counts["total"] != 1 {
-		t.Fatal("partial scan marked clean", err, saved.Verdict)
+	if err != nil || saved.Status != "succeeded" || saved.Verdict != "fail" || saved.Counts["total"] != 1 {
+		t.Fatal("critical detection in partial scan not gated as fail", err, saved.Verdict)
 	}
 	findings, err := s.Findings(ctx, a.ID, uuid.Nil, uuid.Nil)
 	if err != nil || len(findings) != 1 {
@@ -274,5 +273,49 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	}
 	if err := s.Complete(ctx, a, result); !errors.Is(err, assessments.ErrLease) {
 		t.Fatal("completed job accepted duplicate result", err)
+	}
+
+	// Webhook pushes name commit and ref. A full-coverage SCA scan of the ref's
+	// head closes vulnerability entries it no longer sees; waived entries do not gate.
+	allStages := []assessments.Stage{{Name: "resolve", Status: "ok"}, {Name: "fetch", Status: "ok"}, {Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok"}, {Name: "malware", Status: "ok"}, {Name: "ioc", Status: "ok"}, {Name: "integrity", Status: "partial"}}
+	waivedRun, err := s.Claim(ctx) // the queued retention-protected job
+	if err != nil || waivedRun.ID != pending.ID {
+		t.Fatal("pending job not claimable", err)
+	}
+	withHigh := result
+	withHigh.Stages = allStages
+	withHigh.Findings = append([]assessments.Finding{}, result.Findings[0])
+	withHigh.Findings = append(withHigh.Findings, assessments.Finding{Type: "vulnerability", AdvisoryID: "TEST-002", Title: "Synthetic high", Severity: "high", Score: 45, Component: assessments.Component{PURL: "pkg:npm/pkg@1.0.0"}, Evidence: json.RawMessage(`{}`), Guidance: json.RawMessage(`{}`)})
+	if err := s.Complete(ctx, waivedRun, withHigh); err != nil {
+		t.Fatal(err)
+	}
+	if saved, err := s.Get(ctx, waivedRun.ID); err != nil || saved.Verdict != "incomplete" || saved.Counts["waived"] != 1 {
+		t.Fatal("waived critical still gated or partial integrity hidden", err, saved.Verdict, saved.Counts)
+	}
+	pushed := request
+	pushed.Target.Commit = strings.Repeat("b", 40)
+	if _, _, err := s.Enqueue(ctx, pushed, actor, "automation", "webhook-style"); err != nil {
+		t.Fatal(err)
+	}
+	pushRun, err := s.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clean := result
+	clean.Stages = allStages
+	clean.Findings = nil
+	if err := s.Complete(ctx, pushRun, clean); err != nil {
+		t.Fatal(err)
+	}
+	register, err := s.Findings(ctx, uuid.Nil, a.AssetID, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	statuses := map[string]string{}
+	for _, f := range register {
+		statuses[f.AdvisoryID] = f.Status
+	}
+	if statuses["TEST-002"] != "fixed" || statuses["TEST-001"] != "accepted" {
+		t.Fatal("webhook-style complete scan did not close fixed entry or altered waiver", statuses)
 	}
 }

@@ -181,8 +181,9 @@ func (s Security) cors(next http.Handler) http.Handler {
 			}
 			if allowed {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, If-Match")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Expose-Headers", "Location, ETag, Retry-After, X-Next-Cursor, X-Request-Id, Idempotent-Replayed")
 			}
 			if r.Method == http.MethodOptions {
 				if !allowed {
@@ -287,7 +288,7 @@ func (s Security) clientIP(peer netip.Addr, forwarded string) netip.Addr {
 		}
 		return false
 	}
-	if !trusted(peer) || len(forwarded) > 4096 {
+	if !trusted(peer) || len(forwarded) > 4096 || strings.TrimSpace(forwarded) == "" {
 		return peer.Unmap()
 	}
 	hops := strings.Split(forwarded, ",")

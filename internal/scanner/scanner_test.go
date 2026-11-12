@@ -140,3 +140,26 @@ func TestFeedFreshness(t *testing.T) {
 		}
 	}
 }
+func TestScannerProgressPathsAreNotProblems(t *testing.T) {
+	benign := "Scanning dir /work/scrs-scan-1/checkout\nScanned /work/scrs-scan-1/checkout/packages/error-pages/package-lock.json file and found 12 packages\nScanned /work/x/warnings/go.mod file and found 1 package\n"
+	if reportsProblem(benign) {
+		t.Fatal("repository path text treated as scanner problem")
+	}
+	for _, bad := range []string{benign + "Error during extraction of yarn.lock\n", "Warning: lockfile could not be parsed\n"} {
+		if !reportsProblem(bad) {
+			t.Fatalf("scanner problem ignored: %q", bad)
+		}
+	}
+}
+
+// SCRS_TEST_OSV_FEED_ZIP points at a downloaded ecosystem all.zip, e.g. npm's,
+// which outgrew the original 200k-entry cap.
+func TestRealFeedArchiveValidates(t *testing.T) {
+	archive := os.Getenv("SCRS_TEST_OSV_FEED_ZIP")
+	if archive == "" {
+		t.Skip("set SCRS_TEST_OSV_FEED_ZIP to a downloaded OSV all.zip")
+	}
+	if err := validateFeed(archive); err != nil {
+		t.Fatal(err)
+	}
+}

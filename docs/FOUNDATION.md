@@ -48,7 +48,7 @@ make storage-check
 python3 scripts/run_with_env.py bin/scrs api
 ```
 
-Open `http://localhost:8080/scrs/v1/docs`. Swagger UI
+Open `http://localhost:7000/scrs/v1/docs`. Swagger UI
 assets are pinned and bundled in the API image, so the page does not depend on
 a CDN. The API checks storage once at startup. The readiness route also checks
 PostgreSQL, Redis and S3, caching the result for ten seconds. `healthz` only
@@ -118,7 +118,7 @@ authorize connection management. Add each GitHub organization, Docker Hub
 namespace or GAR project through the REST API after deployment. See
 [PROVIDERS.md](PROVIDERS.md).
 In Dokploy's **Domains** settings, select
-`scrs-api`, port `8080`, and your HTTPS hostname. Dokploy attaches the selected
+`scrs-api`, port `7000`, and your HTTPS hostname. Dokploy attaches the selected
 service to Traefik and provides the routing labels. Preview the generated
 Compose configuration before deploying. No host port is published by this
 Compose file. Do not configure a `StripPrefix` middleware. If you supplied

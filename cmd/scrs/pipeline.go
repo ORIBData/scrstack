@@ -51,19 +51,27 @@ func pipelineCommand() error {
 		return nil
 
 	case "feed-sync":
+		// Failures back off exponentially: a persistent rejection must not
+		// re-download hundreds of MiB every minute.
+		retry := time.Minute
 		for {
 			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 			err := scanner.SyncFeeds(syncCtx, setting("SCRS_FEED_ROOT", "/feeds"), strings.Split(setting("SCRS_OSV_ECOSYSTEMS", "npm,Go"), ","))
 			cancel()
 			if err != nil {
-				logger.Error("OSV feed synchronization failed")
+				logger.Error("OSV feed synchronization failed", "error", err, "retry_in", retry.String())
+			} else {
+				logger.Info("OSV feed synchronized")
 			}
 			if len(os.Args) < 3 || os.Args[2] != "--loop" {
 				return err
 			}
 			delay := 6 * time.Hour
 			if err != nil {
-				delay = time.Minute
+				delay = retry
+				retry = min(retry*2, time.Hour)
+			} else {
+				retry = time.Minute
 			}
 			select {
 			case <-ctx.Done():

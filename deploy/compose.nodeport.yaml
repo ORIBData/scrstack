@@ -3,4 +3,4 @@
 services:
   scrs-api:
     ports:
-      - "127.0.0.1:${SCRS_HTTP_NODE_PORT:-8080}:8080"
+      - "127.0.0.1:${SCRS_HTTP_NODE_PORT:-7000}:7000"

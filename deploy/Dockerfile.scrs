@@ -27,5 +27,5 @@ COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-ce
 COPY --from=build /out/scrs /usr/local/bin/scrs
 COPY --from=scanner-build /out/osv-scanner /usr/local/bin/osv-scanner
 USER 65532:65532
-EXPOSE 8080
+EXPOSE 7000
 ENTRYPOINT ["/usr/local/bin/scrs"]

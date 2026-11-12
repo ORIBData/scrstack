@@ -13,7 +13,7 @@ paths:
       description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. Only push and ping are supported. Delivery replay is idempotent for 24 hours. No bearer token is used on this provider endpoint.
       responses:
         '202': {description: Push durably queued with raw event}
-        '200': {description: Replay, ping or deleted-ref acknowledgement}
+        '200': {description: Replay, ping, deleted-ref or non-branch (tag) push acknowledgement}
         '401': {description: Invalid provider signature}
         '404': {description: Repository outside registered scope}
         '409': {description: Same delivery ID with different payload}

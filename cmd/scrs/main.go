@@ -75,10 +75,10 @@ func main() {
 
 	addr := os.Getenv("SCRS_HTTP_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		addr = ":7000"
 	}
 	if !strings.HasPrefix(addr, ":") || len(addr) < 2 {
-		fmt.Fprintln(os.Stderr, "SCRS_HTTP_ADDR must be a port such as :8080")
+		fmt.Fprintln(os.Stderr, "SCRS_HTTP_ADDR must be a port such as :7000")
 		os.Exit(2)
 	}
 	cfg, err := storage.ConfigFromEnv()
@@ -273,7 +273,7 @@ func manageConnections() error {
 func healthcheck() error {
 	addr := os.Getenv("SCRS_HTTP_ADDR")
 	if addr == "" {
-		addr = ":8080"
+		addr = ":7000"
 	}
 	if !strings.HasPrefix(addr, ":") {
 		return errors.New("healthcheck requires a port-only SCRS_HTTP_ADDR")

@@ -156,15 +156,39 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if err = tx.SendBatch(ctx, batch).Close(); err != nil {
 		return err
 	}
-	// Only complete scans of a currently resolved ref can close prior findings.
-	if r.Complete && !r.RefMoved && a.Request.Target.Commit == "" && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID)
+	// Only a scan of the ref's current head can close prior findings, and only
+	// for finding types whose producing stages completed. A webhook push names
+	// both commit and ref; ref_moved tells whether that commit is still the head.
+	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
 		if err != nil {
 			return err
 		}
 	}
 	r.Findings = unique
-	v, counts := verdict(r)
+	// Register triage (waivers, suppressions) applies to the gate; snapshots keep the raw detection.
+	fingerprints := make([]string, len(unique))
+	for i, f := range unique {
+		fingerprints[i] = f.Fingerprint
+	}
+	waived := map[string]bool{}
+	rows, err := tx.Query(ctx, `SELECT fingerprint FROM `+s.schema+`.findings WHERE fingerprint=ANY($1) AND (status IN ('suppressed','false_positive') OR (status='accepted' AND waiver_until>clock_timestamp()))`, fingerprints)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var fp string
+		if err := rows.Scan(&fp); err != nil {
+			rows.Close()
+			return err
+		}
+		waived[fp] = true
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	v, counts := verdict(r, waived)
 	stages, _ := json.Marshal(r.Stages)
 	countJSON, _ := json.Marshal(counts)
 	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256)

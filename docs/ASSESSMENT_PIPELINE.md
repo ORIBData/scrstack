@@ -53,8 +53,12 @@ workers until pool-aware scheduling and load acceptance have been completed.
 Finding identity includes asset, ref, advisory, type, component PURL and manifest path.
 Duplicate detections do not inflate counts. Assessment snapshots remain immutable when
 register statuses change. Accepted risk requires admin and a future expiry of at most
-90 days; expired acceptance reads as open. Manual `fixed` is not allowed. Absence only
-closes findings after a complete current-ref assessment; partial results retain history.
+90 days; expired acceptance reads as open. Manual `fixed` is not allowed. Absence
+closes a finding only when the scan covered the ref's current head (`ref_moved` false,
+including webhook pushes that name both commit and ref) and every stage that produces
+that finding type completed (for example inventory, SBOM and vulnerability matching for
+`vulnerability`). Types whose producing stage was partial or skipped retain history;
+integrity entries therefore stay open until reviewed while that stage remains partial.
 
 S3 success followed by a database failure can leave an unreferenced immutable object.
 This is intentional to avoid a database reference to a missing artifact. S3 garbage collection is not enabled. Raw webhook-event retention is available separately and defaults to keep forever. A production retention feature
@@ -116,6 +120,13 @@ Deployed egress isolation and representative private-provider acceptance are sti
   exact published image, signature, Dokploy domain/TLS and deployed restart recovery.
 
 Consequently successful execution can still return `incomplete`: independent YARA and full integrity coverage remain missing; absent/expired IOC bundles and unavailable or stale ClamAV also prevent complete coverage. Do not interpret incomplete as a clean repository.
+
+Verdict precedence is `fail` > `incomplete` > `warn` > `pass`. A critical, malware,
+malicious-dependency, IOC or integrity entry yields `fail` even when coverage is partial,
+so a CI gate must block on `fail` and must not treat `incomplete` as `pass`. Register
+triage applies to the gate: unexpired `accepted`, `suppressed` and `false_positive`
+entries do not gate (counted under `counts.waived`), except that waived malicious
+content still yields at least `warn` (MAL-007). Assessment snapshots keep raw detections.
 
 ## Verification
 

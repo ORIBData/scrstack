@@ -50,13 +50,13 @@ func (w Worker) Run(ctx context.Context) error {
 			err := w.Store.DispatchAutomaticPlan(dispatchCtx)
 			cancel()
 			if err != nil {
-				w.Logger.Warn("automatic remediation dispatch deferred")
+				w.Logger.Warn("automatic remediation dispatch deferred", "error", err)
 			}
 		}
 		a, err := w.Store.Claim(ctx)
 		if err != nil {
 			if !errors.Is(err, assessments.ErrNotFound) {
-				w.Logger.Error("assessment claim failed")
+				w.Logger.Error("assessment claim failed", "error", err)
 			}
 			select {
 			case <-ctx.Done():
@@ -72,10 +72,12 @@ func (w Worker) Run(ctx context.Context) error {
 			failureCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
 			retry := !errors.Is(err, assessments.ErrScope)
 			if failErr := w.Store.Fail(failureCtx, a, "assessment stage failed; scan coverage incomplete", retry); failErr != nil && !errors.Is(failErr, assessments.ErrLease) {
-				w.Logger.Error("assessment failure persistence failed", "assessment_id", a.ID)
+				w.Logger.Error("assessment failure persistence failed", "assessment_id", a.ID, "error", failErr)
 			}
 			done()
-			w.Logger.Warn("assessment failed", "assessment_id", a.ID)
+			// Provider, scanner and store errors are sanitized at their source;
+			// operators need the cause, which the stored assessment keeps generic.
+			w.Logger.Warn("assessment failed", "assessment_id", a.ID, "attempt", a.Attempts, "retry", retry, "error", err)
 		}
 	}
 }

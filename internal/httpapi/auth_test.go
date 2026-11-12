@@ -14,6 +14,7 @@ func TestClientIPTrustBoundary(t *testing.T) {
 		{"10.1.2.3", "198.51.100.1, 192.0.2.1", "192.0.2.1"},
 		{"10.1.2.3", "192.0.2.1", "192.0.2.1"},
 		{"10.1.2.3", "invalid", "invalid IP"},
+		{"10.1.2.3", "", "10.1.2.3"},
 	} {
 		if got := s.clientIP(netip.MustParseAddr(c.peer), c.header).String(); got != c.want {
 			t.Errorf("peer %s: got %s want %s", c.peer, got, c.want)

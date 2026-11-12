@@ -24,7 +24,7 @@ Match the network, entrypoints and resolver to your existing Traefik configurati
 
 The Compose labels expose only `/scrs/v1` and `/scrs/v1/*` on the selected host,
 redirect HTTP to HTTPS, enable TLS with the named ACME resolver, and send traffic
-to port 8080 without stripping the path. Swagger UI is at `/scrs/v1/docs`; its
+to port 7000 without stripping the path. Swagger UI is at `/scrs/v1/docs`; its
 contract is `/scrs/v1/docs/openapi.yaml`. No application port is published on the
 host. The init service is explicitly hidden from Traefik and receives the optional
 PostgreSQL bootstrap administrator URL; the API does not receive that URL.
@@ -108,10 +108,11 @@ Swagger/OpenAPI and active remediation capabilities. It uses
 `SCRS_ACCEPTANCE_API_TOKEN` (read scope) or falls back to the bootstrap token.
 Credentials are not printed and cross-origin redirects are rejected.
 
-The API listens on HTTP port 8080 inside Docker. Traefik terminates external HTTPS
+The API listens on HTTP port 7000 inside Docker (`SCRS_HTTP_ADDR=:7000`). Traefik terminates external HTTPS
 and preserves `/scrs/v1/*`. A published host port is unnecessary for that routing.
 If an HTTP node port is needed for local VPS diagnostics, add
-`deploy/compose.nodeport.yaml`; it binds `SCRS_HTTP_NODE_PORT` to **127.0.0.1** only.
+`deploy/compose.nodeport.yaml`; it binds `SCRS_HTTP_NODE_PORT` (default 7000) to **127.0.0.1**
+only and forwards it to the container's port 7000, e.g. `curl http://127.0.0.1:7000/scrs/v1/system/readyz`.
 Keep external consumers on the HTTPS domain. Certificate renewal remains owned by
 Dokploy/Traefik and needs operational verification separately.
 

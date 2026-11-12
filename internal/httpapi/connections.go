@@ -120,13 +120,13 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				list, err = h.store.List(ctx)
 			}
-			if len(list) > limit {
-				list = list[:limit]
-				w.Header().Set("X-Next-Cursor", base64.RawURLEncoding.EncodeToString([]byte(list[limit-1].Name)))
-			}
 			if err != nil {
 				writeError(w, 500, "connection list failed")
 				return
+			}
+			if len(list) > limit {
+				list = list[:limit]
+				w.Header().Set("X-Next-Cursor", base64.RawURLEncoding.EncodeToString([]byte(list[limit-1].Name)))
 			}
 			writeJSON(w, 200, list)
 		case http.MethodPost:

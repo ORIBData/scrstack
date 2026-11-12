@@ -143,19 +143,63 @@ func Hash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToS
 func fingerprint(a Assessment, f Finding) string {
 	return Hash([]byte(a.AssetID.String() + "\x00" + a.Request.Target.Ref + "\x00" + f.Type + "\x00" + f.AdvisoryID + "\x00" + f.Component.PURL + "\x00" + f.Component.Path))
 }
-func verdict(r Result) (string, map[string]int) {
-	v := "pass"
+
+// verdict applies the default gate (TRG-006, MAL-007). A positive detection is
+// never hidden behind partial coverage: fail outranks incomplete. Waived
+// findings (keyed by fingerprint) do not gate, except that malicious content
+// can never drop below warn.
+func verdict(r Result, waived map[string]bool) (string, map[string]int) {
+	failing, warning := false, false
 	counts := map[string]int{"total": len(r.Findings)}
 	for _, f := range r.Findings {
 		counts[f.Severity]++
-		if f.Severity == "critical" || f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "ioc_match" {
-			v = "fail"
-		} else if f.Severity == "high" && v == "pass" {
-			v = "warn"
+		malicious := f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "ioc_match"
+		if waived[f.Fingerprint] {
+			counts["waived"]++
+			warning = warning || malicious
+			continue
+		}
+		if f.Severity == "critical" || malicious || f.Type == "integrity" {
+			failing = true
+		} else if f.Severity == "high" {
+			warning = true
 		}
 	}
-	if !r.Complete {
-		v = "incomplete"
+	switch {
+	case failing:
+		return "fail", counts
+	case !r.Complete:
+		return "incomplete", counts
+	case warning:
+		return "warn", counts
 	}
-	return v, counts
+	return "pass", counts
+}
+
+// closableTypes lists finding types whose producing stages all completed, so
+// their absence from this scan is evidence of a fix rather than lost coverage.
+func closableTypes(stages []Stage) []string {
+	ok := map[string]bool{}
+	for _, s := range stages {
+		ok[s.Name] = s.Status == "ok"
+	}
+	producers := map[string][]string{
+		"vulnerability":        {"inventory", "sbom", "match_vuln"},
+		"malicious_dependency": {"inventory", "match_malicious"},
+		"malware":              {"malware"},
+		"posture":              {"malware"},
+		"ioc_match":            {"ioc"},
+		"integrity":            {"integrity"},
+	}
+	types := []string{}
+	for kind, needed := range producers {
+		closable := ok["resolve"] && ok["fetch"]
+		for _, stage := range needed {
+			closable = closable && ok[stage]
+		}
+		if closable {
+			types = append(types, kind)
+		}
+	}
+	return types
 }
