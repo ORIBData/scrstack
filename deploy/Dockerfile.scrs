@@ -1,0 +1,31 @@
+ARG GO_VERSION=1.27.4
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/scrs ./cmd/scrs
+COPY internal ./internal
+COPY api ./api
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/scrs ./cmd/scrs
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS scanner-build
+WORKDIR /scanner
+COPY tools/osv/go.mod tools/osv/go.sum ./
+RUN go mod download
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/osv-scanner github.com/google/osv-scanner/v2/cmd/osv-scanner
+
+FROM alpine:3.24 AS certificates
+RUN apk add --no-cache ca-certificates
+
+FROM scratch
+LABEL io.scrs.project="scrstack"
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /out/scrs /usr/local/bin/scrs
+COPY --from=scanner-build /out/osv-scanner /usr/local/bin/osv-scanner
+USER 65532:65532
+EXPOSE 7000
+ENTRYPOINT ["/usr/local/bin/scrs"]

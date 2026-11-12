@@ -1,0 +1,6 @@
+# Optional localhost-only HTTP port for VPS diagnostics. Traefik still routes
+# over the Docker network; external clients use HTTPS and /scrs/v1/*.
+services:
+  scrs-api:
+    ports:
+      - "127.0.0.1:${SCRS_HTTP_NODE_PORT:-7000}:7000"

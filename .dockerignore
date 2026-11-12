@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+bin
+*.test
+Gopkg.lock
+
+!eicar.test
+artifacts

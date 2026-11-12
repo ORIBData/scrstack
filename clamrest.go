@@ -130,6 +130,10 @@ func scanFileHandler(w http.ResponseWriter, r *http.Request) {
 
 	// if the file is not found, we will get two almost identical error scanResponses on the channel.
 	// Will just use the first and call it a day.
+	if len(resp) == 0 {
+		http.Error(w, "scanner returned no result", http.StatusBadGateway)
+		return
+	}
 	respJSON, err := json.Marshal(resp[0])
 	if err != nil {
 		log.Printf("error marshalling response to json, %v\n", err)
@@ -220,6 +224,10 @@ func scanner(w http.ResponseWriter, r *http.Request, version int) {
 			part, err := reader.NextPart()
 			if err == io.EOF {
 				break
+			}
+			if err != nil {
+				http.Error(w, "invalid multipart body", http.StatusBadRequest)
+				return
 			}
 
 			// if part.FileName() is empty, skip this iteration.
@@ -462,7 +470,7 @@ func main() {
 	))
 
 	// Attach the cors middleware to the middleware chain/request pipeline
-	handler := c.Handler(mux)
+	handler := legacySecurity(os.Getenv("SCRS_SCANNER_API_TOKEN"), c.Handler(mux))
 
 	// Configure the HTTP server with h2c support
 	var protocols http.Protocols
@@ -471,9 +479,13 @@ func main() {
 	protocols.SetHTTP2(true)
 
 	httpServer := &http.Server{
-		Addr:      fmt.Sprintf(":%s", opts["PORT"]),
-		Handler:   handler,
-		Protocols: &protocols,
+		Addr:              fmt.Sprintf(":%s", opts["PORT"]),
+		Handler:           handler,
+		Protocols:         &protocols,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		WriteTimeout:      3 * time.Minute,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	if opts["SSL_PORT"] != "" {
@@ -485,8 +497,12 @@ func main() {
 		} else {
 			// Configure the HTTPS server, if SSL_PORT is set
 			tlsServer := &http.Server{
-				Addr:    fmt.Sprintf(":%s", opts["SSL_PORT"]),
-				Handler: handler,
+				Addr:              fmt.Sprintf(":%s", opts["SSL_PORT"]),
+				Handler:           handler,
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       2 * time.Minute,
+				WriteTimeout:      3 * time.Minute,
+				IdleTimeout:       60 * time.Second,
 			}
 
 			// Start the HTTPS server in a goroutine

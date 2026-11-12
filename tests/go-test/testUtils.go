@@ -16,7 +16,7 @@ var (
 		Scheme: "http",
 		Host:   "localhost:9000",
 	}
-	c = http.Client{}
+	c = http.Client{Transport: authenticatedTransport{}}
 )
 
 func getReqWithFile(file ...*os.File) (*http.Request, error) {
@@ -71,4 +71,13 @@ func getURL(qParams *map[string]string, pathFragments ...string) (*url.URL, erro
 
 func cleanup(file string) {
 	_ = os.Remove(file)
+}
+
+// Supply the internal-service token to legacy scanner integration requests.
+type authenticatedTransport struct{}
+
+func (authenticatedTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	clone := r.Clone(r.Context())
+	clone.Header.Set("Authorization", "Bearer "+os.Getenv("SCRS_SCANNER_API_TOKEN"))
+	return http.DefaultTransport.RoundTrip(clone)
 }

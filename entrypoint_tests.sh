@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Synthetic credential used only inside this disposable test container.
+export SCRS_SCANNER_API_TOKEN=synthetic-test-scanner-token-at-least-32-characters
+
 # Generate self-signed TLS certificate for tests if not already present
 if [ ! -f /etc/ssl/clamav-rest/server.key ] || [ ! -f /etc/ssl/clamav-rest/server.crt ]; then
     echo "Generating self-signed TLS certificate for tests..."

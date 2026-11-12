@@ -4,10 +4,10 @@ services:
       context: .
       dockerfile: Dockerfile.test
       args:
-        GO_VERSION: ${GO_VERSION}
+        GO_VERSION: ${GO_VERSION:-1.27.4}
     ports:
-      - "9000:9000"
-      - "9443:9443"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9443:9443"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:9000/"]
       interval: 60s

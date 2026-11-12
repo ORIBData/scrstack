@@ -1,0 +1,192 @@
+package worker
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"time"
+
+	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/scanner"
+)
+
+type Artifacts interface {
+	PutSBOM(context.Context, []byte) (string, string, error)
+	PutPlan(context.Context, []byte) (string, string, error)
+}
+type Snapshotter interface {
+	GitHubSnapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error)
+}
+type Worker struct {
+	Source                   Snapshotter
+	Store                    *assessments.Store
+	Connections              *connections.Store
+	Artifacts                Artifacts
+	ScannerURL, ScannerToken string
+	Logger                   *slog.Logger
+	AutoRemediation          bool
+}
+
+func (w Worker) Run(ctx context.Context) error {
+	endpoint, err := url.Parse(w.ScannerURL)
+	if err != nil || (endpoint.Scheme != "http" && endpoint.Scheme != "https") || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" || len(w.ScannerToken) < 32 {
+		return errors.New("invalid internal scanner configuration")
+	}
+	timer := time.NewTicker(2 * time.Second)
+	defer timer.Stop()
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if w.AutoRemediation {
+			dispatchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := w.Store.DispatchAutomaticPlan(dispatchCtx)
+			cancel()
+			if err != nil {
+				w.Logger.Warn("automatic remediation dispatch deferred", "error", err)
+			}
+		}
+		a, err := w.Store.Claim(ctx)
+		if err != nil {
+			if !errors.Is(err, assessments.ErrNotFound) {
+				w.Logger.Error("assessment claim failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-timer.C:
+				continue
+			}
+		}
+		jobCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		err = w.run(jobCtx, &a)
+		cancel()
+		if err != nil {
+			failureCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+			retry := !errors.Is(err, assessments.ErrScope)
+			if failErr := w.Store.Fail(failureCtx, a, "assessment stage failed; scan coverage incomplete", retry); failErr != nil && !errors.Is(failErr, assessments.ErrLease) {
+				w.Logger.Error("assessment failure persistence failed", "assessment_id", a.ID, "error", failErr)
+			}
+			done()
+			// Provider, scanner and store errors are sanitized at their source;
+			// operators need the cause, which the stored assessment keeps generic.
+			w.Logger.Warn("assessment failed", "assessment_id", a.ID, "attempt", a.Attempts, "retry", retry, "error", err)
+		}
+	}
+}
+func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
+	name, err := w.Connections.NameByID(ctx, a.ConnectionID)
+	if err != nil {
+		return assessments.ErrScope
+	}
+	c, secret, err := w.Connections.Get(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !c.Enabled || c.ConfigurationRevision != a.ConnectionRevision {
+		return assessments.ErrScope
+	}
+	revision := a.Commit
+	if revision == "" {
+		revision = a.Request.Target.Commit
+	}
+	source := w.Source
+	if source == nil {
+		source = connections.NewNativeAdapters()
+	}
+	archive, commit, moved, err := source.GitHubSnapshot(ctx, c, secret, a.Request.Target.Repository, a.Request.Target.Ref, revision)
+	if err != nil {
+		return err
+	}
+	if err = w.Store.BindRevision(ctx, *a, commit, moved); err != nil {
+		return err
+	}
+	a.Commit = commit
+	endpoint := w.ScannerURL
+	if a.Request.Remediation != nil {
+		target, _ := url.Parse(endpoint)
+		target.Path = "/remediate"
+		query := url.Values{}
+		query.Set("manifest", a.Request.Remediation.Manifest)
+		query.Set("strategy", a.Request.Remediation.Strategy)
+		target.RawQuery = query.Encode()
+		endpoint = target.String()
+	}
+	payload := archive
+	contentType := "application/gzip"
+	if a.Request.Remediation == nil {
+		bundle, err := w.Store.ActiveIndicators(ctx)
+		if err != nil {
+			return err
+		}
+		if len(bundle) > 0 {
+			var body bytes.Buffer
+			m := multipart.NewWriter(&body)
+			part, err := m.CreateFormFile("archive", "snapshot.tar.gz")
+			if err != nil {
+				return err
+			}
+			if _, err = part.Write(archive); err != nil {
+				return err
+			}
+			if err = m.WriteField("indicators", string(bundle)); err != nil {
+				return err
+			}
+			if err = m.Close(); err != nil {
+				return err
+			}
+			payload = body.Bytes()
+			contentType = m.FormDataContentType()
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+w.ScannerToken)
+	request.Header.Set("Content-Type", contentType)
+	client := &http.Client{Timeout: 4 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	response, err := client.Do(request)
+	if err != nil {
+		return errors.New("scanner unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != 200 {
+		return errors.New("scanner failed")
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, (64<<20)+1))
+	if err != nil || len(data) > 64<<20 {
+		return errors.New("scanner result exceeded limit")
+	}
+	if a.Request.Remediation != nil {
+		if !json.Valid(data) {
+			return errors.New("invalid remediation result")
+		}
+		key, digest, err := w.Artifacts.PutPlan(ctx, data)
+		if err != nil {
+			return err
+		}
+		return w.Store.CompletePlan(ctx, *a, key, digest)
+	}
+	var output scanner.Output
+	if json.Unmarshal(data, &output) != nil {
+		return errors.New("invalid scanner result")
+	}
+	var key, digest string
+	if len(output.SBOM) > 0 {
+		key, digest, err = w.Artifacts.PutSBOM(ctx, output.SBOM)
+		if err != nil {
+			return err
+		}
+	}
+	stages := []assessments.Stage{{Name: "resolve", Status: "ok"}, {Name: "fetch", Status: "ok"}}
+	stages = append(stages, output.Stages...)
+	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
+}

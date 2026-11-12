@@ -1,0 +1,595 @@
+openapi: 3.1.0
+info:
+  title: Supply Chain Risk Stack API
+  version: 0.1.0
+  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. GitHub assessment jobs provide offline OSV matching, CycloneDX SBOMs and persisted findings. Missing malware, IOC and integrity stages force incomplete verdicts. Guided npm remediation is enabled by deployment configuration and automatically queued for supported npm manifests; plans never write to repositories.
+servers:
+  - url: /scrs/v1
+paths:
+  /webhooks/github:
+    post:
+      operationId: githubPushWebhook
+      summary: Verify HMAC-SHA256 and enqueue a discovered in-scope GitHub push
+      description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. Only push and ping are supported. Delivery replay is idempotent for 24 hours. No bearer token is used on this provider endpoint.
+      responses:
+        '202': {description: Push durably queued with raw event}
+        '200': {description: Replay, ping, deleted-ref or non-branch (tag) push acknowledgement}
+        '401': {description: Invalid provider signature}
+        '404': {description: Repository outside registered scope}
+        '409': {description: Same delivery ID with different payload}
+        '422': {description: Unsupported event or ambiguous connection}
+        '503': {description: Webhook secret not configured}
+  /feeds/indicators:
+    get:
+      operationId: activeIndicators
+      security: [{bearerAuth: []}]
+      summary: Read active versioned IOC bundle (admin)
+      responses:
+        '200': {description: Version and normalized indicators}
+        '404': {description: No active bundle}
+    put:
+      operationId: importIndicators
+      security: [{bearerAuth: []}]
+      summary: Atomically import and activate immutable IOC version (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version, indicators]
+              properties:
+                version: {type: string, minLength: 1, maxLength: 128}
+                indicators:
+                  type: array
+                  maxItems: 10000
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [id, type, value, valid_until]
+                    properties:
+                      id: {type: string, maxLength: 128}
+                      type: {type: string, enum: [sha256, domain]}
+                      value: {type: string}
+                      valid_until: {type: string, format: date-time}
+      responses:
+        '201': {description: Activated and audited; previous version retained}
+        '400': {description: Invalid indicators}
+        '409': {description: Version already exists}
+  /assessments/{id}/files:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentFiles
+      summary: File hash, size and malware status; source content is excluded
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Bounded file evidence inventory}
+        '409': {description: File evidence unavailable}
+  /assessments/{id}/remediations:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: automaticRemediationPlans
+      summary: Automatic child plans and dispatch state for this assessment
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Manifest, child assessment ID, dispatch state and job status}
+  /settings/retention:
+    get:
+      operationId: getRetention
+      security: [{bearerAuth: []}]
+      summary: Read raw-ingress retention policy and ETag (admin)
+      responses:
+        '200': {description: revision and inbound_event_days; zero keeps forever}
+    put:
+      operationId: setRetention
+      security: [{bearerAuth: []}]
+      summary: Update raw-ingress retention policy atomically (admin)
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+      responses:
+        '200': {description: Saved policy with new ETag}
+        '409': {description: Policy revision changed}
+        '428': {description: If-Match required}
+  /settings/retention:preview:
+    post:
+      operationId: previewRetention
+      security: [{bearerAuth: []}]
+      summary: Count raw events eligible for removal and stored JSON bytes (admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+      responses:
+        '200': {description: rows and bytes; excludes pending/running assessment events}
+  /settings/retention:purge:
+    post:
+      operationId: purgeIngressEvents
+      security: [{bearerAuth: []}]
+      summary: Purge at most 1000 eligible raw events under the saved policy (admin)
+      description: Preserves assessments, findings, audit records and all S3 artifacts. Default policy keeps forever. Scheduling and other retention classes are not supported yet.
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: deleted_events count; purge audited atomically}
+        '409': {description: Stale policy revision}
+        '428': {description: If-Match required}
+  /assessments:
+    post:
+      operationId: createAssessment
+      summary: Queue assessment of a discovered, permitted GitHub repository (write or trigger)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}, description: Actor-scoped replay key retained for 24 hours}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target]
+              properties:
+                connection: {type: string, description: Connection name or UUID; required when ambiguous}
+                target:
+                  type: object
+                  additionalProperties: false
+                  required: [type, repository]
+                  properties:
+                    type: {type: string, enum: [git]}
+                    repository: {type: string, example: organization/repository}
+                    ref: {type: string, default: HEAD}
+                    commit: {type: string, pattern: '^[a-fA-F0-9]{40}$'}
+                trigger:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    origin: {type: string, maxLength: 100}
+                    event: {type: string, maxLength: 100}
+                    delivery_id: {type: string, maxLength: 128}
+                    actor: {type: string, maxLength: 100}
+      responses:
+        '202': {description: Durably queued; Location identifies the assessment}
+        '200': {description: Idempotent replay}
+        '400': {description: Invalid or unsupported target}
+        '404': {description: Asset not registered or outside scope}
+        '409': {description: Idempotency key reused for different request}
+        '422': {description: Multiple connections match}
+        '429': {description: Queue capacity or token rate limit reached}
+    get:
+      operationId: listAssessments
+      summary: List jobs; trigger-only callers see only their own jobs
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+        - {name: status, in: query, schema: {type: string, enum: [queued, running, succeeded, failed, cancelled, superseded]}}
+      responses:
+        '200': {description: Up to 100 items with next_cursor}
+  /assessments/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getAssessment
+      summary: Read status, immutable revision, coverage, counts and verdict
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Assessment; succeeded describes execution and does not imply a pass verdict}
+        '404': {description: Assessment unavailable to caller}
+    delete:
+      operationId: cancelAssessment
+      summary: Cancel a pending job without deleting history (write or own trigger job)
+      security: [{bearerAuth: []}]
+      responses:
+        '204': {description: Cancelled; stale workers cannot publish results}
+        '409': {description: Job already terminal}
+  /register:
+    get:
+      operationId: listFindings
+      summary: Persistent finding register (read or write)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Up to 100 findings with next_cursor}
+  /register/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    patch:
+      operationId: transitionFinding
+      summary: Audit a status change; accepted, suppressed and false_positive require admin
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [status, reason]
+              properties:
+                status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive]}
+                reason: {type: string, minLength: 8, maxLength: 2000}
+                expires_at: {type: string, format: date-time, description: Required only for accepted; future and at most 90 days}
+      responses:
+        '204': {description: Status and audit event persisted atomically}
+        '400': {description: Invalid transition or expiry}
+        '403': {description: Insufficient scope}
+  /register/{id}/events:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: findingEvents
+      security: [{bearerAuth: []}]
+      summary: Latest 100 detection and status events
+      responses:
+        '200': {description: Events newest first}
+  /remediation/capabilities:
+    get:
+      operationId: remediationCapabilities
+      security: [{bearerAuth: []}]
+      summary: Runtime capability and enablement; npm in-place only, Maven unavailable
+      responses:
+        '200': {description: Capability matrix; repository_writes is always false}
+  /assets/{id}/remediations:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: createRemediationPlan
+      security: [{bearerAuth: []}]
+      summary: Queue advice for a prior assessed npm package-lock.json at its exact commit (write)
+      parameters: [{name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [assessment_id, manifest]
+              properties:
+                assessment_id: {type: string, format: uuid}
+                manifest: {type: string, example: package-lock.json}
+                strategy: {type: string, enum: [in-place], default: in-place}
+      responses:
+        '202': {description: Plan queued with assessment Location}
+        '200': {description: Idempotent replay}
+        '400': {description: Unsupported manifest or parent assessment}
+        '503': {description: Remediation sandbox disabled}
+  /assessments/{id}/components:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentComponents
+      security: [{bearerAuth: []}]
+      summary: Component inventory with ordinal cursor
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/findings:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentFindings
+      security: [{bearerAuth: []}]
+      summary: Immutable detection snapshots with UUID cursor
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/sbom:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentSbom
+      security: [{bearerAuth: []}]
+      summary: CycloneDX 1.6 JSON with SHA256 ETag; format=cyclonedx-json
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/report:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentReport
+      security: [{bearerAuth: []}]
+      summary: Assessment summary in JSON or format=md; coverage remains explicit
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /assessments/{id}/remediation:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentRemediation
+      security: [{bearerAuth: []}]
+      summary: Guided remediation JSON advice; never applies changes to the provider
+      responses:
+        '200': {description: Authorized assessment artifact or page}
+        '404': {description: Assessment unavailable to caller}
+        '409': {description: Artifact not yet available}
+  /tokens:
+    get:
+      operationId: listTokens
+      summary: List token metadata without secret values or hashes (admin only)
+      security: [{bearerAuth: []}]
+      parameters: [{name: cursor, in: query, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {description: Up to 100 items and next_cursor}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+    post:
+      operationId: createToken
+      summary: Create a scoped token; secret is shown once (admin only)
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, scopes]
+              properties:
+                name: {type: string, minLength: 1, maxLength: 100}
+                scopes:
+                  type: array
+                  minItems: 1
+                  maxItems: 5
+                  uniqueItems: true
+                  items: {type: string, enum: [read, write, admin, trigger, 'ingest:relay']}
+                ip_allow_list: {type: array, maxItems: 32, items: {type: string, description: IPv4 or IPv6 CIDR}}
+                expires_at: {type: string, format: date-time}
+      responses:
+        '201': {description: One-time token value and metadata}
+        '400': {description: Invalid scopes, expiry or IP list}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+        '409': {description: Token name already exists}
+  /tokens/{id}:
+    delete:
+      operationId: revokeToken
+      summary: Revoke a managed token; bootstrap is rotated through the environment
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '204': {description: Token revoked}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+        '409': {description: Unknown or protected bootstrap token}
+  /assets:
+    get:
+      operationId: listAssets
+      summary: Page through discovered assets with connection and in-scope flags
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': { description: Asset page with items and next_cursor }
+        '401': { description: Missing or invalid admin token }
+  /connections:
+    get:
+      operationId: listConnections
+      summary: List provider connections without credentials (admin only; next page in X-Next-Cursor header)
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {name: cursor, in: query, schema: {type: string}}
+      security: [{bearerAuth: []}]
+      responses:
+        '200':
+          description: Connection list
+          headers:
+            X-Next-Cursor: {description: Opaque cursor for the next page; absent on final page, schema: {type: string}}
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Connection' }
+        '401': { description: Missing or invalid admin token }
+    post:
+      operationId: createConnection
+      summary: Create a provider connection
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateConnection' }
+      responses:
+        '201':
+          description: Connection created; credential omitted from response
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Connection' }
+        '400': { description: Invalid connection }
+        '401': { description: Missing or invalid admin token }
+        '409': { description: Connection name already exists }
+  /connections/{id}:
+    get:
+      operationId: getConnection
+      summary: Get one connection without its credential
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200':
+          description: Connection
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Connection' }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+    patch:
+      operationId: updateConnection
+      summary: Change scope or enabled state and withdraw asset eligibility until rediscovery
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              minProperties: 1
+              properties:
+                scope: {$ref: '#/components/schemas/Scope'}
+                enabled: {type: boolean}
+      responses:
+        '200': {description: Updated connection with no credentials}
+        '400': {description: Invalid input}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+        '404': {description: Connection not found}
+        '409': {description: Concurrent update; retry}
+    delete:
+      operationId: disableConnection
+      summary: Disable connection while retaining assets and audit history
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {description: Disabled connection}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+        '404': {description: Connection not found}
+        '409': {description: Concurrent update; retry}
+  /connections/{id}:rotate-credential:
+    post:
+      operationId: rotateConnectionCredential
+      summary: Replace encrypted credential and invalidate discovery eligibility
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [credential]
+              properties:
+                credential: {type: object, writeOnly: true}
+      responses:
+        '200': {description: Updated connection without credential}
+        '400': {description: Invalid credential}
+        '401': {description: Unauthorized}
+        '403': {description: Admin scope required}
+        '404': {description: Connection not found}
+        '409': {description: Concurrent update; retry}
+  /connections/{id}:test:
+    post:
+      operationId: testConnection
+      summary: Test credential and count visible resources
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': { description: Credential accepted and resource count returned }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+        '502': { description: Provider test failed }
+  /connections/{id}:discover:
+    post:
+      operationId: discoverConnection
+      summary: Discover accessible resources and mark matching assets in scope
+      security: [{bearerAuth: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      responses:
+        '200': { description: Discovery result }
+        '401': { description: Missing or invalid admin token }
+        '404': { description: Connection not found }
+        '502': { description: Provider discovery failed }
+  /system/healthz:
+    get:
+      operationId: getHealth
+      summary: Process liveness
+      responses:
+        '200':
+          description: Process is running
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /system/readyz:
+    get:
+      operationId: getReadiness
+      summary: PostgreSQL, Redis and S3 readiness
+      responses:
+        '200':
+          description: Configured backing services are available
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: A backing service is unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    const: unavailable
+  /docs/openapi.yaml:
+    get:
+      operationId: getOpenAPI
+      summary: Download this OpenAPI contract
+      responses:
+        '200':
+          description: OpenAPI YAML document
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /docs:
+    get:
+      operationId: getSwaggerUI
+      summary: Swagger UI
+      responses:
+        '200':
+          description: Interactive API documentation
+          content:
+            text/html:
+              schema:
+                type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Scope:
+      type: object
+      required: [include]
+      properties:
+        include: {type: array, items: {type: string}}
+        exclude: {type: array, items: {type: string}}
+    Connection:
+      type: object
+      required: [id, provider, name, config, scope, status, enabled]
+      properties:
+        enabled: {type: boolean}
+        id: {type: string, format: uuid}
+        provider: {type: string, enum: [github, dockerhub, gar]}
+        name: {type: string}
+        config: {type: object, additionalProperties: true}
+        scope: { $ref: '#/components/schemas/Scope' }
+        status: {type: object, additionalProperties: true}
+    CreateConnection:
+      type: object
+      required: [provider, name, config, scope, credential]
+      properties:
+        provider: {type: string, enum: [github, dockerhub, gar]}
+        name: {type: string}
+        config: {type: object, additionalProperties: true}
+        scope: { $ref: '#/components/schemas/Scope' }
+        credential:
+          type: object
+          additionalProperties: true
+          writeOnly: true
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
