@@ -98,7 +98,7 @@ func pipelineCommand() error {
 		retry := time.Minute
 		for {
 			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-			err := scanner.SyncFeeds(syncCtx, setting("SCRS_FEED_ROOT", "/feeds"), strings.Split(setting("SCRS_OSV_ECOSYSTEMS", "npm,Go"), ","))
+			err := scanner.SyncFeeds(syncCtx, setting("SCRS_FEED_ROOT", "/feeds"), strings.Split(setting("SCRS_OSV_ECOSYSTEMS", "npm,Go,Maven,PyPI,Alpine,Debian"), ","))
 			cancel()
 			if err != nil {
 				logger.Error("OSV feed synchronization failed", "error", err, "retry_in", retry.String())
@@ -185,7 +185,22 @@ func pipelineCommand() error {
 		if hours, err := strconv.Atoi(os.Getenv("SCRS_RESCAN_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*90 {
 			rescan = time.Duration(hours) * time.Hour
 		}
-		go w.Maintain(ctx, time.Hour, rescan)
+		if os.Getenv("SCRS_MIRRORS_ENABLED") != "false" {
+			w.Mirrors = artifacts
+			if limit, err := strconv.ParseInt(os.Getenv("SCRS_MIRROR_MAX_BYTES"), 10, 64); err == nil && limit > 0 {
+				w.MaxMirrorBytes = limit
+			}
+			w.KeepMirrors = 7
+			if keep, err := strconv.Atoi(os.Getenv("SCRS_MIRROR_KEEP")); err == nil && keep > 0 && keep <= 365 {
+				w.KeepMirrors = keep
+			}
+			go w.RunMirrors(ctx)
+		}
+		mirror := time.Duration(0)
+		if hours, err := strconv.Atoi(os.Getenv("SCRS_MIRROR_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*90 {
+			mirror = time.Duration(hours) * time.Hour
+		}
+		go w.Maintain(ctx, time.Hour, rescan, mirror)
 		return w.Run(ctx)
 	}
 	return errors.New("unknown pipeline command")

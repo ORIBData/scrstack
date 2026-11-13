@@ -20,12 +20,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// githubIngest normalizes direct (HMAC) and relay (ingest:relay token)
-// deliveries into one path (ING-009, ING-011). Payload content is a hint:
-// SCRS resolves and fetches commits itself (TRG-003).
+// githubIngest normalizes direct and relay deliveries from GitHub and GitLab
+// into one path (ING-009, ING-011). Payload content is a hint: SCRS resolves
+// and fetches commits itself (TRG-003).
 type githubIngest struct {
 	store        *assessments.Store
 	secret       string
+	gitlabSecret string
 	remediation  bool
 	relayEnabled bool
 	massDeletion int
@@ -37,40 +38,65 @@ func newGitHubIngest(store *assessments.Store, secret string, remediation, relay
 	if v, err := strconv.Atoi(os.Getenv("SCRS_MASS_DELETION_FILES")); err == nil && v > 0 {
 		threshold = v
 	}
-	return &githubIngest{store: store, secret: secret, remediation: remediation, relayEnabled: relay, massDeletion: threshold, slots: make(chan struct{}, 8)}
+	return &githubIngest{store: store, secret: secret, gitlabSecret: os.Getenv("SCRS_GITLAB_WEBHOOK_SECRET"), remediation: remediation, relayEnabled: relay, massDeletion: threshold, slots: make(chan struct{}, 8)}
 }
 
 var webhookActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:github-webhook"))
+var gitlabActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:gitlab-webhook"))
 
-// direct verifies GitHub's HMAC over the exact raw body.
-func (g *githubIngest) direct() http.Handler {
+// verifyGitHub checks X-Hub-Signature-256 over the exact raw body.
+func (g *githubIngest) verifyGitHub(r *http.Request, body []byte) bool {
+	header := r.Header.Get("X-Hub-Signature-256")
+	supplied, err := hex.DecodeString(strings.TrimPrefix(header, "sha256="))
+	mac := hmac.New(sha256.New, []byte(g.secret))
+	_, _ = mac.Write(body)
+	return err == nil && strings.HasPrefix(header, "sha256=") && hmac.Equal(supplied, mac.Sum(nil))
+}
+
+// verifyGitLab compares X-Gitlab-Token with the configured shared secret.
+func (g *githubIngest) verifyGitLab(r *http.Request) bool {
+	supplied := sha256.Sum256([]byte(r.Header.Get("X-Gitlab-Token")))
+	expected := sha256.Sum256([]byte(g.gitlabSecret))
+	return hmac.Equal(supplied[:], expected[:])
+}
+
+// direct authenticates with the provider's own mechanism.
+func (g *githubIngest) direct(provider string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !g.acquire(w) {
 			return
 		}
 		defer func() { <-g.slots }()
-		if len(g.secret) < 32 {
-			writeError(w, 503, "GitHub webhook authentication not configured")
+		secret := g.secret
+		if provider == "gitlab" {
+			secret = g.gitlabSecret
+		}
+		if len(secret) < 32 {
+			writeError(w, 503, provider+" webhook authentication not configured")
 			return
 		}
 		body, ok := g.read(w, r)
 		if !ok {
 			return
 		}
-		supplied, err := hex.DecodeString(strings.TrimPrefix(r.Header.Get("X-Hub-Signature-256"), "sha256="))
-		mac := hmac.New(sha256.New, []byte(g.secret))
-		_, _ = mac.Write(body)
-		if err != nil || !strings.HasPrefix(r.Header.Get("X-Hub-Signature-256"), "sha256=") || !hmac.Equal(supplied, mac.Sum(nil)) {
+		valid := g.verifyGitHub(r, body)
+		actor, actorName := webhookActor, "github-webhook"
+		if provider == "gitlab" {
+			valid, actor, actorName = g.verifyGitLab(r), gitlabActor, "gitlab-webhook"
+		}
+		if !valid {
 			writeError(w, 401, "invalid webhook signature")
 			return
 		}
-		g.process(w, r, body, "direct", webhookActor, "github-webhook")
+		g.process(w, r, body, provider, "direct", actor, actorName)
 	})
 }
 
 // relay accepts the provider's unchanged body from automation holding an
-// ingest:relay token (TRG-002). Wrap it with Security.protect.
-func (g *githubIngest) relay() http.Handler {
+// ingest:relay token (TRG-002). When the relay also forwards the provider's
+// signature header, it is verified too, so the relay cannot alter events.
+// Wrap it with Security.protect.
+func (g *githubIngest) relay(provider string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !g.relayEnabled {
 			writeError(w, 503, "relay ingestion disabled; set SCRS_RELAY_ENABLED=true")
@@ -85,7 +111,25 @@ func (g *githubIngest) relay() http.Handler {
 		if !ok {
 			return
 		}
-		g.process(w, r, body, "relay", principal.ID, principal.Name)
+		forwarded, secret, valid := r.Header.Get("X-Hub-Signature-256") != "", g.secret, false
+		if provider == "gitlab" {
+			forwarded, secret = r.Header.Get("X-Gitlab-Token") != "", g.gitlabSecret
+		}
+		if forwarded {
+			if len(secret) < 32 {
+				writeError(w, 503, "forwarded provider signature cannot be verified; configure the "+provider+" webhook secret")
+				return
+			}
+			valid = g.verifyGitHub(r, body)
+			if provider == "gitlab" {
+				valid = g.verifyGitLab(r)
+			}
+			if !valid {
+				writeError(w, 401, "invalid forwarded provider signature")
+				return
+			}
+		}
+		g.process(w, r, body, provider, "relay", principal.ID, principal.Name)
 	})
 }
 
@@ -165,26 +209,49 @@ type githubPayload struct {
 	} `json:"organization"`
 }
 
-func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []byte, mode string, actor uuid.UUID, actorName string) {
-	delivery, err := uuid.Parse(r.Header.Get("X-GitHub-Delivery"))
-	if err != nil {
-		writeError(w, 400, "valid delivery ID required")
-		return
-	}
-	event := r.Header.Get("X-GitHub-Event")
-	if event == "ping" {
-		writeJSON(w, 200, map[string]string{"status": "ok"})
-		return
-	}
-	switch event {
-	case "push", "pull_request", "delete", "create", "repository", "member", "organization":
-	default:
-		// Organization webhooks may send every event type; acknowledge the rest.
-		writeJSON(w, 200, map[string]string{"status": "ignored_event"})
-		return
-	}
+func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []byte, provider, mode string, actor uuid.UUID, actorName string) {
+	var delivery uuid.UUID
+	var event string
 	var p githubPayload
-	if json.Unmarshal(body, &p) != nil || (event == "push" && !strings.HasPrefix(p.Ref, "refs/")) {
+	var err error
+	if provider == "gitlab" {
+		delivery, err = uuid.Parse(firstNonEmpty(r.Header.Get("X-Gitlab-Event-UUID"), r.Header.Get("Idempotency-Key")))
+		if err != nil {
+			writeError(w, 400, "valid X-Gitlab-Event-UUID required")
+			return
+		}
+		var ok bool
+		if event, p, ok = gitlabPayload(r.Header.Get("X-Gitlab-Event"), body); !ok {
+			writeError(w, 400, "invalid event payload")
+			return
+		}
+		if event == "" {
+			writeJSON(w, 200, map[string]string{"status": "ignored_event"})
+			return
+		}
+	} else {
+		if delivery, err = uuid.Parse(r.Header.Get("X-GitHub-Delivery")); err != nil {
+			writeError(w, 400, "valid delivery ID required")
+			return
+		}
+		event = r.Header.Get("X-GitHub-Event")
+		if event == "ping" {
+			writeJSON(w, 200, map[string]string{"status": "ok"})
+			return
+		}
+		switch event {
+		case "push", "pull_request", "delete", "create", "repository", "member", "organization":
+		default:
+			// Organization webhooks may send every event type; acknowledge the rest.
+			writeJSON(w, 200, map[string]string{"status": "ignored_event"})
+			return
+		}
+		if json.Unmarshal(body, &p) != nil {
+			writeError(w, 400, "invalid event payload")
+			return
+		}
+	}
+	if event == "push" && !strings.HasPrefix(p.Ref, "refs/") {
 		writeError(w, 400, "invalid event payload")
 		return
 	}
@@ -206,17 +273,28 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 	case "push":
 		signals = g.pushSignals(ctx, p, bundle, claimed)
 		branch, isBranch := strings.CutPrefix(p.Ref, "refs/heads/")
+		// GitHub reports branch deletion as a separate delete event; GitLab only as a push.
+		if provider == "gitlab" && isBranch && p.Deleted {
+			churn, err := g.store.RecentBranchCreation(ctx, repo, p.Ref, 15)
+			if err != nil {
+				writeError(w, 503, "event store unavailable")
+				return
+			}
+			if churn {
+				signals = append(signals, assessments.IntegrityEvent{Kind: "branch_churn", Severity: "high", Title: "Branch created and deleted within 15 minutes", Repository: repo, Ref: branch, Actor: claimed})
+			}
+		}
 		if isBranch && !p.Deleted {
 			if len(p.After) != 40 || branch == "" {
 				writeError(w, 400, "immutable commit and branch required")
 				return
 			}
-			request = &assessments.Request{AutoRemediation: g.remediation, Target: assessments.Target{Type: "git", Repository: repo, Ref: branch, Commit: p.After}}
+			request = &assessments.Request{AutoRemediation: g.remediation, Target: assessments.Target{Type: "git", Provider: provider, Repository: repo, Ref: branch, Commit: p.After}}
 		}
 	case "pull_request":
 		signals = matchPatterns(bundle, map[string][]string{"pr_title_regex": {p.PullRequest.Title}, "git_branch_regex": {p.PullRequest.Head.Ref}}, repo, "", p.PullRequest.Head.SHA, claimed)
 		if p.Action == "opened" || p.Action == "synchronize" || p.Action == "reopened" {
-			request = &assessments.Request{AutoRemediation: g.remediation, Target: assessments.Target{Type: "git", Repository: repo, Commit: p.PullRequest.Head.SHA, PullRequest: &assessments.PullRequest{Number: p.PullRequest.Number, BaseRef: p.PullRequest.Base.Ref, HeadRef: p.PullRequest.Head.Ref, Title: truncate(p.PullRequest.Title, 512)}}}
+			request = &assessments.Request{AutoRemediation: g.remediation, Target: assessments.Target{Type: "git", Provider: provider, Repository: repo, Commit: p.PullRequest.Head.SHA, PullRequest: &assessments.PullRequest{Number: p.PullRequest.Number, BaseRef: p.PullRequest.Base.Ref, HeadRef: p.PullRequest.Head.Ref, Title: truncate(p.PullRequest.Title, 512)}}}
 		}
 	case "delete":
 		ref := p.Ref
@@ -252,7 +330,7 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 			signals = append(signals, assessments.IntegrityEvent{Kind: "org_" + p.Action, Severity: "high", Title: "Organization " + strings.ReplaceAll(p.Action, "_", " "), Repository: p.Organization.Login, Actor: claimed, Details: map[string]any{"member": p.Membership.User.Login, "role": p.Membership.Role}})
 		}
 	}
-	recorded, err := g.store.RecordIntegrity(ctx, delivery.String(), actor, body, mode, event, signals)
+	recorded, err := g.store.RecordIntegrity(ctx, delivery.String(), actor, body, mode, storedEvent(provider, event), signals)
 	if err != nil {
 		assessmentError(w, err)
 		return
@@ -261,11 +339,11 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 		writeJSON(w, 200, map[string]any{"status": statusFor(event, p), "integrity_signals": recorded})
 		return
 	}
-	request.Trigger.Origin = "github_" + mode
+	request.Trigger.Origin = provider + "_" + mode
 	request.Trigger.Event = event
 	request.Trigger.DeliveryID = delivery.String()
 	request.Trigger.Actor = truncate(claimed, 100)
-	a, replay, err := g.store.EnqueueEvent(ctx, *request, actor, actorName, delivery.String(), body, mode, event)
+	a, replay, err := g.store.EnqueueEvent(ctx, *request, actor, actorName, delivery.String(), body, mode, storedEvent(provider, event))
 	if errors.Is(err, assessments.ErrScope) {
 		// AST-004: events for undiscovered or out-of-scope repositories are
 		// acknowledged, never scanned. Integrity signals above still alert.
@@ -360,4 +438,98 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n]
+}
+
+// storedEvent names inbound events; GitHub names stay unprefixed for compatibility.
+func storedEvent(provider, event string) string {
+	if provider == "github" {
+		return event
+	}
+	return provider + ":" + event
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+const zeroSHA = "0000000000000000000000000000000000000000"
+
+// gitlabPayload maps GitLab push, tag push and merge request hooks onto the
+// normalized event shape. An empty event name means "acknowledge and ignore".
+// GitLab does not report force pushes, so that signal is GitHub-only.
+func gitlabPayload(header string, body []byte) (string, githubPayload, bool) {
+	var raw struct {
+		Kind     string `json:"object_kind"`
+		Ref      string `json:"ref"`
+		Before   string `json:"before"`
+		After    string `json:"after"`
+		Username string `json:"user_username"`
+		User     struct {
+			Username string `json:"username"`
+		} `json:"user"`
+		Project struct {
+			Path          string `json:"path_with_namespace"`
+			DefaultBranch string `json:"default_branch"`
+		} `json:"project"`
+		Commits []struct {
+			ID       string   `json:"id"`
+			Message  string   `json:"message"`
+			Added    []string `json:"added"`
+			Removed  []string `json:"removed"`
+			Modified []string `json:"modified"`
+		} `json:"commits"`
+		Attributes struct {
+			IID          int    `json:"iid"`
+			Title        string `json:"title"`
+			SourceBranch string `json:"source_branch"`
+			TargetBranch string `json:"target_branch"`
+			Action       string `json:"action"`
+			OldRev       string `json:"oldrev"`
+			LastCommit   struct {
+				ID string `json:"id"`
+			} `json:"last_commit"`
+		} `json:"object_attributes"`
+	}
+	var p githubPayload
+	switch header {
+	case "Push Hook", "Tag Push Hook", "Merge Request Hook":
+	default:
+		return "", p, true
+	}
+	if json.Unmarshal(body, &raw) != nil || raw.Project.Path == "" {
+		return "", p, false
+	}
+	p.Repository.FullName = raw.Project.Path
+	p.Repository.DefaultBranch = raw.Project.DefaultBranch
+	if raw.Kind == "merge_request" {
+		a := raw.Attributes
+		p.Sender.Login = raw.User.Username
+		p.Action = map[string]string{"open": "opened", "reopen": "reopened"}[a.Action]
+		if a.Action == "update" && a.OldRev != "" {
+			p.Action = "synchronize" // new commits, not a metadata edit
+		}
+		if p.Action == "" {
+			p.Action = a.Action
+		}
+		p.PullRequest.Number, p.PullRequest.Title = a.IID, a.Title
+		p.PullRequest.Head.Ref, p.PullRequest.Head.SHA, p.PullRequest.Base.Ref = a.SourceBranch, a.LastCommit.ID, a.TargetBranch
+		return "pull_request", p, true
+	}
+	p.Ref, p.After, p.Pusher.Name = raw.Ref, raw.After, raw.Username
+	p.Created, p.Deleted = raw.Before == zeroSHA, raw.After == zeroSHA
+	for _, c := range raw.Commits {
+		p.Commits = append(p.Commits, struct {
+			ID       string   `json:"id"`
+			Message  string   `json:"message"`
+			Added    []string `json:"added"`
+			Removed  []string `json:"removed"`
+			Modified []string `json:"modified"`
+		}{c.ID, c.Message, c.Added, c.Removed, c.Modified})
+	}
+	return "push", p, true
 }

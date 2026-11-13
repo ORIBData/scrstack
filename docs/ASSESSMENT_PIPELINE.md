@@ -6,14 +6,15 @@ routes. Database migration `2026111204` is additive and runs through `scrs init`
 
 ## Workflow
 
-1. An administrator creates a GitHub connection and discovers its permitted assets.
+1. An administrator creates a GitHub, GitLab or registry connection and discovers its permitted assets.
 2. A `write` or `trigger` token posts an assessment. Repository URLs are not accepted;
    the repository must resolve to a discovered, accessible asset on an enabled
    connection. Specify `connection` when multiple connections cover that repository.
 3. PostgreSQL commits the job, normalized inbound request, audit event and optional
    actor-scoped 24-hour idempotency record in one transaction, then the API returns 202.
-4. A worker leases a job, resolves a GitHub commit, downloads its archive, and binds
-   retries to that immutable commit. API credentials never follow the codeload redirect.
+4. A worker leases a job, resolves a GitHub or GitLab commit, downloads its archive, and
+   binds retries to that immutable commit. API credentials never follow a redirect.
+   Image jobs resolve the tag to a platform manifest digest and stream the image.
 5. An isolated scanner extracts bounded regular files, runs pinned OSV-Scanner 2.7.1
    offline, and returns component inventory, findings and a CycloneDX 1.6 SBOM.
 6. The worker writes the content-addressed SBOM to S3 before committing database
@@ -108,18 +109,81 @@ through a transactional outbox for supported npm manifests after assessments com
 changed provider scope blocks dispatch. Unsupported ecosystems remain unsupported.
 Deployed egress isolation and representative private-provider acceptance are still open.
 
+## SBOM and MBOM
+
+Every successful assessment has two CycloneDX 1.6 documents:
+
+- **SBOM** (`/assessments/{id}/sbom`): the component inventory from OSV-Scanner,
+  stored content-addressed in S3 and hash-checked on download.
+- **MBOM** (`/assessments/{id}/mbom`): a Manufacturing Bill of Materials
+  generated on request from the register. `metadata.component` is the produced
+  artifact (`pkg:github`/`pkg:gitlab` at the commit, or `pkg:oci` at the image
+  digest and platform). `components` are the build definitions and pinned
+  inputs observed in that revision with their SHA-256: CI workflows (GitHub,
+  GitLab, CircleCI, Jenkins, Azure, Bitbucket), Dockerfiles and Compose files,
+  Makefiles, Gradle/Maven, `package.json`, and Go, npm, Yarn, pnpm, Python,
+  Cargo and Bundler lockfiles. `formulation` ties them to a build workflow;
+  `metadata.tools` and `scrs:stage:*` properties record what verified it;
+  `externalReferences` links the SBOM. It validates against the CycloneDX 1.6
+  schema.
+
+The MBOM describes declared build inputs. SCRS does not watch the CI run, so it
+is not build provenance; pair it with SLSA attestations where your pipeline
+produces them. Image MBOMs list only flagged layer files, because image file
+inventories are not retained.
+
+## Container images
+
+Image assessments (Docker Hub, GAR, Harbor, OCI) stream a docker-save archive
+from the registry to the scanner (capped by `SCRS_MAX_IMAGE_BYTES`). Two
+analyses run concurrently:
+
+- **Packages:** OSV-Scanner inventories OS packages (Alpine, Debian feeds) and
+  language packages, with a CycloneDX SBOM and vulnerability/MAL matching. An
+  image whose OS feed is not in `SCRS_OSV_ECOSYSTEMS` reports `inventory`
+  failed. Ubuntu's feed exceeds the 512 MiB cap and is unsupported.
+- **Layer content:** every regular file of every layer goes through ClamAV
+  (with the SCRS YARA rules) and the IOC matchers, including files deleted by a
+  later layer: they are still in the blobs every pull downloads. Identical
+  content is scanned once. Files over 25 MiB are hashed but not scanned
+  (`malware: partial`). The scan stops at 200 000 files or 4 minutes and reports
+  partial coverage. Only flagged files are listed under `/files`.
+
+Repository workflow rules (workflow changes, install hooks, root helper scripts)
+do not apply to images; `integrity` says so in its detail.
+
+## Imported reports
+
+`POST /assessments:import` records a Trivy JSON or SARIF 2.1.0 report against a
+discovered asset revision (`target.commit` required). The assessment has one
+stage, `import`, and no SBOM. Findings join the register (`misconfiguration`,
+`secret` and `code` types are import-only) and gate like SCRS findings. A newer
+import from the same tool closes that tool's import-only findings. Imports never
+close vulnerabilities, never serve as a baseline for SCRS scans and never count
+as last-known-good. Trivy secret matches are discarded; only rule, file and line
+are kept.
+
+## Git history mirrors
+
+`POST /assets/{id}/mirrors` queues a git bundle of every branch and tag of a
+GitHub or GitLab asset. The worker speaks git's smart HTTP protocol directly
+(no git binary), verifies the pack checksum, and streams the bundle through a
+SHA-256 hash into S3 (`mirrors/<id>.bundle`, at most `SCRS_MIRROR_MAX_BYTES`).
+With `SCRS_MIRROR_INTERVAL_HOURS`, assets labelled `mirror=true` are mirrored
+on schedule. The newest `SCRS_MIRROR_KEEP` bundles per asset are kept; older
+ones are marked `pruned` and their objects deleted. Restore: download with an
+admin token, compare with `X-Content-SHA256`, then `git clone <file>.bundle`.
+SHA-256 object-format repositories are not supported.
+
 ## Remaining product gates
 
-- Relay adapters, other GitHub event types, batch triggers and outbound delivery/outbox. Signed direct GitHub pushes now work.
-- Full OSV advisory JSONB mirror and provenance, KEV/EPSS, NVD/CVE/VEX and custom feeds.
-- Independent YARA, wider indicator types, full provider integrity signals and malicious-response notifications. ClamAV, SHA256/domain IOCs and workflow checks are now integrated.
-- OCI image/digest fetching, layer attribution, registry event adapters and PR assessment.
-- Owners, remaining retention classes and scheduling, metrics/alerts and full contextual reports.
-- Licensing/SPDX/compliance, SAST analyzers and reachability.
-- Real GitHub/private-repository acceptance; hosted backup/restore and failure/load tests;
-  exact published image, signature, Dokploy domain/TLS and deployed restart recovery.
+- Licensing/SPDX/compliance policy, built-in SAST and reachability analysis (SARIF import covers external SAST tools).
+- YARA runs inside ClamAV, which supports a subset of YARA (no modules such as `pe` or `math`); rules needing modules are rejected at load.
+- Real private-repository and registry acceptance on the target VPS; hosted backup/restore drills.
 
-Consequently successful execution can still return `incomplete`: independent YARA and full integrity coverage remain missing; absent/expired IOC bundles and unavailable or stale ClamAV also prevent complete coverage. Do not interpret incomplete as a clean repository.
+Consequently, successful execution can still return `incomplete`, for example
+when no IOC bundle is active or ClamAV signatures are stale. Do not interpret
+incomplete as a clean result.
 
 Verdict precedence is `fail` > `incomplete` > `warn` > `pass`. Malware, malicious
 dependencies and IOC matches fail whether new or existing; a new critical

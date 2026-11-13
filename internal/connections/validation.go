@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 )
@@ -91,7 +90,7 @@ func ValidateInput(c Connection, credential json.RawMessage) error {
 			return errors.New("GAR credential must be a Google service account key")
 		}
 	default:
-		return fmt.Errorf("unsupported provider %q", c.Provider)
+		return validateProviderInput(c, credential)
 	}
 	return nil
 }

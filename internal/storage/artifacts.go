@@ -122,3 +122,44 @@ func (a *Artifacts) GetSnapshot(ctx context.Context, key string) ([]byte, error)
 	}
 	return data, nil
 }
+
+var mirrorKey = regexp.MustCompile(`^mirrors/[0-9a-f-]{36}\.bundle$`)
+
+// PutMirror streams a git bundle into S3 without buffering it whole; minio
+// uploads it in 16 MiB parts. The caller hashes the stream for integrity.
+func (a *Artifacts) PutMirror(ctx context.Context, id string, r io.Reader) (string, int64, error) {
+	key := "mirrors/" + id + ".bundle"
+	if !mirrorKey.MatchString(key) {
+		return "", 0, errors.New("invalid mirror id")
+	}
+	info, err := a.client.PutObject(ctx, a.bucket, key, r, -1, minio.PutObjectOptions{ContentType: "application/x-git-bundle", PartSize: 16 << 20})
+	if err != nil {
+		return "", 0, err
+	}
+	return key, info.Size, nil
+}
+
+// OpenMirror streams a stored bundle; the caller checks the recorded digest.
+func (a *Artifacts) OpenMirror(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	if !mirrorKey.MatchString(key) {
+		return nil, 0, errors.New("invalid mirror key")
+	}
+	object, err := a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := object.Stat()
+	if err != nil {
+		object.Close()
+		return nil, 0, err
+	}
+	return object, info.Size, nil
+}
+
+// DeleteMirror removes a pruned bundle.
+func (a *Artifacts) DeleteMirror(ctx context.Context, key string) error {
+	if !mirrorKey.MatchString(key) {
+		return errors.New("invalid mirror key")
+	}
+	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})
+}

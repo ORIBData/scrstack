@@ -6,10 +6,9 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "scrs-events",
+        "authentication": "headerAuth",
         "responseMode": "onReceived",
-        "options": {
-          "rawBody": true
-        }
+        "options": {}
       },
       "id": "7b2e1d75-2e3f-4d4c-8b12-000000000001",
       "name": "SCRS events",
@@ -19,15 +18,34 @@
         0,
         0
       ],
-      "webhookId": "7b2e1d75-2e3f-4d4c-8b12-0000000000a1"
+      "webhookId": "7b2e1d75-2e3f-4d4c-8b12-0000000000a1",
+      "notes": "Header Auth credential: Name = X-SCRS-Auth, Value = auth_header.value returned when the SCRS subscription was created or its secret rotated. No Code node or NODE_FUNCTION_ALLOW_BUILTIN needed."
     },
     {
       "parameters": {
-        "jsCode": "// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto and SCRS_WEBHOOK_SECRET in n8n's environment.\nconst crypto = require('crypto');\nconst item = $input.first();\nconst raw = Buffer.from(item.binary.data.data, 'base64');\nconst expected = 'sha256=' + crypto.createHmac('sha256', $env.SCRS_WEBHOOK_SECRET).update(raw).digest('hex');\nconst given = item.json.headers['x-scrs-signature'] || '';\nif (given.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected))) {\n  throw new Error('Invalid SCRS signature');\n}\nconst event = JSON.parse(raw.toString('utf8'));\nreturn [{ json: { type: event.event.type, verdict: event.data.assessment ? event.data.assessment.verdict : null, event } }];"
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.body.event.type }}",
+              "rightValue": "assessment.completed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
       },
       "id": "7b2e1d75-2e3f-4d4c-8b12-000000000002",
-      "name": "Verify signature",
-      "type": "n8n-nodes-base.code",
+      "name": "Assessment completed?",
+      "type": "n8n-nodes-base.if",
       "typeVersion": 2,
       "position": [
         260,
@@ -43,17 +61,8 @@
           },
           "conditions": [
             {
-              "id": "c1",
-              "leftValue": "={{ $json.type }}",
-              "rightValue": "assessment.completed",
-              "operator": {
-                "type": "string",
-                "operation": "equals"
-              }
-            },
-            {
               "id": "c2",
-              "leftValue": "={{ $json.verdict }}",
+              "leftValue": "={{ $json.body.data.assessment.verdict }}",
               "rightValue": "fail",
               "operator": {
                 "type": "string",
@@ -71,18 +80,18 @@
       "typeVersion": 2,
       "position": [
         520,
-        0
+        -60
       ]
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://api.github.com/repos/{{ $json.event.data.assessment.repository }}/statuses/{{ $json.event.data.assessment.commit }}",
+        "url": "=https://api.github.com/repos/{{ $json.body.data.assessment.repository }}/statuses/{{ $json.body.data.assessment.commit }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ state: 'failure', context: 'scrs/supply-chain', description: 'SCRS verdict: fail', target_url: $json.event.data.links.report }) }}",
+        "jsonBody": "={{ JSON.stringify({ state: 'failure', context: 'scrs/supply-chain', description: 'SCRS verdict: ' + $json.body.data.assessment.verdict, target_url: $json.body.data.links.report }) }}",
         "options": {}
       },
       "id": "7b2e1d75-2e3f-4d4c-8b12-000000000004",
@@ -91,19 +100,19 @@
       "typeVersion": 4.2,
       "position": [
         780,
-        -100
+        -160
       ],
       "notes": "Uses n8n's own GitHub credential (statuses:write). SCRS never writes to GitHub."
     },
     {
       "parameters": {
         "method": "POST",
-        "url": "=https://api.github.com/repos/{{ $json.event.data.assessment.repository }}/statuses/{{ $json.event.data.assessment.commit }}",
+        "url": "=https://api.github.com/repos/{{ $json.body.data.assessment.repository }}/statuses/{{ $json.body.data.assessment.commit }}",
         "authentication": "predefinedCredentialType",
         "nodeCredentialType": "githubApi",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ state: $json.verdict === 'incomplete' ? 'pending' : 'success', context: 'scrs/supply-chain', description: 'SCRS verdict: ' + $json.verdict, target_url: $json.event.data.links.report }) }}",
+        "jsonBody": "={{ JSON.stringify({ state: $json.body.data.assessment.verdict === 'incomplete' ? 'pending' : 'success', context: 'scrs/supply-chain', description: 'SCRS verdict: ' + $json.body.data.assessment.verdict, target_url: $json.body.data.links.report }) }}",
         "options": {}
       },
       "id": "7b2e1d75-2e3f-4d4c-8b12-000000000005",
@@ -112,7 +121,7 @@
       "typeVersion": 4.2,
       "position": [
         780,
-        100
+        40
       ],
       "notes": "incomplete is reported as pending: partial coverage is never a pass."
     }
@@ -122,14 +131,14 @@
       "main": [
         [
           {
-            "node": "Verify signature",
+            "node": "Assessment completed?",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Verify signature": {
+    "Assessment completed?": {
       "main": [
         [
           {
@@ -137,7 +146,8 @@
             "type": "main",
             "index": 0
           }
-        ]
+        ],
+        []
       ]
     },
     "Verdict is fail?": {

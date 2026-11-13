@@ -147,3 +147,46 @@ required.
 - Git-bundle history mirroring, Harbor/OCI/GitLab adapters, registry push events, Trivy/SARIF import, licences, SAST and reachability are not built.
 - Webhook receivers must verify `X-SCRS-Signature`.
 - Live Traefik/TLS acceptance on the VPS is still pending.
+
+## 2026-11-14 update: closing the remaining gaps
+
+**Delivered**
+- **Image layers:** every layer file goes through ClamAV, YARA and IOC matching, including files later layers delete. Image verdicts can now reach `pass`. Default feeds add Maven, PyPI, Alpine and Debian.
+- **Providers:** GitLab (groups and subgroups, archive snapshots, webhooks with branch-churn and mass-deletion alerts), Harbor, and generic OCI registries (catalog or explicit repositories).
+- **Registry push events:** Harbor, Docker Hub, GAR Pub/Sub and CNCF Distribution. Assessments are pinned to the pushed digest, and retried deliveries replay the same assessments.
+- **Trivy and SARIF import:** imports join the register and the gate. Trivy secret values are discarded. Closure is scoped to the same tool, and imports never act as baseline or last-known-good.
+- **Git-history mirrors:** native smart-HTTP fetch with pack checksum verification, streamed to S3 with a SHA-256 hash, then pruned. Bundles restore with `git clone`.
+- **Relay and n8n:** relayed GitHub and GitLab events verify a forwarded provider signature. Outbound webhooks add `X-SCRS-Auth`, so n8n needs no Code node or `crypto` builtin.
+- **OpenAPI 0.3.0:** 74 operations across 14 tags, each with a summary, description, scope and typed errors; validated by Redocly. Contract tests fail if a route is undocumented or a documented operation is not routed.
+
+**Defects found and fixed while building**
+- The registry ingest returned `202` for a fully replayed delivery.
+- Imported assessments were rejected because the SBOM rule did not exempt them.
+- The completion n8n workflow set a passing commit status for every non-completion event, for example `integrity.alert`.
+- Callers could inject the internal `import` marker into a normal trigger; it is now stripped.
+
+**Verification**
+- Passing: `make qa`, `database-test` (including new GitLab, registry, import and mirror end-to-end tests, plus a worker mirror test), `scanner-test`, `malware-test` and `storage-integration` (multipart bundle round trip).
+- `image-scan-test` now uses real ClamAV: 90 Alpine layer files scanned, YARA canary detected, 15 packages and 43 advisories.
+- Mirror restore tested against a real `git http-backend`.
+- Rebuilt Compose stack smoke-tested live.
+- govulncheck: 0 reachable vulnerabilities.
+
+**Remaining**
+- YARA is limited to ClamAV's subset (no modules).
+- Ubuntu OSV feed exceeds the 512 MiB cap.
+- No licence/SPDX policy, built-in SAST or reachability.
+- GitLab does not report force pushes.
+- Live Traefik/TLS acceptance on the VPS is still pending.
+- Decisions kept: existing criticals warn rather than pass; metrics use a `read` token; `pass` needs an active IOC bundle.
+
+## 2026-11-14 addendum: SBOM/MBOM and inbound automation
+
+- **Renamed:** the product is now the Software Supply Chain Risk Stack (README, PRD title, OpenAPI 0.4.0, image labels).
+- **New: CycloneDX 1.6 MBOM per assessment** (`/assessments/{id}/mbom`). It records the produced commit or image digest, the build definitions and pinned inputs with SHA-256, the verifying tools, and a link to the SBOM. It validates against the CycloneDX 1.6 schema (`cyclonedx-cli`). It records declared inputs, not observed build provenance.
+- **Validated: inbound automation.** `POST /assessments` is the inbound automation endpoint, alongside signed outbound webhooks. Added bounded `trigger.context` (20 keys, 256-character printable values), echoed in `assessment.completed`.
+- **New end-to-end test** of the n8n round trip:
+  - Rejects a missing token, a token from the wrong network, and the wrong scope (`ingest:relay`).
+  - Rejects undiscovered or excluded assets (`404`) and malformed context (`400`).
+  - Accepts the request (`202` with `Location`); a retry replays (`200`, `Idempotent-Replayed`) and a changed body under the same key conflicts (`409`).
+  - Logs the inbound event, then delivers the context back in the `assessment.completed` payload.

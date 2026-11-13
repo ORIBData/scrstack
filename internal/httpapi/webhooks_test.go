@@ -12,7 +12,7 @@ import (
 
 func TestWebhookSignatureAndEventValidation(t *testing.T) {
 	secret := strings.Repeat("x", 40)
-	handler := newGitHubIngest(nil, secret, true, false).direct()
+	handler := newGitHubIngest(nil, secret, true, false).direct("github")
 	for _, tc := range []struct {
 		event, body, signature string
 		status                 int

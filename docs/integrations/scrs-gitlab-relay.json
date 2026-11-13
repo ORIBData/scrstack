@@ -1,0 +1,92 @@
+{
+  "name": "SCRS - GitLab relay",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "gitlab-scrs",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "8c3f2e86-3f4a-4e5d-9c23-000000000001",
+      "name": "Inbound webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "8c3f2e86-3f4a-4e5d-9c23-0000000000a1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SCRS_BASE_URL }}/scrs/v1/ingest/gitlab",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Gitlab-Event",
+              "value": "={{ $json.headers['x-gitlab-event'] }}"
+            },
+            {
+              "name": "X-Gitlab-Event-UUID",
+              "value": "={{ $json.headers['x-gitlab-event-uuid'] }}"
+            },
+            {
+              "name": "X-Gitlab-Token",
+              "value": "={{ $json.headers['x-gitlab-token'] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "8c3f2e86-3f4a-4e5d-9c23-000000000002",
+      "name": "Relay unchanged body to SCRS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. SCRS verifies the forwarded X-Gitlab-Token against SCRS_GITLAB_WEBHOOK_SECRET. The event UUID is the idempotency key.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Inbound webhook": {
+      "main": [
+        [
+          {
+            "node": "Relay unchanged body to SCRS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

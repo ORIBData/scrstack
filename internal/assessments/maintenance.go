@@ -88,7 +88,7 @@ func (s *Store) Maintain(ctx context.Context, actor uuid.UUID, trigger string) (
 // interval rescans everything (manual maintenance). Idempotency keys per
 // interval window make concurrent or repeated runs harmless.
 func (s *Store) EnqueueRescans(ctx context.Context, interval time.Duration, limit int) (int, error) {
-	rows, err := s.pool.Query(ctx, `SELECT a.locator,c.id::text,COALESCE(NULLIF(a.metadata->>'default_branch',''),'HEAD') FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type='github_repo' AND c.enabled AND a.flags->>'in_scope'='true' AND a.flags->>'accessible'='true' AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.assessments x WHERE x.asset_id=a.id AND x.request->'target'->>'ref'=COALESCE(NULLIF(a.metadata->>'default_branch',''),'HEAD') AND x.request->'remediation' IS NULL AND (x.status IN ('queued','running') OR x.created_at>clock_timestamp()-($1*interval '1 second'))) ORDER BY a.locator LIMIT $2`, int64(interval.Seconds()), limit)
+	rows, err := s.pool.Query(ctx, `SELECT a.locator,c.id::text,COALESCE(NULLIF(a.metadata->>'default_branch',''),'HEAD') FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type IN ('github_repo','gitlab_repo') AND c.enabled AND a.flags->>'in_scope'='true' AND a.flags->>'accessible'='true' AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.assessments x WHERE x.asset_id=a.id AND x.request->'target'->>'ref'=COALESCE(NULLIF(a.metadata->>'default_branch',''),'HEAD') AND x.request->'remediation' IS NULL AND x.request->'import' IS NULL AND (x.status IN ('queued','running') OR x.created_at>clock_timestamp()-($1*interval '1 second'))) ORDER BY a.locator LIMIT $2`, int64(interval.Seconds()), limit)
 	if err != nil {
 		return 0, err
 	}

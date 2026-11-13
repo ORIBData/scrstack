@@ -34,6 +34,7 @@ services:
       <<: *scrs-storage-env
       SCRS_HTTP_ADDR: ":7000"
       SCRS_GITHUB_WEBHOOK_SECRET: ${SCRS_GITHUB_WEBHOOK_SECRET:-}
+      SCRS_GITLAB_WEBHOOK_SECRET: ${SCRS_GITLAB_WEBHOOK_SECRET:-}
       SCRS_RELAY_ENABLED: ${SCRS_RELAY_ENABLED:-false}
       SCRS_MASS_DELETION_FILES: ${SCRS_MASS_DELETION_FILES:-50}
       SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
@@ -93,6 +94,11 @@ services:
       SCRS_MAX_IMAGE_BYTES: ${SCRS_MAX_IMAGE_BYTES:-419430400}
       SCRS_SNAPSHOT_ARCHIVES: ${SCRS_SNAPSHOT_ARCHIVES:-false}
       SCRS_RESCAN_INTERVAL_HOURS: ${SCRS_RESCAN_INTERVAL_HOURS:-0}
+      # Git history mirrors (bundles in S3); scheduled for assets labelled mirror=true.
+      SCRS_MIRRORS_ENABLED: ${SCRS_MIRRORS_ENABLED:-true}
+      SCRS_MIRROR_INTERVAL_HOURS: ${SCRS_MIRROR_INTERVAL_HOURS:-0}
+      SCRS_MIRROR_MAX_BYTES: ${SCRS_MIRROR_MAX_BYTES:-2147483648}
+      SCRS_MIRROR_KEEP: ${SCRS_MIRROR_KEEP:-7}
       SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
       SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set a separate random scanner service token}
       # Outbound webhooks are delivered from the worker (OUT-001/002).
@@ -203,7 +209,7 @@ services:
     restart: unless-stopped
     environment:
       SCRS_FEED_ROOT: /feeds
-      SCRS_OSV_ECOSYSTEMS: ${SCRS_OSV_ECOSYSTEMS:-npm,Go}
+      SCRS_OSV_ECOSYSTEMS: ${SCRS_OSV_ECOSYSTEMS:-npm,Go,Maven,PyPI,Alpine,Debian}
     volumes: ["scrs-feeds:/feeds"]
     read_only: true
     cap_drop: [ALL]

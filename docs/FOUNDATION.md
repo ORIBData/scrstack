@@ -1,6 +1,8 @@
 # SCRS foundation and deployment
 
-The foundation is the part every SCRS module builds on: the API process, the
+SCRS is the Software Supply Chain Risk Stack: it assesses repositories and
+container images and records each revision's SBOM (what it contains) and MBOM
+(how it is built). The foundation is the part every SCRS module builds on: the API process, the
 versioned OpenAPI contract and Swagger UI, storage bootstrap and migrations,
 API tokens, and native provider connections with asset discovery. The
 assessment pipeline (durable jobs, worker, isolated scanner, findings register)

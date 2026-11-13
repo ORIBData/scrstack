@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,7 +29,7 @@ type syntheticSource struct{}
 func (syntheticSource) List(context.Context, connections.Connection, json.RawMessage) ([]connections.Resource, error) {
 	return []connections.Resource{{Type: "github_repo", Locator: "org/repo"}}, nil
 }
-func (syntheticSource) GitHubSnapshot(_ context.Context, _ connections.Connection, _ json.RawMessage, _, _, _ string) ([]byte, string, bool, error) {
+func (syntheticSource) Snapshot(_ context.Context, _ connections.Connection, _ json.RawMessage, _, _, _ string) ([]byte, string, bool, error) {
 	return []byte("synthetic archive"), strings.Repeat("a", 40), false, nil
 }
 
@@ -38,9 +39,9 @@ type recordingSource struct {
 	refs []string
 }
 
-func (r *recordingSource) GitHubSnapshot(ctx context.Context, c connections.Connection, s json.RawMessage, repo, ref, commit string) ([]byte, string, bool, error) {
+func (r *recordingSource) Snapshot(ctx context.Context, c connections.Connection, s json.RawMessage, repo, ref, commit string) ([]byte, string, bool, error) {
 	r.refs = append(r.refs, ref)
-	return r.syntheticSource.GitHubSnapshot(ctx, c, s, repo, ref, commit)
+	return r.syntheticSource.Snapshot(ctx, c, s, repo, ref, commit)
 }
 
 type snapshotSink struct{ keys int }
@@ -248,5 +249,110 @@ func TestPostgresWorkerAssessesImageByDigest(t *testing.T) {
 	latest, err := jobs.Latest(ctx, uuid.Nil, "docker.io/library/app", digest, uuid.Nil)
 	if err != nil || latest.ID != job.ID {
 		t.Fatal("latest-by-digest lookup failed", err)
+	}
+}
+
+type fakeMirrorSource struct{ fail bool }
+
+func (f fakeMirrorSource) Mirror(_ context.Context, _ connections.Connection, _ json.RawMessage, repo string, _ int64, w io.Writer) (connections.MirrorInfo, error) {
+	if _, err := io.WriteString(w, "# v2 git bundle\n"+repo+"\n"); err != nil {
+		return connections.MirrorInfo{}, err
+	}
+	if f.fail {
+		return connections.MirrorInfo{}, errors.New("git fetch failed")
+	}
+	return connections.MirrorInfo{Refs: 2, Head: strings.Repeat("a", 40)}, nil
+}
+
+type mirrorSink struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func (m *mirrorSink) PutMirror(_ context.Context, id string, r io.Reader) (string, int64, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return "", 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects["mirrors/"+id+".bundle"] = data
+	return "mirrors/" + id + ".bundle", int64(len(data)), nil
+}
+func (m *mirrorSink) DeleteMirror(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objects, key)
+	return nil
+}
+
+// Mirror jobs stream source -> hash -> object store, record the digest, and
+// remove partial uploads when the fetch fails.
+func TestPostgresWorkerMirrors(t *testing.T) {
+	db := os.Getenv("SCRS_TEST_DATABASE_URL")
+	if db == "" {
+		t.Skip("requires disposable PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	schema := "qa_" + uuid.NewString()[:8]
+	if err := storage.BootstrapDatabase(ctx, storage.Config{DatabaseURL: db, DatabaseSchema: schema}); err != nil {
+		t.Fatal(err)
+	}
+	pool, _ := pgxpool.New(ctx, db)
+	defer pool.Close()
+	defer func() { _, _ = pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") }()
+	providers, err := connections.Open(ctx, db, schema, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providers.Close()
+	c := connections.Connection{Name: "gh", Provider: "github", Config: json.RawMessage(`{"organization":"org","auth_type":"fine_grained_pat"}`), Scope: connections.Scope{Include: []string{"org/*"}}}
+	if _, err := providers.Put(ctx, c, json.RawMessage(`{"token":"t"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providers.Discover(ctx, "gh", syntheticSource{}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := assessments.Open(ctx, db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobs.Close()
+	var asset uuid.UUID
+	if err := pool.QueryRow(ctx, "SELECT id FROM "+schema+".assets LIMIT 1").Scan(&asset); err != nil {
+		t.Fatal(err)
+	}
+	sink := &mirrorSink{objects: map[string][]byte{}}
+	for _, fail := range []bool{false, true} {
+		m, _, err := jobs.RequestMirror(ctx, asset, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := Worker{Store: jobs, Connections: providers, Mirrors: sink, MirrorSource: fakeMirrorSource{fail: fail}, KeepMirrors: 5, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+		loop, stop := context.WithCancel(ctx)
+		go w.RunMirrors(loop)
+		deadline := time.Now().Add(20 * time.Second)
+		for {
+			got, err := jobs.GetMirror(ctx, asset, m.ID)
+			if err == nil && (got.Status == "succeeded" || got.Status == "failed") {
+				m = got
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("mirror not processed", got, err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		stop()
+		sink.mu.Lock()
+		data := sink.objects["mirrors/"+m.ID.String()+".bundle"]
+		sink.mu.Unlock()
+		if !fail && (m.Status != "succeeded" || m.SHA256 != assessments.Hash(data) || m.SizeBytes != int64(len(data)) || m.Refs != 2) {
+			t.Fatal("mirror record does not match stored bundle", m)
+		}
+		if fail && (m.Status != "failed" || data != nil) {
+			t.Fatal("failed mirror left a partial bundle", m, len(data))
+		}
 	}
 }

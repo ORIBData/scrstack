@@ -3,6 +3,8 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -29,7 +31,7 @@ type ImageSource interface {
 }
 
 type Snapshotter interface {
-	GitHubSnapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error)
+	Snapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error)
 }
 type Worker struct {
 	Source                   Snapshotter
@@ -46,6 +48,101 @@ type Worker struct {
 	Snapshots interface {
 		PutSnapshot(context.Context, []byte) (string, error)
 	}
+	// Mirrors stores git history bundles (INT-006); nil disables mirroring.
+	Mirrors interface {
+		PutMirror(context.Context, string, io.Reader) (string, int64, error)
+		DeleteMirror(context.Context, string) error
+	}
+	MirrorSource interface {
+		Mirror(context.Context, connections.Connection, json.RawMessage, string, int64, io.Writer) (connections.MirrorInfo, error)
+	}
+	MaxMirrorBytes int64
+	KeepMirrors    int
+}
+
+// RunMirrors processes queued mirror requests one at a time. A bundle streams
+// from the git host through a SHA-256 hash into S3 without touching disk.
+func (w Worker) RunMirrors(ctx context.Context) {
+	if w.Mirrors == nil {
+		return
+	}
+	for {
+		m, err := w.Store.ClaimMirror(ctx)
+		if err != nil {
+			if !errors.Is(err, assessments.ErrNotFound) && ctx.Err() == nil {
+				w.Logger.Warn("mirror claim failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(30 * time.Second):
+			}
+			continue
+		}
+		jobCtx, cancel := context.WithTimeout(ctx, 25*time.Minute)
+		result, err := w.mirror(jobCtx, m)
+		cancel()
+		failure := ""
+		if err != nil {
+			failure = err.Error()
+			w.Logger.Warn("mirror failed", "mirror_id", m.ID, "error", err)
+		}
+		finishCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
+		pruned, err := w.Store.FinishMirror(finishCtx, m, result, failure, w.KeepMirrors)
+		if err != nil {
+			w.Logger.Error("mirror result not recorded", "mirror_id", m.ID, "error", err)
+		}
+		for _, key := range pruned {
+			if err := w.Mirrors.DeleteMirror(finishCtx, key); err != nil {
+				w.Logger.Warn("pruned mirror object not deleted", "key", key, "error", err)
+			}
+		}
+		done()
+	}
+}
+
+func (w Worker) mirror(ctx context.Context, m assessments.Mirror) (*assessments.Mirror, error) {
+	name, err := w.Connections.NameByID(ctx, m.ConnectionID)
+	if err != nil {
+		return nil, errors.New("connection unavailable")
+	}
+	c, secret, err := w.Connections.Get(ctx, name)
+	if err != nil {
+		return nil, errors.New("connection unavailable")
+	}
+	source := w.MirrorSource
+	if source == nil {
+		source = connections.NewNativeAdapters()
+	}
+	limit := w.MaxMirrorBytes
+	if limit <= 0 {
+		limit = 2 << 30
+	}
+	reader, writer := io.Pipe()
+	hash := sha256.New()
+	type outcome struct {
+		info connections.MirrorInfo
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		info, err := source.Mirror(ctx, c, secret, m.Locator, limit, io.MultiWriter(writer, hash))
+		writer.CloseWithError(err)
+		done <- outcome{info, err}
+	}()
+	key, size, putErr := w.Mirrors.PutMirror(ctx, m.ID.String(), reader)
+	reader.CloseWithError(errors.New("upload finished"))
+	fetched := <-done
+	if fetched.err != nil {
+		if key != "" {
+			_ = w.Mirrors.DeleteMirror(context.WithoutCancel(ctx), key)
+		}
+		return nil, fetched.err
+	}
+	if putErr != nil {
+		return nil, errors.New("mirror upload failed")
+	}
+	return &assessments.Mirror{ObjectKey: key, SHA256: hex.EncodeToString(hash.Sum(nil)), SizeBytes: size, Refs: fetched.info.Refs, Head: fetched.info.Head}, nil
 }
 
 // MonitorFeeds polls the scanner's feed health and emits feed.stale once per
@@ -144,7 +241,8 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if err != nil {
 		return err
 	}
-	if !c.Enabled || c.ConfigurationRevision != a.ConnectionRevision {
+	if !c.Enabled || c.ConfigurationRevision != a.ConnectionRevision || a.Request.Import != nil {
+		// An import whose recording was interrupted is not scanned instead.
 		return assessments.ErrScope
 	}
 	revision := a.Commit
@@ -162,7 +260,7 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if a.Request.Target.PullRequest != nil {
 		ref = ""
 	}
-	archive, commit, moved, err := source.GitHubSnapshot(ctx, c, secret, a.Request.Target.Repository, ref, revision)
+	archive, commit, moved, err := source.Snapshot(ctx, c, secret, a.Request.Target.Repository, ref, revision)
 	if err != nil {
 		return err
 	}
@@ -263,7 +361,7 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 
 // Maintain runs retention, idempotency expiry and optional default-branch
 // rescans on a schedule (M13, M14, ING-007). One replica wins each pass.
-func (w Worker) Maintain(ctx context.Context, every, rescan time.Duration) {
+func (w Worker) Maintain(ctx context.Context, every, rescan, mirror time.Duration) {
 	for {
 		passCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		report, err := w.Store.Maintain(passCtx, assessments.SchedulerActor, "scheduled")
@@ -274,6 +372,13 @@ func (w Worker) Maintain(ctx context.Context, every, rescan time.Duration) {
 				report.Rescans, err = w.Store.EnqueueRescans(passCtx, rescan, 500)
 				if err != nil {
 					w.Logger.Warn("scheduled rescans failed", "error", err)
+				}
+			}
+			if mirror > 0 && w.Mirrors != nil {
+				if queued, err := w.Store.ScheduleMirrors(passCtx, mirror); err != nil {
+					w.Logger.Warn("scheduled mirrors failed", "error", err)
+				} else if queued > 0 {
+					w.Logger.Info("scheduled mirrors queued", "count", queued)
 				}
 			}
 			w.Logger.Info("scheduled maintenance completed", "report", report)

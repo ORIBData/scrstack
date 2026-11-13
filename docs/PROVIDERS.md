@@ -1,8 +1,9 @@
 # Native provider connections
 
 Build and deploy one generic SCRS image. After deployment, create any number
-of GitHub, Docker Hub and Google Artifact Registry (GAR) connections through
-the authenticated REST API. Each connection has its own name, provider config,
+of GitHub, GitLab, Docker Hub, Google Artifact Registry (GAR), Harbor and
+generic OCI registry connections through the authenticated REST API
+(`POST /scrs/v1/connections`, documented in Swagger UI at `/scrs/v1/docs`). Each connection has its own name, provider config,
 credential and scope. The Docker Hub PAT used by `make release` is separate
 from provider connection credentials.
 
@@ -139,17 +140,60 @@ Sources: [GAR repository listing](https://docs.cloud.google.com/artifact-registr
 [GAR reader role](https://docs.cloud.google.com/artifact-registry/docs/repositories/list-repos),
 [Workload Identity Federation](https://docs.cloud.google.com/iam/docs/workload-identity-federation).
 
+## GitLab
+
+`config.group` is the top-level group or a subgroup path (`acme/platform`);
+discovery includes every non-archived project in subgroups and records them as
+`gitlab_repo` assets (`acme/platform/api`). `config.base_url` defaults to
+`https://gitlab.com`; self-managed instances need an HTTPS origin and may
+include a path prefix. Put a group or project access token with `read_api` and
+`read_repository` in `credential.token`.
+
+Assessments fetch `repository/archive.tar.gz` for the resolved commit from the
+same origin with redirects refused. Webhooks: point the group webhook at
+`/scrs/v1/ingest/gitlab` with the secret token `SCRS_GITLAB_WEBHOOK_SECRET`,
+or relay through n8n. When GitHub and GitLab both hold the same path, pass
+`"provider": "gitlab"` in the assessment target.
+
+```json
+{"provider":"gitlab","name":"gitlab-platform","config":{"group":"acme/platform"},
+ "scope":{"include":["acme/platform/**"]},"credential":{"token":"glpat-..."}}
+```
+
+## Harbor
+
+Set `config.url` (HTTPS), `config.project` and `config.username` (a robot
+account such as `robot$scrs`), and put the robot secret in
+`credential.token`. Give the robot `list repository` and `pull artifact`
+permissions only. Discovery uses Harbor's v2 API; image pulls use the same
+robot account. For push events, add a project webhook "Artifact pushed"
+pointing at `/scrs/v1/ingest/registry/harbor` with Auth Header
+`Bearer <ingest:relay token>`.
+
+## Generic OCI registry
+
+For GHCR, Quay, ECR-compatible proxies, registry:2, Zot, Nexus and others:
+`config.registry` is the host (with port if needed). List the image
+repositories to cover in `config.repositories`, or omit it to use the
+registry catalog (`/v2/_catalog`) filtered by `config.namespace`; GHCR and
+some others offer no catalog. For private registries set `config.username` and
+`credential.token`; omit both for anonymous public pulls (`credential: {}`).
+Registries must serve HTTPS.
+
+```json
+{"provider":"oci","name":"ghcr-acme","config":{"registry":"ghcr.io","username":"acme-bot",
+ "repositories":["acme/api","acme/worker"]},"scope":{"include":["ghcr.io/acme/*"]},
+ "credential":{"token":"ghp_... (read:packages)"}}
+```
+
 ## Security and current boundaries
 
 - No provider credential is returned by the API or stored in JSONB.
 - Credentials supplied through the REST API pass through the API process and
   are encrypted before storage. Use HTTPS and keep the admin token server-side.
 - The same repository or image may appear under more than one connection.
-  Future assessment triggers must resolve the intended connection explicitly
-  when multiple active scopes match.
-- Webhook ingestion, image digest resolution, repository fetch, scan jobs and
-  remediation remain to be implemented. Discovery alone does not scan or clean
-  malware, perform SCA/SAST/DAST, or apply remediations.
-- Generic OCI registries cannot all enumerate repositories reliably. Their
-  eventual adapter will support explicitly configured repositories and OCI
-  Distribution APIs without assuming a universal catalogue endpoint.
+  Assessment triggers then return `422`; pass `connection` (name or id).
+- Admin-supplied base URLs (GitLab, Harbor, OCI registry) may point at private
+  networks by design, for self-hosted installs. Only admins create connections.
+- Discovery alone does not scan. Assessments, webhooks, imports and mirrors use
+  these connections; see `ASSESSMENT_PIPELINE.md`.

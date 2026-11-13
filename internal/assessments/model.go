@@ -22,12 +22,29 @@ var (
 	ErrNotFound  = errors.New("not found")
 	ErrLease     = errors.New("assessment lease no longer valid")
 )
-var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// A git repository is owner/name on GitHub, or group[/subgroup...]/name on GitLab.
+var repositoryPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*){1,7}$`)
 var digestPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var commitPattern = regexp.MustCompile(`^[a-fA-F0-9]{40}$`)
 
 // An image locator is registry host plus repository path, as discovery records it.
 var imagePattern = regexp.MustCompile(`^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$`)
+var contextKey = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+
+// validContext bounds trigger context: at most 20 keys, short printable values.
+func validContext(c map[string]string) bool {
+	if len(c) > 20 {
+		return false
+	}
+	for k, v := range c {
+		if !contextKey.MatchString(k) || len(v) > 256 || strings.IndexFunc(v, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 var tagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 var imageDigestPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var platformPattern = regexp.MustCompile(`^linux/(amd64|arm64|arm/v7|386|ppc64le|s390x)$`)
@@ -45,6 +62,22 @@ type Target struct {
 	PullRequest *PullRequest `json:"pull_request,omitempty"`
 	// Platform selects one image of a multi-architecture index (image targets).
 	Platform string `json:"platform,omitempty"`
+	// Provider narrows a git target to "github" or "gitlab" when both hold
+	// the same repository path; empty matches either.
+	Provider string `json:"provider,omitempty"`
+}
+
+// assetTypes maps a target to the asset types that may satisfy it.
+func (t Target) assetTypes() []string {
+	switch {
+	case t.Type == "image":
+		return []string{"container_image"}
+	case t.Provider == "github":
+		return []string{"github_repo"}
+	case t.Provider == "gitlab":
+		return []string{"gitlab_repo"}
+	}
+	return []string{"github_repo", "gitlab_repo"}
 }
 
 // PullRequest targets a PR head commit (UC8). Ref becomes "pull/<number>" and
@@ -64,14 +97,19 @@ type RemediationRequest struct {
 type Request struct {
 	AutoRemediation bool                `json:"auto_remediation,omitempty"`
 	Remediation     *RemediationRequest `json:"remediation,omitempty"`
-	Target          Target              `json:"target"`
-	Connection      string              `json:"connection,omitempty"`
-	Notify          []string            `json:"notify,omitempty"`
-	Trigger         struct {
+	// Import is set by Store.Import; API callers cannot supply it.
+	Import     *ImportSource `json:"import,omitempty"`
+	Target     Target        `json:"target"`
+	Connection string        `json:"connection,omitempty"`
+	Notify     []string      `json:"notify,omitempty"`
+	Trigger    struct {
 		Origin     string `json:"origin,omitempty"`
 		Event      string `json:"event,omitempty"`
 		DeliveryID string `json:"delivery_id,omitempty"`
 		Actor      string `json:"actor,omitempty"`
+		// Context is caller correlation data (ticket, change request, n8n
+		// execution) echoed in outbound events. It never affects the scan.
+		Context map[string]string `json:"context,omitempty"`
 	} `json:"trigger,omitempty"`
 }
 
@@ -85,15 +123,15 @@ func (r *Request) Validate() error {
 		if r.Target.Platform == "" {
 			r.Target.Platform = "linux/amd64"
 		}
-		if !imagePattern.MatchString(r.Target.Repository) || len(r.Target.Repository) > 255 || (r.Target.Ref != "" && !tagPattern.MatchString(r.Target.Ref)) || (r.Target.Commit != "" && !imageDigestPattern.MatchString(r.Target.Commit)) || !platformPattern.MatchString(r.Target.Platform) || r.Target.PullRequest != nil || len(r.Connection) > 100 || len(r.Notify) > 10 {
+		if !imagePattern.MatchString(r.Target.Repository) || len(r.Target.Repository) > 255 || (r.Target.Ref != "" && !tagPattern.MatchString(r.Target.Ref)) || (r.Target.Commit != "" && !imageDigestPattern.MatchString(r.Target.Commit)) || !platformPattern.MatchString(r.Target.Platform) || r.Target.PullRequest != nil || r.Target.Provider != "" || len(r.Connection) > 100 || len(r.Notify) > 10 {
 			return ErrInput
 		}
-		if len(r.Trigger.Origin) > 100 || len(r.Trigger.Event) > 100 || len(r.Trigger.DeliveryID) > 128 || len(r.Trigger.Actor) > 100 {
+		if len(r.Trigger.Origin) > 100 || len(r.Trigger.Event) > 100 || len(r.Trigger.DeliveryID) > 128 || len(r.Trigger.Actor) > 100 || !validContext(r.Trigger.Context) {
 			return ErrInput
 		}
 		return nil
 	}
-	if r.Target.Type != "git" || !repositoryPattern.MatchString(r.Target.Repository) || len(r.Target.Ref) > 255 || strings.ContainsAny(r.Target.Ref, "\x00\r\n") || len(r.Connection) > 100 {
+	if r.Target.Type != "git" || !repositoryPattern.MatchString(r.Target.Repository) || len(r.Target.Repository) > 255 || (r.Target.Provider != "" && r.Target.Provider != "github" && r.Target.Provider != "gitlab") || len(r.Target.Ref) > 255 || strings.ContainsAny(r.Target.Ref, "\x00\r\n") || len(r.Connection) > 100 {
 		return ErrInput
 	}
 	if r.Target.Commit != "" && !commitPattern.MatchString(r.Target.Commit) {
@@ -117,7 +155,7 @@ func (r *Request) Validate() error {
 			return ErrInput
 		}
 	}
-	if len(r.Trigger.Origin) > 100 || len(r.Trigger.Event) > 100 || len(r.Trigger.DeliveryID) > 128 || len(r.Trigger.Actor) > 100 {
+	if len(r.Trigger.Origin) > 100 || len(r.Trigger.Event) > 100 || len(r.Trigger.DeliveryID) > 128 || len(r.Trigger.Actor) > 100 || !validContext(r.Trigger.Context) {
 		return ErrInput
 	}
 	r.Target.Repository = strings.ToLower(r.Target.Repository)

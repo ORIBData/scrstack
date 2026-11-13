@@ -1,4 +1,4 @@
-# Supply Chain Risk Stack (SCRS): Product Requirements and Architecture
+# Software Supply Chain Risk Stack (SCRS): Product Requirements and Architecture
 
 | | |
 |---|---|
@@ -1348,7 +1348,7 @@ CREATE TABLE audit_log (
 ```yaml
 openapi: 3.1.0
 info:
-  title: Supply Chain Risk Stack (SCRS) API
+  title: Software Supply Chain Risk Stack (SCRS) API
   version: 1.0.0
 servers:
   - url: /api/v1

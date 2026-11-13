@@ -1,43 +1,148 @@
 openapi: 3.1.0
 info:
-  title: Supply Chain Risk Stack API
-  version: 0.2.0
-  description: >-
-    Supply-chain risk assessments for GitHub repositories with offline OSV matching, CycloneDX SBOMs,
-    ClamAV and YARA malware scanning, IOC matching, workflow and install-hook integrity checks,
-    KEV/EPSS enrichment and a persistent risk register. Authenticated requests allow 120 calls per
-    token per sliding minute (429 with Retry-After). Redis/auth-store outages fail closed with 503.
-    Verdict precedence is fail > incomplete > warn > pass; a partial scan is never pass. Every
-    response carries X-Request-Id. Outbound webhooks are signed with X-SCRS-Signature
-    (sha256 HMAC of the exact body) and carry Idempotency-Key (event id). Guided npm and Maven
-    remediation plans never write to repositories.
+  title: Software Supply Chain Risk Stack (SCRS) API
+  version: 0.4.0
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+  summary: Software supply-chain risk assessments, SBOM and MBOM, risk register and automation for repositories and container images.
+  description: |
+    SCRS (Software Supply Chain Risk Stack) assesses GitHub/GitLab repositories and container
+    images (Docker Hub, Google Artifact Registry, Harbor, any OCI registry) with offline OSV
+    matching, ClamAV + YARA malware scanning, IOC matching, integrity rules and KEV/EPSS enrichment,
+    and keeps a persistent risk register. Each assessed revision has a CycloneDX **SBOM** (what the
+    software contains) and a CycloneDX **MBOM** (how it is built: build definitions and pinned
+    inputs).
+
+    **Automation.** External services such as n8n trigger assessments with `POST /assessments`
+    (inbound) and receive results through signed outbound webhooks. Put correlation data in
+    `trigger.context`; it is echoed in `assessment.completed`.
+
+    **Authentication.** Send `Authorization: Bearer <token>`. Token scopes:
+    `read` (view), `write` (trigger, triage, edit assets), `trigger` (trigger and view own
+    assessments only), `ingest:relay` (automation relays) and `admin` (everything). Each operation
+    states the scope it needs; `admin` satisfies every scope.
+
+    **Limits and errors.** 120 requests per token per sliding minute (`429` with `Retry-After`).
+    Errors are `{"error": "<message>"}`. If Redis or the token store is unavailable, requests fail
+    closed with `503`. Every response carries `X-Request-Id`.
+
+    **Concurrency.** Mutable resources return an `ETag` revision; send it back in `If-Match`
+    (`428` when missing, `409` when stale). `POST` triggers accept `Idempotency-Key` (24 h replay
+    returns `200` and `Idempotent-Replayed: true`).
+
+    **Verdicts.** `fail` > `incomplete` > `warn` > `pass`. A partial scan is never `pass`.
+
+    **Pagination.** List endpoints return `{items, next_cursor}`; pass `cursor=<next_cursor>`
+    until it is empty. The connection list returns the cursor in the `X-Next-Cursor` header.
+
+    **Outbound webhooks** carry `X-SCRS-Signature` (`sha256=` HMAC of the exact body),
+    `X-SCRS-Auth` (static header for receivers like n8n Header Auth), `X-SCRS-Event` and
+    `Idempotency-Key` (event id).
 servers:
   - url: /scrs/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: System
+    description: Health, readiness, metrics and these docs.
+  - name: Tokens
+    description: API tokens and their scopes (admin).
+  - name: Connections
+    description: Provider connections (GitHub, GitLab, Docker Hub, GAR, Harbor, OCI) and discovery (admin).
+  - name: Assets
+    description: Discovered repositories and images, their owners and operator attributes.
+  - name: Mirrors
+    description: Git history bundles of repository assets for incident restore.
+  - name: Assessments
+    description: Trigger, track and list supply-chain assessments.
+  - name: Assessment results
+    description: Findings, components, SBOM, reports and machine-readable documents of one assessment.
+  - name: Imports
+    description: Record external scanner reports (Trivy, SARIF) as assessments.
+  - name: Risk register
+    description: Deduplicated findings across assessments and their triage lifecycle.
+  - name: Remediation
+    description: Guided npm and Maven fix plans. Plans are advice; SCRS never writes to repositories.
+  - name: Ingest
+    description: Provider and registry events (direct webhooks or relayed through automation such as n8n).
+  - name: Webhook subscriptions
+    description: Outbound event subscriptions, delivery log and redelivery (admin).
+  - name: Threat intelligence
+    description: Versioned indicator-of-compromise bundles (admin).
+  - name: Operations
+    description: Maintenance, inbound event log and retention (admin).
 paths:
-  /webhooks/github:
-    post:
-      operationId: githubPushWebhook
-      summary: Direct GitHub delivery (HMAC); same processing as /ingest/github
-      description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. push and pull_request (opened, synchronize, reopened) queue assessments; push, delete, create, repository, member and organization events raise integrity alerts (force push, ref deletion, branch churn, mass deletion, default-branch, visibility and membership changes, campaign patterns). Other event types are acknowledged with 200. Delivery replay is idempotent for 24 hours.
-      responses:
-        '202': {description: Push durably queued with raw event}
-        '200': {description: Replay, ping, deleted-ref or non-branch (tag) push acknowledgement}
-        '401': {description: Invalid provider signature}
-        '409': {description: Same delivery ID with different payload}
-        '422': {description: Ambiguous connection}
-        '503': {description: Webhook secret not configured}
-  /feeds/indicators:
+  # ---------------------------------------------------------------- System
+  /system/healthz:
     get:
-      operationId: activeIndicators
-      security: [{bearerAuth: []}]
-      summary: Read active versioned IOC bundle (admin)
+      tags: [System]
+      operationId: health
+      summary: Liveness probe
+      description: Returns `ok` while the process is serving. No authentication.
+      security: []
       responses:
-        '200': {description: Version and normalized indicators}
-        '404': {description: No active bundle}
-    put:
-      operationId: importIndicators
-      security: [{bearerAuth: []}]
-      summary: Atomically import and activate immutable IOC version (admin)
+        '200': {description: Process is alive, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+  /system/readyz:
+    get:
+      tags: [System]
+      operationId: readiness
+      summary: Readiness probe
+      description: Checks PostgreSQL, Redis and S3 (cached for 10 s). Use for load-balancer health. No authentication.
+      security: []
+      responses:
+        '200': {description: Backing services reachable, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        '503': {description: A backing service is unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+  /system/metrics:
+    get:
+      tags: [System]
+      operationId: metrics
+      summary: Prometheus metrics
+      description: Request, queue-depth, verdict, trigger and webhook-delivery metrics in Prometheus text format. Scope `read`.
+      responses:
+        '200': {description: Prometheus exposition, content: {text/plain: {schema: {type: string}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /docs:
+    get:
+      tags: [System]
+      operationId: apiDocs
+      summary: Swagger UI
+      description: Interactive documentation for this API. Public unless `SCRS_DOCS_PUBLIC=false` (then any valid token).
+      security: []
+      responses:
+        '200': {description: HTML page, content: {text/html: {schema: {type: string}}}}
+  /docs/openapi.yaml:
+    get:
+      tags: [System]
+      operationId: openAPIDocument
+      summary: OpenAPI document
+      description: This contract in YAML, for client generation (for example openapi-typescript or orval).
+      security: []
+      responses:
+        '200': {description: OpenAPI 3.1 YAML, content: {application/yaml: {schema: {type: string}}}}
+
+  # ---------------------------------------------------------------- Tokens
+  /tokens:
+    get:
+      tags: [Tokens]
+      operationId: listTokens
+      summary: List API tokens
+      description: Token metadata only; secrets are never returned after creation. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/Cursor'}]
+      responses:
+        '200':
+          description: Page of tokens
+          content: {application/json: {schema: {$ref: '#/components/schemas/TokenPage'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Tokens]
+      operationId: createToken
+      summary: Create an API token
+      description: Returns the token secret once. Optionally restrict client IPs (`ip_allow_list`) and set an expiry. Scope `admin`.
       requestBody:
         required: true
         content:
@@ -45,188 +150,747 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [version, indicators]
+              required: [name, scopes]
               properties:
-                version: {type: string, minLength: 1, maxLength: 128}
-                indicators:
-                  type: array
-                  maxItems: 10000
-                  items:
-                    type: object
-                    additionalProperties: false
-                    required: [id, type, value, valid_until]
-                    properties:
-                      id: {type: string, maxLength: 128}
-                      type: {type: string, enum: [sha256, domain]}
-                      value: {type: string}
-                      valid_until: {type: string, format: date-time}
+                name: {type: string, maxLength: 100, example: backoffice-reader}
+                scopes: {type: array, minItems: 1, items: {$ref: '#/components/schemas/Scope'}}
+                ip_allow_list: {type: array, items: {type: string, description: IP or CIDR}, example: ['203.0.113.0/24']}
+                expires_at: {type: [string, 'null'], format: date-time}
       responses:
-        '201': {description: Activated and audited; previous version retained}
-        '400': {description: Invalid indicators}
-        '409': {description: Version already exists}
-  /assessments/{id}/files:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+        '201':
+          description: Token created; store `token` now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token: {type: string, description: Secret bearer token (shown once)}
+                  metadata: {$ref: '#/components/schemas/Token'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /tokens/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    delete:
+      tags: [Tokens]
+      operationId: revokeToken
+      summary: Revoke an API token
+      description: Revocation is immediate. The bootstrap token is rotated through the environment instead. Scope `admin`.
+      responses:
+        '204': {description: Revoked}
+        '409': {description: Unknown token or bootstrap token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Connections
+  /connections:
     get:
-      operationId: assessmentFiles
-      summary: File hash, size and malware status; source content is excluded
-      security: [{bearerAuth: []}]
+      tags: [Connections]
+      operationId: listConnections
+      summary: List connections
+      description: Connections without credentials, ordered by name. The next page cursor is in `X-Next-Cursor`. Scope `admin`.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {name: cursor, in: query, schema: {type: string}, description: 'Value of the previous `X-Next-Cursor` header'}
       responses:
-        '200': {description: Bounded file evidence inventory}
-        '409': {description: File evidence unavailable}
-  /assessments/{id}/remediations:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: automaticRemediationPlans
-      summary: Automatic child plans and dispatch state for this assessment
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Manifest, child assessment ID, dispatch state and job status}
-  /settings/retention:
-    get:
-      operationId: getRetention
-      security: [{bearerAuth: []}]
-      summary: Read raw-ingress retention policy and ETag (admin)
-      responses:
-        '200': {description: revision and inbound_event_days; zero keeps forever}
-    put:
-      operationId: setRetention
-      security: [{bearerAuth: []}]
-      summary: Update raw-ingress retention policy atomically (admin)
-      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+        '200':
+          description: Connections
+          headers: {X-Next-Cursor: {schema: {type: string}, description: Present when more pages exist}}
+          content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/Connection'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Connections]
+      operationId: createConnection
+      summary: Create a connection
+      description: |
+        Stores provider config and an AES-GCM encrypted credential. `config` and `credential` depend on the provider:
+        - `github`: config `{organization, auth_type: github_app|fine_grained_pat|oauth_app_token, app_id?, installation_id?}`, credential `{private_key_pem}` or `{token}`
+        - `gitlab`: config `{group, base_url?}` (subgroups allowed, default https://gitlab.com), credential `{token}` (read_api + read_repository)
+        - `dockerhub`: config `{namespace, identifier}`, credential `{token}`
+        - `gar`: config `{project, location}`, credential `{service_account_json}`
+        - `harbor`: config `{url, project, username}` (robot account), credential `{token}`
+        - `oci`: config `{registry, namespace?, username?, repositories?}`, credential `{token}` or `{}` for anonymous. List `repositories` for registries without a catalog (GHCR).
+
+        Scope `admin`.
       requestBody:
         required: true
         content:
           application/json:
-            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+            schema: {$ref: '#/components/schemas/ConnectionInput'}
+            examples:
+              gitlab: {value: {provider: gitlab, name: gitlab-platform, config: {group: acme/platform}, scope: {include: ['acme/platform/**']}, credential: {token: glpat-xxxx}}}
+              harbor: {value: {provider: harbor, name: harbor-apps, config: {url: 'https://harbor.example.com', project: apps, username: 'robot$scrs'}, scope: {include: ['harbor.example.com/apps/*']}, credential: {token: '...'}}}
       responses:
-        '200': {description: Saved policy with new ETag}
-        '409': {description: Policy revision changed}
-        '428': {description: If-Match required}
-  /settings/retention:preview:
-    post:
-      operationId: previewRetention
-      security: [{bearerAuth: []}]
-      summary: Count raw events eligible for removal and stored JSON bytes (admin)
+        '201':
+          description: Created
+          headers: {Location: {schema: {type: string}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /connections/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Connections]
+      operationId: getConnection
+      summary: Get a connection
+      description: Configuration, scope and last check status; never the credential. Scope `admin`.
+      responses:
+        '200': {description: Connection, content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Connections]
+      operationId: updateConnection
+      summary: Change scope or enable/disable
+      description: Changing scope or disabling invalidates queued work for the old configuration. Send at least one field. Scope `admin`.
       requestBody:
         required: true
         content:
           application/json:
-            schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 0, maximum: 36500}}}
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                scope: {$ref: '#/components/schemas/ConnectionScope'}
+                enabled: {type: boolean}
       responses:
-        '200': {description: rows and bytes; excludes pending/running assessment events}
-  /settings/retention:purge:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [Connections]
+      operationId: disableConnection
+      summary: Disable a connection
+      description: Soft delete. The connection is disabled and its history kept as audit evidence. Scope `admin`.
+      responses:
+        '200': {description: Disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /connections/{id}:rotate-credential:
+    parameters: [{$ref: '#/components/parameters/Id'}]
     post:
-      operationId: purgeIngressEvents
-      security: [{bearerAuth: []}]
-      summary: Purge at most 1000 eligible raw events under the saved policy (admin)
-      description: Preserves assessments, findings, audit records and all S3 artifacts. Default policy keeps forever. Scheduling and other retention classes are not supported yet.
-      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      tags: [Connections]
+      operationId: rotateConnectionCredential
+      summary: Replace the stored credential
+      description: Validates the credential shape for the provider and re-encrypts it. Scope `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [credential]
+              properties:
+                credential: {type: object, description: 'Provider credential, as in createConnection'}
       responses:
-        '200': {description: deleted_events count; purge audited atomically}
-        '409': {description: Stale policy revision}
-        '428': {description: If-Match required}
+        '200': {description: Rotated, content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /connections/{id}:test:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Connections]
+      operationId: testConnection
+      summary: Test provider access
+      description: Lists resources with the stored credential without changing the inventory. Scope `admin`.
+      responses:
+        '200':
+          description: Provider reachable
+          content: {application/json: {schema: {type: object, properties: {connection_id: {type: string, format: uuid}, resource_count: {type: integer}}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '502': {description: Provider rejected the request, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /connections/{id}:discover:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Connections]
+      operationId: discoverConnection
+      summary: Discover assets
+      description: Lists the provider's repositories or images and reconciles the asset inventory. Resources that disappeared lose eligibility but keep their history. Scope `admin`.
+      responses:
+        '200':
+          description: Inventory reconciled
+          content: {application/json: {schema: {type: object, properties: {connection: {type: string}, discovered: {type: integer}, in_scope: {type: integer}}}}}
+        '502': {description: Provider rejected the request, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Assets
+  /assets:
+    get:
+      tags: [Assets]
+      operationId: listAssets
+      summary: List assets
+      description: All discovered repositories and images ordered by locator. Check `flags.in_scope` and `flags.accessible` for eligibility. Scope `read`.
+      parameters:
+        - {$ref: '#/components/parameters/Limit'}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200': {description: Page of assets, content: {application/json: {schema: {$ref: '#/components/schemas/AssetPage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: getAsset
+      summary: Get an asset
+      description: Asset with owner and attributes. The `ETag` header is the revision for updates. Scope `read` or `write`.
+      responses:
+        '200':
+          description: Asset
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Asset'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Assets]
+      operationId: updateAsset
+      summary: Update owner and attributes
+      description: Sets owner, environment, criticality, exposure and labels. The label `mirror=true` opts the asset into scheduled git mirrors. Requires `If-Match`. Scope `write`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AssetChange'}}}
+      responses:
+        '200':
+          description: Updated
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Asset'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/last-known-good:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: lastKnownGood
+      summary: Last known good revision
+      description: Newest `pass` SCRS assessment of a ref with no open integrity finding against it. Imports never count. Use it as the restore target after an incident. Scope `read` or `write`.
+      parameters: [{name: ref, in: query, required: true, schema: {type: string}, example: main}]
+      responses:
+        '200':
+          description: Revision and its assessment
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id: {type: string, format: uuid}
+                  ref: {type: string}
+                  commit: {type: string}
+                  assessment: {$ref: '#/components/schemas/Assessment'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /owners:
+    get:
+      tags: [Assets]
+      operationId: listOwners
+      summary: List owners
+      description: Accountable contacts that assets can reference. Scope `read` or `write`.
+      responses:
+        '200': {description: Owners, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Owner'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Assets]
+      operationId: createOwner
+      summary: Create an owner
+      description: Names are unique. Contact fields are excluded from outbound events unless a subscription opts in. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OwnerInput'}}}
+      responses:
+        '201':
+          description: Created
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Owner'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /owners/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    patch:
+      tags: [Assets]
+      operationId: updateOwner
+      summary: Replace an owner's fields
+      description: Requires `If-Match` with the owner's revision. Scope `write`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/OwnerInput'}}}
+      responses:
+        '200':
+          description: Updated
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Owner'}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Mirrors
+  /assets/{id}/mirrors:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Mirrors]
+      operationId: listMirrors
+      summary: List git mirrors of an asset
+      description: The 50 newest mirror jobs and bundles, newest first. Older bundles beyond `SCRS_MIRROR_KEEP` show `pruned`. Scope `read` or `write`.
+      responses:
+        '200': {description: Mirrors, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Mirror'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Mirrors]
+      operationId: requestMirror
+      summary: Mirror a repository now
+      description: Queues a git bundle of every branch and tag of a GitHub or GitLab asset. If a mirror is already queued or running, returns it with `200`. Scope `write`.
+      responses:
+        '202': {description: Mirror queued, content: {application/json: {schema: {$ref: '#/components/schemas/Mirror'}}}}
+        '200': {description: A mirror is already in progress, content: {application/json: {schema: {$ref: '#/components/schemas/Mirror'}}}}
+        '404': {description: Not an in-scope git repository asset, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/mirrors/{mirror}/bundle:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - {name: mirror, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [Mirrors]
+      operationId: downloadMirror
+      summary: Download a git bundle
+      description: Streams the bundle. Verify it against `X-Content-SHA256`, then restore with `git clone <file>.bundle`. Scope `admin`.
+      responses:
+        '200':
+          description: Git bundle (v2)
+          headers: {X-Content-SHA256: {schema: {type: string}, description: SHA-256 recorded when the bundle was stored}}
+          content: {application/x-git-bundle: {schema: {type: string, format: binary}}}
+        '409': {description: Mirror not succeeded or pruned, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '502': {description: Object store unavailable or object size mismatch, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Assessments
   /assessments:
     post:
+      tags: [Assessments]
       operationId: createAssessment
-      summary: Queue assessment of a discovered, permitted GitHub repository (write or trigger)
-      security: [{bearerAuth: []}]
-      parameters:
-        - {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}, description: Actor-scoped replay key retained for 24 hours}
+      summary: Trigger an assessment
+      description: |
+        Queues an assessment of one in-scope asset. This is also the inbound endpoint for automation (n8n, CI, ticketing): use a `trigger` token restricted with `ip_allow_list`, the caller's event id as `Idempotency-Key`, and `trigger.context` for correlation data returned in `assessment.completed`. Git targets resolve `ref` to an immutable commit (or pin `commit`); image targets resolve `ref` (tag) to a manifest digest (or pin `commit` = `sha256:` digest).
+        Poll `GET /assessments/{id}?wait=30`, or subscribe to `assessment.completed`. Scope `write` or `trigger`.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [target]
-              properties:
-                connection: {type: string, description: Connection name or UUID; required when ambiguous}
-                target:
-                  type: object
-                  additionalProperties: false
-                  required: [type, repository]
-                  properties:
-                    type: {type: string, enum: [git]}
-                    repository: {type: string, example: organization/repository}
-                    ref: {type: string, default: HEAD}
-                    commit: {type: string, pattern: '^[a-fA-F0-9]{40}$'}
-                    pull_request:
-                      type: object
-                      description: Assess a PR head commit (commit required); ref becomes pull/<number>; base_ref is the new-versus-existing baseline
-                      required: [number, base_ref]
-                      properties:
-                        number: {type: integer, minimum: 1}
-                        base_ref: {type: string}
-                        head_ref: {type: string}
-                        title: {type: string, maxLength: 512}
-                notify: {type: array, maxItems: 10, items: {type: string}, description: Restrict completion events to these webhook subscription names (TRG-008)}
-                trigger:
-                  type: object
-                  additionalProperties: false
-                  properties:
-                    origin: {type: string, maxLength: 100}
-                    event: {type: string, maxLength: 100}
-                    delivery_id: {type: string, maxLength: 128}
-                    actor: {type: string, maxLength: 100}
+            schema: {$ref: '#/components/schemas/AssessmentRequest'}
+            examples:
+              branch: {value: {target: {type: git, repository: acme/api, ref: main}}}
+              automation: {value: {target: {type: git, repository: acme/api, ref: main, commit: 0123456789abcdef0123456789abcdef01234567}, trigger: {origin: n8n, event: release.requested, delivery_id: exec-4711, actor: release-bot, context: {ticket: CHG-1042}}}}
+              gitlab: {value: {target: {type: git, provider: gitlab, repository: acme/platform/api, ref: main}}}
+              pullRequest: {value: {target: {type: git, repository: acme/api, commit: 0123456789abcdef0123456789abcdef01234567, pull_request: {number: 42, base_ref: main}}}}
+              image: {value: {target: {type: image, repository: docker.io/acme/api, ref: '1.4.2', platform: linux/amd64}}}
       responses:
-        '202': {description: Durably queued; Location identifies the assessment}
-        '200': {description: Idempotent replay}
-        '400': {description: Invalid or unsupported target}
-        '404': {description: Asset not registered or outside scope}
-        '409': {description: Idempotency key reused for different request}
-        '422': {description: Multiple connections match}
-        '429': {description: Queue capacity or token rate limit reached}
+        '202':
+          description: Queued
+          headers:
+            Location: {schema: {type: string}}
+            Retry-After: {schema: {type: integer}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {description: Asset not discovered or out of scope, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '409': {description: Idempotency key reused with a different body, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: 'Several connections match; set `connection`', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
     get:
+      tags: [Assessments]
       operationId: listAssessments
-      summary: List jobs; trigger-only callers see only their own jobs
-      security: [{bearerAuth: []}]
+      summary: List assessments
+      description: Newest first, filterable. `trigger`-only tokens see only their own assessments. Scope `read`, `write` or `trigger`.
       parameters:
-        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {$ref: '#/components/parameters/Cursor'}
         - {name: asset_id, in: query, schema: {type: string, format: uuid}}
-        - {name: status, in: query, schema: {type: string, enum: [queued, running, succeeded, failed, cancelled, superseded]}}
-        - {name: verdict, in: query, schema: {type: string, enum: [pass, warn, fail, incomplete]}}
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/AssessmentStatus'}}
+        - {name: verdict, in: query, schema: {$ref: '#/components/schemas/Verdict'}}
         - {name: ref, in: query, schema: {type: string}}
-        - {name: commit, in: query, schema: {type: string, pattern: '^[a-fA-F0-9]{40}$'}}
-        - {name: actor, in: query, schema: {type: string}, description: Claimed actor (INT-016)}
+        - {name: commit, in: query, schema: {type: string}, description: Resolved commit SHA or image digest}
+        - {name: actor, in: query, schema: {type: string}, description: Requesting token name}
         - {name: created_after, in: query, schema: {type: string, format: date-time}}
         - {name: created_before, in: query, schema: {type: string, format: date-time}}
       responses:
-        '200': {description: Up to 100 items with next_cursor}
-  /assessments/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+        '200': {description: Page of assessments, content: {application/json: {schema: {$ref: '#/components/schemas/AssessmentPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments:batch:
+    post:
+      tags: [Assessments]
+      operationId: createAssessmentBatch
+      summary: Trigger up to 100 assessments
+      description: Each item has its own idempotency key and result; one failing item never fails the others. Always `207`. Scope `write` or `trigger`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    additionalProperties: false
+                    required: [request]
+                    properties:
+                      idempotency_key: {type: string, maxLength: 128}
+                      request: {$ref: '#/components/schemas/AssessmentRequest'}
+      responses:
+        '207':
+          description: Per-item results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: {type: integer}
+                        status: {type: integer, description: HTTP status this item would have received}
+                        assessment_id: {type: string, format: uuid}
+                        location: {type: string}
+                        error: {type: string}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/latest:
     get:
-      operationId: getAssessment
-      summary: Read status, revision, coverage, counts (including new and waived), diff and verdict
-      security: [{bearerAuth: []}]
+      tags: [Assessments]
+      operationId: latestAssessment
+      summary: Latest assessment for an asset or commit
+      description: The newest assessment matching `asset_id`, `repository` and/or `commit`, for example to show a PR or release gate. Scope `read`, `write` or `trigger`.
       parameters:
-        - {name: wait, in: query, schema: {type: integer, minimum: 0, maximum: 60}, description: Long-poll while queued or running (TRG-009)}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+        - {name: repository, in: query, schema: {type: string}}
+        - {name: commit, in: query, schema: {type: string}}
       responses:
-        '200': {description: Assessment; succeeded describes execution and does not imply a pass verdict}
-        '404': {description: Assessment unavailable to caller}
+        '200': {description: Assessment, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessments]
+      operationId: getAssessment
+      summary: Get an assessment
+      description: Status, verdict, stage coverage, counts and component diff. With `wait`, holds the request up to that many seconds until the assessment finishes (long-poll). Scope `read`, `write` or `trigger` (own).
+      parameters: [{name: wait, in: query, schema: {type: integer, minimum: 0, maximum: 60}}]
+      responses:
+        '200': {description: Assessment, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
     delete:
+      tags: [Assessments]
       operationId: cancelAssessment
-      summary: Cancel a pending job without deleting history (write or own trigger job)
-      security: [{bearerAuth: []}]
+      summary: Cancel a queued or running assessment
+      description: Finished assessments cannot be cancelled. Scope `write`, or `trigger` for own assessments.
       responses:
-        '204': {description: Cancelled; stale workers cannot publish results}
-        '409': {description: Job already terminal}
+        '204': {description: Cancelled}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {description: Already finished, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Assessment results
+  /assessments/{id}/findings:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentFindings
+      summary: Findings of an assessment
+      description: Findings as detected in this assessment, each marked `new` or `existing` against the baseline. Scope `read`, `write` or `trigger` (own).
+      parameters: [{$ref: '#/components/parameters/Cursor'}]
+      responses:
+        '200': {description: Page of findings, content: {application/json: {schema: {$ref: '#/components/schemas/FindingPage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/components:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentComponents
+      summary: Components (packages) of an assessment
+      description: Package inventory with ecosystem, version, PURL and manifest path. Scope `read`, `write` or `trigger` (own).
+      parameters: [{$ref: '#/components/parameters/Cursor'}]
+      responses:
+        '200':
+          description: Page of components
+          content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Component'}}, next_cursor: {type: string}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/files:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentFiles
+      summary: File evidence
+      description: Path, size, SHA-256 and malware status per file. Source content is never stored. Image assessments list only flagged layer files. Scope `read`, `write` or `trigger` (own).
+      responses:
+        '200': {description: File evidence, content: {application/json: {schema: {type: array, items: {$ref: '#/components/schemas/FileEvidence'}}}}}
+        '409': {description: File evidence unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/sbom:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentSBOM
+      summary: CycloneDX SBOM
+      description: CycloneDX 1.6 JSON, integrity-checked against the stored digest (`ETag`). Push it to Dependency-Track or other SBOM tools. Scope `read`, `write` or `trigger` (own).
+      parameters: [{name: format, in: query, schema: {type: string, enum: [cyclonedx-json]}}]
+      responses:
+        '200':
+          description: SBOM
+          headers: {ETag: {schema: {type: string}, description: SHA-256 of the SBOM}}
+          content: {application/vnd.cyclonedx+json: {schema: {type: object}}}
+        '409': {description: 'SBOM not available (failed, partial or imported assessment)', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/report:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentReport
+      summary: Human-readable report
+      description: Markdown summary with `format=md`; otherwise the assessment JSON. Scope `read`, `write` or `trigger` (own).
+      parameters: [{name: format, in: query, schema: {type: string, enum: [md, json]}}]
+      responses:
+        '200':
+          description: Report
+          content:
+            text/markdown: {schema: {type: string}}
+            application/json: {schema: {$ref: '#/components/schemas/Assessment'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/context:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentContext
+      summary: Context document for automation and AI agents
+      description: Size-capped, redacted JSON with verdict, gate rule, findings and guidance. `agent` marks repository-controlled text as untrusted. Contacts only with `include_contacts=true` and `admin`. Scope `read`, `write` or `trigger` (own).
+      parameters:
+        - {name: profile, in: query, schema: {type: string, enum: [full, agent], default: full}}
+        - {name: include_contacts, in: query, schema: {type: boolean}}
+      responses:
+        '200': {description: Context document, content: {application/json: {schema: {type: object}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/mbom:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentMBOM
+      summary: CycloneDX MBOM (manufacturing BOM)
+      description: CycloneDX 1.6 Manufacturing Bill of Materials of the assessed revision. Lists the produced artifact (commit or image digest), the build definitions and pinned inputs SCRS observed (CI workflows, Dockerfiles, build scripts, lockfiles) with SHA-256, the verifying tools and a link to the SBOM. It is declared, not observed, build data; use SLSA attestations for provenance. Scope `read`, `write` or `trigger` (own).
+      responses:
+        '200': {description: MBOM, content: {application/vnd.cyclonedx+json: {schema: {type: object}}}}
+        '409': {description: Assessment not succeeded, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/vex:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentVEX
+      summary: OpenVEX document
+      description: OpenVEX 0.2.0 statements derived from register triage (affected, not_affected, fixed, under_investigation). Scope `read`, `write` or `trigger` (own).
+      responses:
+        '200': {description: OpenVEX, content: {application/json: {schema: {type: object}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/snapshot:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assessment results]
+      operationId: assessmentSnapshot
+      summary: Download the scanned source archive
+      description: The exact tar.gz SCRS scanned, when `SCRS_SNAPSHOT_ARCHIVES=true`. Scope `admin`.
+      responses:
+        '200': {description: Source archive, content: {application/gzip: {schema: {type: string, format: binary}}}}
+        '409': {description: Snapshot not stored for this assessment, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/remediation:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Remediation]
+      operationId: remediationPlan
+      summary: Remediation plan result
+      description: The plan produced by a remediation assessment (changed manifest, upgrades, residual risk). Scope `read`, `write` or `trigger` (own).
+      responses:
+        '200': {description: Plan, content: {application/json: {schema: {type: object}}}}
+        '409': {description: Plan not available, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/remediations:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Remediation]
+      operationId: automaticRemediationPlans
+      summary: Automatic plans for an assessment
+      description: Fix plans dispatched automatically for this assessment's manifests, with dispatch and job status. Scope `read`, `write` or `trigger` (own).
+      responses:
+        '200':
+          description: Plans
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    manifest: {type: string}
+                    dispatch_status: {type: string}
+                    assessment_id: {type: [string, 'null'], format: uuid}
+                    job_status: {type: [string, 'null']}
+                    error: {type: string}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Imports
+  /assessments:import:
+    post:
+      tags: [Imports]
+      operationId: importReport
+      summary: Import a Trivy or SARIF report
+      description: |
+        Records an external scan of one in-scope asset revision as a completed assessment (stage `import`). Findings join the register and the verdict gate.
+        - `trivy`: Trivy JSON (`SchemaVersion: 2`): vulnerabilities, misconfigurations, secrets. Secret values are discarded.
+        - `sarif`: SARIF 2.1.0 from Semgrep, CodeQL and similar tools, as `code` findings. Severity comes from `security-severity`, else from `level`.
+
+        A newer import from the same tool closes that tool's misconfiguration, secret or code findings. Imports never close vulnerabilities and never serve as a baseline or last-known-good.
+        Body limit 16 MiB. Scope `write` or `trigger`.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [target, format, report]
+              properties:
+                target: {$ref: '#/components/schemas/Target'}
+                connection: {type: string}
+                format: {type: string, enum: [trivy, sarif]}
+                notify: {type: array, maxItems: 10, items: {type: string}}
+                report: {type: object, description: The unmodified Trivy JSON or SARIF document}
+            example:
+              target: {type: git, repository: acme/api, ref: main, commit: 0123456789abcdef0123456789abcdef01234567}
+              format: trivy
+              report: {SchemaVersion: 2, Results: []}
+      responses:
+        '201':
+          description: Imported and completed
+          headers: {Location: {schema: {type: string}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '400': {description: 'Invalid report, format or missing `target.commit`', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '404': {description: Asset not discovered or out of scope, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Risk register
   /register:
     get:
-      operationId: listFindings
-      summary: Persistent finding register (read or write)
-      security: [{bearerAuth: []}]
+      tags: [Risk register]
+      operationId: listRegister
+      summary: List register entries
+      description: Deduplicated findings across all assessments with current lifecycle status. Scope `read` or `write`.
       parameters:
-        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+        - {$ref: '#/components/parameters/Cursor'}
         - {name: asset_id, in: query, schema: {type: string, format: uuid}}
       responses:
-        '200': {description: Up to 100 findings with next_cursor}
+        '200': {description: Page of register entries, content: {application/json: {schema: {$ref: '#/components/schemas/FindingPage'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /register/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     patch:
+      tags: [Risk register]
       operationId: transitionFinding
-      summary: Audit a status change; accepted, suppressed and false_positive require admin
-      security: [{bearerAuth: []}]
+      summary: Change a finding's status
+      description: |
+        Triage with a reason (8 to 2000 characters). `open`, `triaged` and `in_progress` need `write`. `accepted` (a waiver, requires `expires_at` within 90 days), `suppressed` and `false_positive` need `admin`.
+        Malicious content never gates below `warn`, even when waived.
       requestBody:
         required: true
         content:
@@ -238,216 +902,60 @@ paths:
               properties:
                 status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive]}
                 reason: {type: string, minLength: 8, maxLength: 2000}
-                expires_at: {type: string, format: date-time, description: Required only for accepted; future and at most 90 days}
+                expires_at: {type: string, format: date-time, description: Required for accepted; at most 90 days ahead}
       responses:
-        '204': {description: Status and audit event persisted atomically}
-        '400': {description: Invalid transition or expiry}
-        '403': {description: Insufficient scope}
+        '204': {description: Transitioned and audited}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /register/{id}/events:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     get:
-      operationId: findingEvents
-      security: [{bearerAuth: []}]
-      summary: Latest 100 detection and status events
-      responses:
-        '200': {description: Events newest first}
-  /remediation/capabilities:
-    get:
-      operationId: remediationCapabilities
-      security: [{bearerAuth: []}]
-      summary: Runtime capability and enablement; npm in-place and Maven override
-      responses:
-        '200': {description: Capability matrix; repository_writes is always false}
-  /assets/{id}/remediations:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    post:
-      operationId: createRemediationPlan
-      security: [{bearerAuth: []}]
-      summary: Queue advice for a prior assessed npm package-lock.json at its exact commit (write)
-      parameters: [{name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}}]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [assessment_id, manifest]
-              properties:
-                assessment_id: {type: string, format: uuid}
-                manifest: {type: string, example: package-lock.json, description: package-lock.json (npm) or pom.xml (Maven)}
-                strategy: {type: string, enum: [in-place, override], description: Defaults to in-place for npm and override for Maven}
-      responses:
-        '202': {description: Plan queued with assessment Location}
-        '200': {description: Idempotent replay}
-        '400': {description: Unsupported manifest or parent assessment}
-        '503': {description: Remediation sandbox disabled}
-  /assessments/{id}/components:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentComponents
-      security: [{bearerAuth: []}]
-      summary: Component inventory with ordinal cursor
-      responses:
-        '200': {description: Authorized assessment artifact or page}
-        '404': {description: Assessment unavailable to caller}
-        '409': {description: Artifact not yet available}
-  /assessments/{id}/findings:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentFindings
-      security: [{bearerAuth: []}]
-      summary: Immutable detection snapshots with UUID cursor
-      responses:
-        '200': {description: Authorized assessment artifact or page}
-        '404': {description: Assessment unavailable to caller}
-        '409': {description: Artifact not yet available}
-  /assessments/{id}/sbom:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentSbom
-      security: [{bearerAuth: []}]
-      summary: CycloneDX 1.6 JSON with SHA256 ETag; format=cyclonedx-json
-      responses:
-        '200': {description: Authorized assessment artifact or page}
-        '404': {description: Assessment unavailable to caller}
-        '409': {description: Artifact not yet available}
-  /assessments/{id}/report:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentReport
-      security: [{bearerAuth: []}]
-      summary: Assessment summary in JSON or format=md; coverage remains explicit
-      responses:
-        '200': {description: Authorized assessment artifact or page}
-        '404': {description: Assessment unavailable to caller}
-        '409': {description: Artifact not yet available}
-  /assessments/{id}/remediation:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentRemediation
-      security: [{bearerAuth: []}]
-      summary: Guided remediation JSON advice; never applies changes to the provider
-      responses:
-        '200': {description: Authorized assessment artifact or page}
-        '404': {description: Assessment unavailable to caller}
-        '409': {description: Artifact not yet available}
-  /tokens:
-    get:
-      operationId: listTokens
-      summary: List token metadata without secret values or hashes (admin only)
-      security: [{bearerAuth: []}]
-      parameters: [{name: cursor, in: query, schema: {type: string, format: uuid}}]
-      responses:
-        '200': {description: Up to 100 items and next_cursor}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-    post:
-      operationId: createToken
-      summary: Create a scoped token; secret is shown once (admin only)
-      security: [{bearerAuth: []}]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [name, scopes]
-              properties:
-                name: {type: string, minLength: 1, maxLength: 100}
-                scopes:
-                  type: array
-                  minItems: 1
-                  maxItems: 5
-                  uniqueItems: true
-                  items: {type: string, enum: [read, write, admin, trigger, 'ingest:relay']}
-                ip_allow_list: {type: array, maxItems: 32, items: {type: string, description: IPv4 or IPv6 CIDR}}
-                expires_at: {type: string, format: date-time}
-      responses:
-        '201': {description: One-time token value and metadata}
-        '400': {description: Invalid scopes, expiry or IP list}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-        '409': {description: Token name already exists}
-  /tokens/{id}:
-    delete:
-      operationId: revokeToken
-      summary: Revoke a managed token; bootstrap is rotated through the environment
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses:
-        '204': {description: Token revoked}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-        '409': {description: Unknown or protected bootstrap token}
-  /assets:
-    get:
-      operationId: listAssets
-      summary: Page through discovered assets with connection and in-scope flags
-      security: [{bearerAuth: []}]
-      parameters:
-        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
-        - {name: cursor, in: query, schema: {type: string}}
-      responses:
-        '200': { description: Asset page with items and next_cursor }
-        '401': { description: Missing or invalid admin token }
-  /connections:
-    get:
-      operationId: listConnections
-      summary: List provider connections without credentials (admin only; next page in X-Next-Cursor header)
-      parameters:
-        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
-        - {name: cursor, in: query, schema: {type: string}}
-      security: [{bearerAuth: []}]
+      tags: [Risk register]
+      operationId: findingHistory
+      summary: Finding history
+      description: The 100 newest lifecycle events (detected, transitions, fixed by scan or import) with actor and details. Scope `read` or `write`.
       responses:
         '200':
-          description: Connection list
-          headers:
-            X-Next-Cursor: {description: Opaque cursor for the next page; absent on final page, schema: {type: string}}
+          description: Events
           content:
             application/json:
               schema:
                 type: array
-                items: { $ref: '#/components/schemas/Connection' }
-        '401': { description: Missing or invalid admin token }
-    post:
-      operationId: createConnection
-      summary: Create a provider connection
-      security: [{bearerAuth: []}]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: '#/components/schemas/CreateConnection' }
-      responses:
-        '201':
-          description: Connection created; credential omitted from response
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Connection' }
-        '400': { description: Invalid connection }
-        '401': { description: Missing or invalid admin token }
-        '409': { description: Connection name already exists }
-  /connections/{id}:
+                items:
+                  type: object
+                  properties:
+                    id: {type: integer}
+                    action: {type: string}
+                    actor_id: {type: [string, 'null'], format: uuid}
+                    details: {type: object}
+                    created_at: {type: string, format: date-time}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Remediation
+  /remediation/capabilities:
     get:
-      operationId: getConnection
-      summary: Get one connection without its credential
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+      tags: [Remediation]
+      operationId: remediationCapabilities
+      summary: Supported fix-plan ecosystems
+      description: Whether remediation is enabled and which manifests and strategies are supported. Scope `read` or `write`.
       responses:
-        '200':
-          description: Connection
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Connection' }
-        '401': { description: Missing or invalid admin token }
-        '404': { description: Connection not found }
-    patch:
-      operationId: updateConnection
-      summary: Change scope or enabled state and withdraw asset eligibility until rediscovery
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+        '200': {description: Capabilities, content: {application/json: {schema: {type: object}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/remediations:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Remediation]
+      operationId: requestRemediation
+      summary: Request a fix plan
+      description: Queues a sandboxed plan for one manifest of a completed assessment (`package-lock.json` with `in-place`, or `pom.xml` with `override`). Fetch the result from `/assessments/{id}/remediation`. Scope `write`.
+      parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
         required: true
         content:
@@ -455,150 +963,123 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              minProperties: 1
+              required: [assessment_id, manifest, strategy]
               properties:
-                scope: {$ref: '#/components/schemas/Scope'}
-                enabled: {type: boolean}
+                assessment_id: {type: string, format: uuid}
+                manifest: {type: string, examples: [package-lock.json]}
+                strategy: {type: string, enum: [in-place, override]}
       responses:
-        '200': {description: Updated connection with no credentials}
-        '400': {description: Invalid input}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-        '404': {description: Connection not found}
-        '409': {description: Concurrent update; retry}
-    delete:
-      operationId: disableConnection
-      summary: Disable connection while retaining assets and audit history
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses:
-        '200': {description: Disabled connection}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-        '404': {description: Connection not found}
-        '409': {description: Concurrent update; retry}
-  /connections/{id}:rotate-credential:
+        '202': {description: Plan queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '503': {description: Remediation disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Ingest
+  /webhooks/github:
     post:
-      operationId: rotateConnectionCredential
-      summary: Replace encrypted credential and invalidate discovery eligibility
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [credential]
-              properties:
-                credential: {type: object, writeOnly: true}
+      tags: [Ingest]
+      operationId: githubWebhook
+      summary: GitHub webhook (direct)
+      description: Same as `/ingest/github` in direct mode. Requires `X-Hub-Signature-256` (secret `SCRS_GITHUB_WEBHOOK_SECRET`).
+      security: []
+      parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
-        '200': {description: Updated connection without credential}
-        '400': {description: Invalid credential}
-        '401': {description: Unauthorized}
-        '403': {description: Admin scope required}
-        '404': {description: Connection not found}
-        '409': {description: Concurrent update; retry}
-  /connections/{id}:test:
-    post:
-      operationId: testConnection
-      summary: Test credential and count visible resources
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses:
-        '200': { description: Credential accepted and resource count returned }
-        '401': { description: Missing or invalid admin token }
-        '404': { description: Connection not found }
-        '502': { description: Provider test failed }
-  /connections/{id}:discover:
-    post:
-      operationId: discoverConnection
-      summary: Discover accessible resources and mark matching assets in scope
-      security: [{bearerAuth: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-      responses:
-        '200': { description: Discovery result }
-        '401': { description: Missing or invalid admin token }
-        '404': { description: Connection not found }
-        '502': { description: Provider discovery failed }
-  /system/healthz:
-    get:
-      operationId: getHealth
-      summary: Process liveness
-      responses:
-        '200':
-          description: Process is running
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Health'
-  /system/readyz:
-    get:
-      operationId: getReadiness
-      summary: PostgreSQL, Redis and S3 readiness
-      responses:
-        '200':
-          description: Configured backing services are available
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Health'
-        '503':
-          description: A backing service is unavailable
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    const: unavailable
-  /docs/openapi.yaml:
-    get:
-      operationId: getOpenAPI
-      summary: Download this OpenAPI contract
-      responses:
-        '200':
-          description: OpenAPI YAML document
-          content:
-            application/yaml:
-              schema:
-                type: string
-  /docs:
-    get:
-      operationId: getSwaggerUI
-      summary: Swagger UI
-      responses:
-        '200':
-          description: Interactive API documentation
-          content:
-            text/html:
-              schema:
-                type: string
+        '202': {description: Assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: 'Replay, ping, ignored event, or integrity signals only', content: {application/json: {schema: {$ref: '#/components/schemas/IngestOutcome'}}}}
+        '401': {description: Invalid signature, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Webhook secret not configured, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /ingest/github:
     post:
+      tags: [Ingest]
       operationId: ingestGitHub
-      summary: GitHub events in direct (X-Hub-Signature-256) or relay mode (Bearer ingest:relay token, SCRS_RELAY_ENABLED=true)
-      description: Relay mode lets automation such as n8n forward GitHub's unchanged JSON body with X-GitHub-Event and X-GitHub-Delivery. Processing, idempotency and responses match /webhooks/github; the entry mode is recorded on the raw event.
-      security: [{bearerAuth: []}, {}]
+      summary: GitHub events (direct or relay)
+      description: |
+        Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified too.
+        `push` and `pull_request` (opened, synchronize, reopened) queue assessments. `push`, `delete`, `create`, `repository`, `member` and `organization` raise integrity alerts (force push, deletions, branch churn, mass deletion, visibility and membership changes, campaign patterns). Other events return `200`.
+      security: [{}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
-        '202': {description: Assessment queued}
-        '200': {description: Replay, acknowledgement, out-of-scope or integrity-only event}
-        '401': {description: Invalid signature or token}
-        '403': {description: Token lacks ingest:relay}
-        '503': {description: Relay disabled or webhook secret not configured}
+        '202': {description: Assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: 'Replay, ping, ignored event, or integrity signals only', content: {application/json: {schema: {$ref: '#/components/schemas/IngestOutcome'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {description: Invalid provider signature or token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '409': {description: Same delivery id with a different body, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {description: Ingest concurrency limit, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Webhook secret not configured or relay disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /ingest/gitlab:
+    post:
+      tags: [Ingest]
+      operationId: ingestGitLab
+      summary: GitLab events (direct or relay)
+      description: |
+        Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified too.
+        `X-Gitlab-Event-UUID` is the idempotency key. Push Hook and Merge Request Hook (open, reopen, update with new commits) queue assessments. Pushes raise ref-deletion, branch-churn, mass-deletion and pattern alerts. Tag pushes raise alerts only. Other hooks return `200`.
+      security: [{}, {bearerAuth: []}]
+      parameters:
+        - {name: X-Gitlab-Event, in: header, required: true, schema: {type: string, enum: [Push Hook, Tag Push Hook, Merge Request Hook]}}
+        - {name: X-Gitlab-Event-UUID, in: header, required: true, schema: {type: string, format: uuid}}
+        - {name: X-Gitlab-Token, in: header, schema: {type: string}, description: Shared secret (required in direct mode)}
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '202': {description: Assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: 'Replay, ignored event, or integrity signals only', content: {application/json: {schema: {$ref: '#/components/schemas/IngestOutcome'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {description: Invalid token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: GitLab secret not configured or relay disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /ingest/registry/{provider}:
+    parameters:
+      - {name: provider, in: path, required: true, schema: {type: string, enum: [harbor, dockerhub, gar, oci]}}
+    post:
+      tags: [Ingest]
+      operationId: ingestRegistry
+      summary: Registry push events
+      description: |
+        Queues an image assessment per pushed manifest, pinned to the pushed digest when the registry reports it. Accepted payloads:
+        - `harbor`: Harbor webhook `PUSH_ARTIFACT`. Set the token as the webhook Auth Header.
+        - `dockerhub`: Docker Hub webhook (tag only; resolved at scan time)
+        - `gar`: Artifact Registry Pub/Sub message (push envelope or decoded data) with `action: INSERT`
+        - `oci`: CNCF Distribution notifications (registry:2, Zot, Nexus)
+
+        Docker Hub and Pub/Sub cannot send headers, so relay them through n8n. Retries of the same body replay the same assessments. Scope `ingest:relay` with `SCRS_RELAY_ENABLED=true`.
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '202':
+          description: At least one assessment queued
+          content: {application/json: {schema: {$ref: '#/components/schemas/RegistryIngestResult'}}}
+        '200':
+          description: Nothing new queued (replay, out of scope, or not a push)
+          content: {application/json: {schema: {$ref: '#/components/schemas/RegistryIngestResult'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {description: Unknown registry provider, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Relay ingestion disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Webhook subscriptions
   /webhooks:
     get:
-      operationId: listWebhookSubscriptions
-      summary: Outbound webhook subscriptions (admin); secrets are never returned
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: listSubscriptions
+      summary: List subscriptions
+      description: Subscriptions without secrets. Scope `admin`.
       responses:
-        '200': {description: Subscriptions}
+        '200': {description: Subscriptions, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Subscription'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
     post:
-      operationId: createWebhookSubscription
-      summary: Create a subscription; returns its signing secret once (admin)
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: createSubscription
+      summary: Create a subscription
+      description: |
+        Delivers selected events to an HTTPS URL that resolves to a public address. HTTP and private addresses work only for hosts in `SCRS_WEBHOOK_PRIVATE_HOSTS` (for example an n8n container).
+        Returns the signing secret and the `X-SCRS-Auth` header value once. The `full` and `agent` profiles send the assessment context document and require `egress_ack: true`. Scope `admin`.
       requestBody:
         required: true
         content:
@@ -609,258 +1090,696 @@ paths:
               required: [name, url, events]
               properties:
                 name: {type: string, maxLength: 100}
-                url: {type: string, description: https URL to a public host; http or private addresses only for hosts in SCRS_WEBHOOK_PRIVATE_HOSTS}
-                events: {type: array, items: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, ping]}}
-                profile: {type: string, enum: [summary, full, agent], default: summary, description: full and agent replace assessment.completed data with the context document (OUT-005)}
-                egress_ack: {type: boolean, description: Required for the agent profile}
-                include_contacts: {type: boolean, default: false}
+                url: {type: string, format: uri}
+                events: {type: array, minItems: 1, items: {$ref: '#/components/schemas/EventType'}}
+                profile: {type: string, enum: [summary, full, agent], default: summary}
+                egress_ack: {type: boolean, description: Acknowledge that full/agent payloads leave SCRS}
+                include_contacts: {type: boolean, description: Include owner contact fields}
       responses:
-        '201': {description: Subscription and one-time secret}
-        '400': {description: URL, events or profile rejected}
-        '409': {description: Name exists}
+        '201':
+          description: Created; store `secret` and `auth_header` now
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/SubscriptionSecret'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /webhooks/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     get:
-      operationId: getWebhookSubscription
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: getSubscription
+      summary: Get a subscription
+      description: Subscription settings and revision (`ETag`); the secret is never returned. Scope `admin`.
       responses:
-        '200': {description: Subscription with ETag revision}
+        '200':
+          description: Subscription
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Subscription'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
     patch:
-      operationId: updateWebhookSubscription
-      summary: Change url, events, profile, egress_ack, include_contacts or enabled (If-Match required)
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: updateSubscription
+      summary: Update a subscription
+      description: Change URL, events, profile or enabled state. Requires `If-Match`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                url: {type: string, format: uri}
+                events: {type: array, items: {$ref: '#/components/schemas/EventType'}}
+                profile: {type: string, enum: [summary, full, agent]}
+                egress_ack: {type: boolean}
+                include_contacts: {type: boolean}
+                enabled: {type: boolean}
       responses:
-        '200': {description: Updated}
-        '409': {description: Stale revision}
-        '428': {description: If-Match missing}
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/Subscription'}}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
     delete:
-      operationId: disableWebhookSubscription
-      summary: Disable and keep the delivery log (If-Match required)
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: disableSubscription
+      summary: Disable a subscription
+      description: Soft delete. Disables delivery and keeps the delivery log as audit evidence. Requires `If-Match`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
       responses:
-        '200': {description: Disabled}
+        '200': {description: Disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Subscription'}}}}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /webhooks/{id}:rotate-secret:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     post:
-      operationId: rotateWebhookSecret
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: rotateSubscriptionSecret
+      summary: Rotate the signing secret
+      description: Returns the new secret and `X-SCRS-Auth` value once; the old ones stop working immediately. Scope `admin`.
       responses:
-        '200': {description: New secret, returned once}
+        '200':
+          description: Rotated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: {type: string}
+                  auth_header: {$ref: '#/components/schemas/AuthHeader'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /webhooks/{id}:test:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     post:
-      operationId: pingWebhookSubscription
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: testSubscription
+      summary: Send a ping event
+      description: Queues a signed `ping` to this subscription; check the delivery log for the result. Scope `admin`.
       responses:
-        '202': {description: Ping event queued}
+        '202': {description: Ping queued, content: {application/json: {schema: {type: object, properties: {event_id: {type: string, format: uuid}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /webhooks/{id}/deliveries:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     get:
-      operationId: listWebhookDeliveries
-      summary: Delivery log; deliveries are dead-lettered after 8 attempts
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: listDeliveries
+      summary: Delivery log
+      description: Newest first, with attempts, last HTTP status and error. Scope `admin`.
       parameters:
+        - {$ref: '#/components/parameters/Cursor'}
         - {name: status, in: query, schema: {type: string, enum: [pending, sending, delivered, dead]}}
-        - {name: cursor, in: query, schema: {type: string, format: uuid}}
       responses:
-        '200': {description: Up to 100 deliveries with next_cursor}
+        '200':
+          description: Page of deliveries
+          content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Delivery'}}, next_cursor: {type: string}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /webhooks/{id}/deliveries/{delivery}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - {name: delivery, in: path, required: true, schema: {type: string, format: uuid}}
+    get:
+      tags: [Webhook subscriptions]
+      operationId: getDelivery
+      summary: Get one delivery
+      description: Includes the payload. Scope `admin`.
+      responses:
+        '200': {description: Delivery, content: {application/json: {schema: {$ref: '#/components/schemas/Delivery'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /webhooks/{id}/deliveries/{delivery}:redeliver:
     parameters:
-      - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      - {$ref: '#/components/parameters/Id'}
       - {name: delivery, in: path, required: true, schema: {type: string, format: uuid}}
     post:
-      operationId: redeliverWebhook
-      summary: Requeue a delivered or dead delivery with the same event id
-      security: [{bearerAuth: []}]
+      tags: [Webhook subscriptions]
+      operationId: redeliver
+      summary: Redeliver an event
+      description: Requeues a delivered or dead delivery with the same event id, so receivers deduplicate it. Scope `admin`.
       responses:
         '202': {description: Requeued}
-        '409': {description: Delivery still pending}
-  /assessments:batch:
-    post:
-      operationId: batchAssessments
-      summary: Queue up to 100 targets with per-item idempotency keys (write or trigger, TRG-011)
-      security: [{bearerAuth: []}]
-      responses:
-        '207': {description: Per-item status, assessment_id or error}
-        '400': {description: Empty or oversized batch}
-  /assessments/latest:
+        '404': {$ref: '#/components/responses/NotFound'}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Threat intelligence
+  /feeds/indicators:
     get:
-      operationId: latestAssessment
-      summary: Newest assessment of an exact commit (UC13); never treat incomplete as pass
-      security: [{bearerAuth: []}]
-      parameters:
-        - {name: commit, in: query, required: true, schema: {type: string, pattern: '^[a-fA-F0-9]{40}$'}}
-        - {name: repository, in: query, schema: {type: string}}
-        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+      tags: [Threat intelligence]
+      operationId: activeIndicators
+      summary: Active indicator bundle
+      description: The active versioned IOC bundle used by scans and event pattern matching. Scope `admin`.
       responses:
-        '200': {description: Assessment}
-        '404': {description: No assessment of that commit}
-  /assessments/{id}/context:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentContext
-      summary: Full or agent context document (OUT-005 to OUT-007) with untrusted_paths and a size cap
-      security: [{bearerAuth: []}]
-      parameters:
-        - {name: profile, in: query, schema: {type: string, enum: [full, agent], default: full}}
+        '200': {description: Bundle, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}}
+        '404': {description: No active bundle (IOC stage reports skipped and verdicts stay incomplete), content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Threat intelligence]
+      operationId: importIndicators
+      summary: Import and activate an indicator bundle
+      description: Atomically activates a new immutable version; previous versions are retained. Max 4 MiB, 10000 indicators. Scope `admin`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}
       responses:
-        '200': {description: Context document}
-  /assessments/{id}/vex:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentVEX
-      summary: OpenVEX 0.2.0 statements from register triage
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: OpenVEX document}
-  /assessments/{id}/snapshot:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: assessmentSnapshot
-      summary: Download the stored source archive (admin; SCRS_SNAPSHOT_ARCHIVES=true)
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Integrity-verified gzip tarball}
-        '409': {description: No snapshot stored}
-  /assets/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: getAsset
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Asset with owner, environment, criticality, exposure, labels and ETag}
-    patch:
-      operationId: updateAsset
-      summary: Set owner_id (or null), environment, criticality 0-5, exposure, labels (write, If-Match)
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Updated}
-        '400': {description: Invalid attribute or unknown owner}
-        '409': {description: Stale revision}
-  /assets/{id}/last-known-good:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    get:
-      operationId: lastKnownGood
-      summary: Newest passing revision of a ref with no open integrity entry (INT-017)
-      security: [{bearerAuth: []}]
-      parameters:
-        - {name: ref, in: query, required: true, schema: {type: string}}
-      responses:
-        '200': {description: Commit and assessment}
-        '404': {description: No qualifying revision}
-  /owners:
-    get:
-      operationId: listOwners
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Owners}
-    post:
-      operationId: createOwner
-      summary: Create an owner (write); contacts are excluded from event payloads unless opted in
-      security: [{bearerAuth: []}]
-      responses:
-        '201': {description: Owner}
-        '409': {description: Name exists}
-  /owners/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-    patch:
-      operationId: updateOwner
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Updated (If-Match required)}
-  /system/metrics:
-    get:
-      operationId: metrics
-      summary: Prometheus metrics (read scope); queue, verdict and delivery values come from PostgreSQL
-      security: [{bearerAuth: []}]
-      responses:
-        '200': {description: Prometheus text format}
+        '201': {description: Activated, content: {application/json: {schema: {type: object, properties: {version: {type: string}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: Version already exists, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Operations
   /maintenance/run:
     post:
+      tags: [Operations]
       operationId: runMaintenance
-      summary: Apply retention and expire idempotency keys now (admin); also runs hourly in the worker
-      security: [{bearerAuth: []}]
+      summary: Run maintenance now
+      description: Applies retention, expires idempotency keys and purges old deliveries. Concurrent runs are skipped. Scope `admin`.
       responses:
-        '200': {description: Maintenance report}
+        '200': {description: Report, content: {application/json: {schema: {$ref: '#/components/schemas/MaintenanceReport'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /maintenance/rescan:
     post:
+      tags: [Operations]
       operationId: rescanDefaultBranches
-      summary: Queue default-branch assessments of all in-scope repositories (admin)
-      security: [{bearerAuth: []}]
+      summary: Rescan default branches
+      description: Queues a rescan of every in-scope repository's default branch that has no recent assessment. Scope `admin`.
       responses:
-        '202': {description: Count queued}
+        '202': {description: Queued, content: {application/json: {schema: {type: object, properties: {rescans_queued: {type: integer}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /maintenance/redeliver-dead:
     post:
-      operationId: redeliverDeadWebhooks
-      security: [{bearerAuth: []}]
+      tags: [Operations]
+      operationId: redeliverDead
+      summary: Requeue all dead deliveries
+      description: Use after a receiver outage. Scope `admin`.
       responses:
-        '202': {description: Count requeued}
+        '202': {description: Requeued, content: {application/json: {schema: {type: object, properties: {deliveries_requeued: {type: integer}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /events/inbound:
     get:
+      tags: [Operations]
       operationId: listInboundEvents
-      summary: Stored raw deliveries and triggers (admin); filter by claimed actor or event type
-      security: [{bearerAuth: []}]
+      summary: Inbound event log
+      description: Raw provider events and triggers SCRS received, newest first. GitLab and registry events are prefixed (`gitlab:push`, `registry:harbor`). Scope `admin`.
       parameters:
+        - {$ref: '#/components/parameters/Cursor'}
         - {name: actor, in: query, schema: {type: string}}
         - {name: event_type, in: query, schema: {type: string}}
-        - {name: cursor, in: query, schema: {type: string, format: uuid}}
       responses:
-        '200': {description: Up to 100 events with next_cursor}
+        '200':
+          description: Page of events
+          content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/InboundEvent'}}, next_cursor: {type: string}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /events/inbound/{id}:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     get:
+      tags: [Operations]
       operationId: getInboundEvent
-      security: [{bearerAuth: []}]
+      summary: Get an inbound event
+      description: Includes the raw body. Scope `admin`.
       responses:
-        '200': {description: Event including raw body}
+        '200': {description: Event, content: {application/json: {schema: {$ref: '#/components/schemas/InboundEvent'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /events/inbound/{id}:replay:
-    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    parameters: [{$ref: '#/components/parameters/Id'}]
     post:
+      tags: [Operations]
       operationId: replayInboundEvent
-      summary: Re-assess the revision an event produced, as a new assessment (admin)
-      security: [{bearerAuth: []}]
+      summary: Replay an event's assessment
+      description: Queues a new assessment with the original request pinned to the originally resolved revision. Scope `admin`.
       responses:
-        '202': {description: New assessment queued}
-        '409': {description: Event produced no assessment}
+        '202': {description: Queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '409': {description: Event did not create an assessment, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /settings/retention:
+    get:
+      tags: [Operations]
+      operationId: getRetention
+      summary: Get the retention policy
+      description: Days to keep inbound event bodies and webhook deliveries. Scope `admin`.
+      responses:
+        '200':
+          description: Policy
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Retention'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Operations]
+      operationId: setRetention
+      summary: Set the retention policy
+      description: Requires `If-Match`. Preview first with `:preview`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [inbound_event_days]
+              properties:
+                inbound_event_days: {type: integer, minimum: 1}
+                webhook_delivery_days: {type: integer, minimum: 1}
+      responses:
+        '200':
+          description: Updated
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Retention'}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /settings/retention:preview:
+    post:
+      tags: [Operations]
+      operationId: previewRetention
+      summary: Preview what a retention change deletes
+      description: Counts rows a policy would delete, without deleting. Scope `admin`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 1}}}}}
+      responses:
+        '200': {description: Counts, content: {application/json: {schema: {type: object}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /settings/retention:purge:
+    post:
+      tags: [Operations]
+      operationId: purgeRetention
+      summary: Purge expired inbound events now
+      description: Deletes inbound event bodies older than the current policy. Requires `If-Match` with the policy revision you previewed. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      responses:
+        '200': {description: Deleted, content: {application/json: {schema: {type: object, properties: {deleted_events: {type: integer}}}}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
+      description: SCRS API token. Create with POST /tokens.
+  headers:
+    ETag:
+      description: Resource revision; send back in `If-Match`.
+      schema: {type: string, examples: ['"3"']}
+  parameters:
+    Id: {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+    Cursor: {name: cursor, in: query, schema: {type: string}, description: '`next_cursor` from the previous page'}
+    Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+    IfMatch: {name: If-Match, in: header, required: true, schema: {type: string}, description: 'ETag revision, for example "3"'}
+    IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}, description: Replays within 24 h return the original result}
+    GitHubEvent: {name: X-GitHub-Event, in: header, required: true, schema: {type: string}}
+    GitHubDelivery: {name: X-GitHub-Delivery, in: header, required: true, schema: {type: string, format: uuid}}
+    GitHubSignature: {name: X-Hub-Signature-256, in: header, schema: {type: string}, description: 'sha256=<hex HMAC of the body> (required in direct mode)'}
+  responses:
+    BadRequest: {description: Invalid request, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Unauthorized: {description: Missing or invalid bearer token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Forbidden: {description: Token lacks the required scope, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    NotFound: {description: Not found or not visible to this token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    Conflict: {description: Conflicts with current state or revision, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    PreconditionRequired: {description: If-Match header required, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    RateLimited:
+      description: Rate or capacity limit; retry after the given seconds
+      headers: {Retry-After: {schema: {type: integer}}}
+      content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
   schemas:
-    Scope:
+    Error:
+      type: object
+      required: [error]
+      properties: {error: {type: string}}
+    Status:
+      type: object
+      properties: {status: {type: string, enum: [ok, unavailable]}}
+    Scope: {type: string, enum: [read, write, trigger, ingest:relay, admin]}
+    Token:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        prefix: {type: string, description: 'First characters of the secret, for identification'}
+        scopes: {type: array, items: {$ref: '#/components/schemas/Scope'}}
+        ip_allow_list: {type: array, items: {type: string}}
+        expires_at: {type: [string, 'null'], format: date-time}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: [string, 'null'], format: date-time}
+        revoked_at: {type: [string, 'null'], format: date-time}
+    TokenPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Token'}}
+        next_cursor: {type: string}
+    Provider: {type: string, enum: [github, gitlab, dockerhub, gar, harbor, oci]}
+    ConnectionScope:
       type: object
       required: [include]
       properties:
-        include: {type: array, items: {type: string}}
+        include: {type: array, maxItems: 100, items: {type: string}, description: 'Locator globs; `/**` matches any depth', example: ['acme/*', 'docker.io/acme/*']}
         exclude: {type: array, items: {type: string}}
-    Connection:
+    ConnectionInput:
       type: object
-      required: [id, provider, name, config, scope, status, enabled]
-      properties:
-        enabled: {type: boolean}
-        id: {type: string, format: uuid}
-        provider: {type: string, enum: [github, dockerhub, gar]}
-        name: {type: string}
-        config: {type: object, additionalProperties: true}
-        scope: { $ref: '#/components/schemas/Scope' }
-        status: {type: object, additionalProperties: true}
-    CreateConnection:
-      type: object
+      additionalProperties: false
       required: [provider, name, config, scope, credential]
       properties:
-        provider: {type: string, enum: [github, dockerhub, gar]}
-        name: {type: string}
-        config: {type: object, additionalProperties: true}
-        scope: { $ref: '#/components/schemas/Scope' }
-        credential:
-          type: object
-          additionalProperties: true
-          writeOnly: true
-    Health:
+        provider: {$ref: '#/components/schemas/Provider'}
+        name: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$', maxLength: 100}
+        config: {type: object}
+        scope: {$ref: '#/components/schemas/ConnectionScope'}
+        credential: {type: object, description: Encrypted at rest and never returned}
+    Connection:
       type: object
-      required: [status]
       properties:
-        status:
-          type: string
-          const: ok
+        id: {type: string, format: uuid}
+        provider: {$ref: '#/components/schemas/Provider'}
+        name: {type: string}
+        config: {type: object}
+        scope: {$ref: '#/components/schemas/ConnectionScope'}
+        status: {type: object, description: 'Last check: state (pending, ok, degraded, disabled), checked_at, counts'}
+        enabled: {type: boolean}
+    AssetType: {type: string, enum: [github_repo, gitlab_repo, container_image]}
+    Asset:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        type: {$ref: '#/components/schemas/AssetType'}
+        locator: {type: string, description: 'owner/repo, group/subgroup/project, or registry/repository', example: acme/api}
+        connection_id: {type: string, format: uuid}
+        flags: {type: object, description: 'discovered, accessible, in_scope'}
+        owner_id: {type: [string, 'null'], format: uuid}
+        environment: {type: string, enum: ['', dev, stg, prod]}
+        criticality: {type: integer, minimum: 0, maximum: 5}
+        exposure: {type: string, enum: ['', internet, internal, offline]}
+        labels: {type: object, additionalProperties: {type: string}}
+        revision: {type: integer}
+    AssetPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Asset'}}
+        next_cursor: {type: string}
+    AssetChange:
+      type: object
+      additionalProperties: false
+      properties:
+        owner_id: {type: [string, 'null'], format: uuid}
+        environment: {type: string, enum: ['', dev, stg, prod]}
+        criticality: {type: integer, minimum: 0, maximum: 5}
+        exposure: {type: string, enum: ['', internet, internal, offline]}
+        labels: {type: object, maxProperties: 50, additionalProperties: {type: string, maxLength: 256}}
+    OwnerInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, maxLength: 100}
+        email: {type: string, format: email}
+        team: {type: string}
+        chat: {type: string}
+        secondary_contact: {type: string}
+    Owner:
+      allOf:
+        - $ref: '#/components/schemas/OwnerInput'
+        - type: object
+          properties:
+            id: {type: string, format: uuid}
+            revision: {type: integer}
+    Mirror:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        status: {type: string, enum: [queued, running, succeeded, failed, pruned]}
+        sha256: {type: string}
+        size_bytes: {type: integer}
+        refs: {type: integer, description: Branches and tags in the bundle}
+        head: {type: string, description: Commit of HEAD at mirror time}
+        error: {type: string}
+        requested_by: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+    Target:
+      type: object
+      required: [type, repository]
+      properties:
+        type: {type: string, enum: [git, image]}
+        repository: {type: string, description: 'Asset locator: owner/repo, group/sub/project, or registry/repository'}
+        provider: {type: string, enum: [github, gitlab], description: Git targets only; disambiguates equal paths}
+        ref: {type: string, description: 'Branch (git) or tag (image). Default HEAD / latest'}
+        commit: {type: string, description: '40-hex commit (git) or sha256: manifest digest (image)'}
+        platform: {type: string, default: linux/amd64, description: Image targets only}
+        pull_request:
+          type: object
+          required: [number, base_ref]
+          properties:
+            number: {type: integer}
+            base_ref: {type: string}
+            head_ref: {type: string}
+            title: {type: string}
+    AssessmentRequest:
+      type: object
+      additionalProperties: false
+      required: [target]
+      properties:
+        target: {$ref: '#/components/schemas/Target'}
+        connection: {type: string, description: Connection name or id when several match}
+        notify: {type: array, maxItems: 10, items: {type: string}, description: Deliver completion events only to these subscription names}
+        trigger: {$ref: '#/components/schemas/Trigger'}
+    Trigger:
+      type: object
+      additionalProperties: false
+      description: Who triggered the assessment and why. Echoed in outbound events; never affects the scan.
+      properties:
+        origin: {type: string, maxLength: 100, example: n8n}
+        event: {type: string, maxLength: 100, example: release.requested}
+        delivery_id: {type: string, maxLength: 128, description: Caller's event or execution id}
+        actor: {type: string, maxLength: 100, description: Claimed human or bot behind the request}
+        context:
+          type: object
+          maxProperties: 20
+          description: 'Correlation data (ticket, change request, n8n execution). Keys match ^[a-z0-9][a-z0-9._-]{0,62}$; values are at most 256 printable characters.'
+          additionalProperties: {type: string, maxLength: 256}
+          example: {ticket: CHG-1042, n8n.execution: '4711'}
+    AssessmentStatus: {type: string, enum: [queued, running, succeeded, failed, cancelled]}
+    Verdict: {type: string, enum: [pass, warn, fail, incomplete]}
+    Stage:
+      type: object
+      properties:
+        name: {type: string, examples: [inventory, malware, yara, ioc, integrity, import]}
+        status: {type: string, enum: [ok, partial, skipped, failed]}
+        detail: {type: string}
+    Assessment:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        connection_id: {type: string, format: uuid}
+        request:
+          allOf:
+            - $ref: '#/components/schemas/AssessmentRequest'
+            - type: object
+              properties:
+                import: {type: object, description: 'Present on imported assessments, properties: {format: {type: string}, tool: {type: string}, tool_version: {type: string}}'}
+        requested_by: {type: string}
+        status: {$ref: '#/components/schemas/AssessmentStatus'}
+        verdict: {$ref: '#/components/schemas/Verdict'}
+        resolved_commit: {type: string}
+        ref_moved: {type: boolean, description: The ref moved past this commit during the scan}
+        stages: {type: array, items: {$ref: '#/components/schemas/Stage'}}
+        counts: {type: object, additionalProperties: {type: integer}, description: 'total, new, waived and per-severity counts'}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        error: {type: string}
+        attempts: {type: integer}
+        sbom_sha256: {type: string}
+        diff: {type: object, description: Components added and removed since the baseline}
+        request_id: {type: string}
+    AssessmentPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Assessment'}}
+        next_cursor: {type: string}
+    Component:
+      type: object
+      properties:
+        name: {type: string}
+        version: {type: string}
+        ecosystem: {type: string}
+        purl: {type: string}
+        path: {type: string}
+    Finding:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        fingerprint: {type: string}
+        ref: {type: string}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code]}
+        advisory_id: {type: string}
+        title: {type: string}
+        severity: {type: string, enum: [critical, high, medium, low, unknown]}
+        score: {type: integer, minimum: 0, maximum: 100}
+        status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}
+        component: {$ref: '#/components/schemas/Component'}
+        evidence: {type: object}
+        guidance: {type: object, description: 'summary, fixed_versions, reference, kev, epss'}
+        first_seen: {type: string, format: date-time}
+        last_seen: {type: string, format: date-time}
+        waiver_until: {type: string, format: date-time}
+        change: {type: string, enum: [new, existing]}
+    FindingPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Finding'}}
+        next_cursor: {type: string}
+    FileEvidence:
+      type: object
+      properties:
+        path: {type: string}
+        sha256: {type: string}
+        size: {type: integer}
+        malware: {type: string, enum: [clean, infected, error, skipped, skipped_oversize]}
+    IngestOutcome:
+      type: object
+      properties:
+        status: {type: string, examples: [ignored_event, recorded, ignored_out_of_scope]}
+        integrity_signals: {type: integer}
+    RegistryIngestResult:
+      type: object
+      properties:
+        status: {type: string}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              locator: {type: string}
+              tag: {type: string}
+              digest: {type: string}
+              status: {type: string, enum: [queued, replayed, ignored_out_of_scope, invalid_reference, ambiguous_connection]}
+              assessment_id: {type: string, format: uuid}
+    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, ping]}
+    AuthHeader:
+      type: object
+      description: Configure as Header Auth in n8n (name and value).
+      properties:
+        name: {type: string, const: X-SCRS-Auth}
+        value: {type: string}
+    Subscription:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        url: {type: string}
+        events: {type: array, items: {$ref: '#/components/schemas/EventType'}}
+        profile: {type: string, enum: [summary, full, agent]}
+        egress_ack: {type: boolean}
+        include_contacts: {type: boolean}
+        enabled: {type: boolean}
+        revision: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    SubscriptionSecret:
+      type: object
+      properties:
+        secret: {type: string, description: HMAC signing secret (shown once)}
+        auth_header: {$ref: '#/components/schemas/AuthHeader'}
+        subscription: {$ref: '#/components/schemas/Subscription'}
+    Delivery:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        subscription_id: {type: string, format: uuid}
+        event_id: {type: string, format: uuid}
+        event_type: {$ref: '#/components/schemas/EventType'}
+        status: {type: string, enum: [pending, sending, delivered, dead]}
+        attempts: {type: integer}
+        next_attempt_at: {type: string, format: date-time}
+        last_status: {type: integer}
+        last_error: {type: string}
+        created_at: {type: string, format: date-time}
+        delivered_at: {type: [string, 'null'], format: date-time}
+        payload: {type: object}
+    IndicatorBundle:
+      type: object
+      additionalProperties: false
+      required: [version, indicators]
+      properties:
+        version: {type: string, minLength: 1, maxLength: 128}
+        indicators:
+          type: array
+          maxItems: 10000
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, type, value, valid_until]
+            properties:
+              id: {type: string, maxLength: 128}
+              type: {type: string, enum: [sha256, domain, ipv4, purl, workflow_step_name, file_path_regex, file_content_regex, git_branch_regex, commit_message_regex, pr_title_regex]}
+              value: {type: string}
+              valid_until: {type: string, format: date-time}
+    InboundEvent:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        assessment_id: {type: [string, 'null'], format: uuid}
+        mode: {type: string, enum: [direct, relay, trigger]}
+        event_type: {type: string}
+        created_at: {type: string, format: date-time}
+        body: {type: object}
+    Retention:
+      type: object
+      properties:
+        revision: {type: integer}
+        inbound_event_days: {type: integer}
+        webhook_delivery_days: {type: integer}
+    MaintenanceReport:
+      type: object
+      properties:
+        inbound_events_purged: {type: integer}
+        webhook_deliveries_purged: {type: integer}
+        idempotency_keys_expired: {type: integer}
+        rescans_queued: {type: integer}
+        skipped_concurrent_run: {type: boolean}

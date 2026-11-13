@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -19,17 +20,107 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
 
-// RunImage inventories a docker-save archive offline (M6): OS and language
-// packages, CycloneDX SBOM and OSV/MAL matching. Layer malware, YARA, IOC and
-// integrity analysis are not yet applied to images; those stages report
-// skipped so the verdict can never be pass on partial coverage.
+// RunImage assesses a docker-save archive offline (M6): OS and language
+// packages, CycloneDX SBOM and OSV/MAL matching, plus ClamAV, YARA and IOC
+// inspection of every layer file. Both halves run concurrently so the scan
+// fits the worker's deadline.
 func (e Engine) RunImage(ctx context.Context, archivePath string) (Output, error) {
-	out := Output{Files: []FileEvidence{}}
-	for _, name := range []string{"malware", "yara", "ioc", "integrity"} {
-		out.Stages = append(out.Stages, assessments.Stage{Name: name, Status: "skipped", Detail: "Not yet applied to container image layers"})
+	type content struct {
+		files    []FileEvidence
+		findings []assessments.Finding
+		stages   []assessments.Stage
 	}
+	layers := make(chan content, 1)
+	go func() {
+		layerCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+		defer cancel()
+		files, findings, stages := e.scanLayers(layerCtx, archivePath)
+		layers <- content{files, findings, stages}
+	}()
+	out, err := e.inventoryImage(ctx, archivePath)
+	c := <-layers
+	out.Files = c.files
+	out.Findings = append(c.findings, out.Findings...)
+	out.Stages = append(c.stages, out.Stages...)
+	if len(out.Findings) > 10000 {
+		out.Findings = out.Findings[:10000]
+		out.Stages = append(out.Stages, assessments.Stage{Name: "inventory", Status: "failed", Detail: "Finding limit exceeded"})
+	}
+	return out, err
+}
+
+// scanLayers streams every layer through the content scanner. Files deleted by
+// later layers are still inspected: they remain in the blobs every pull fetches.
+// Only files with a malware verdict other than clean, or with findings, are
+// recorded as evidence; whole-image inventories exceed the evidence budget.
+func (e Engine) scanLayers(ctx context.Context, archivePath string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
+	scan := e.newContentScan(ctx, true)
+	files := []FileEvidence{}
+	image, err := tarball.ImageFromPath(archivePath, nil)
+	if err != nil {
+		scan.incomplete("Image archive unreadable")
+		return files, scan.findings, scan.stages()
+	}
+	layers, err := image.Layers()
+	if err != nil {
+		scan.incomplete("Image layers unreadable")
+		return files, scan.findings, scan.stages()
+	}
+	total := 0
+	walk := func(layer v1.Layer) error {
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		reader := tar.NewReader(rc)
+		for {
+			h, err := reader.Next()
+			if err == io.EOF {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := strings.TrimPrefix(path.Clean("/"+h.Name), "/")
+			if h.Typeflag != tar.TypeReg || name == "" || strings.HasPrefix(path.Base(name), ".wh.") {
+				continue
+			}
+			if total++; total > 200000 {
+				return errors.New("image file limit exceeded")
+			}
+			before := len(scan.findings)
+			record, err := scan.file(ctx, name, h.Size, reader)
+			if err != nil {
+				return err
+			}
+			if (record.Malware != "clean" && record.Malware != "skipped") || len(scan.findings) != before {
+				if len(files) < 10000 {
+					files = append(files, record)
+				}
+			}
+		}
+	}
+	for _, layer := range layers {
+		if err := walk(layer); err != nil {
+			scan.incomplete("Layer inspection did not complete: " + err.Error())
+			return files, scan.findings, scan.stages()
+		}
+	}
+	scan.malware.Detail += fmt.Sprintf("; %d files across %d layers", total, len(layers))
+	return files, scan.findings, scan.stages()
+}
+
+// inventoryImage runs the OSV-Scanner half of RunImage.
+func (e Engine) inventoryImage(ctx context.Context, archivePath string) (Output, error) {
+	out := Output{Files: []FileEvidence{}}
 	database, err := pinnedFeed(e.Database)
 	if err != nil {
 		out.Stages = append(out.Stages, assessments.Stage{Name: "inventory", Status: "failed", Detail: "Offline feeds unavailable"})

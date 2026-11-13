@@ -2,8 +2,13 @@ package assessments
 
 // Schema is applied under the storage migration lock. No destructive DDL.
 func Schema(s string) []string {
+	return append(baseSchema(s), mirrorSchema(s)...)
+}
+
+func baseSchema(s string) []string {
 	return []string{
 		`CREATE INDEX IF NOT EXISTS assets_github_locator_idx ON ` + s + `.assets(lower(locator)) WHERE type='github_repo'`,
+		`CREATE INDEX IF NOT EXISTS assets_gitlab_locator_idx ON ` + s + `.assets(lower(locator)) WHERE type='gitlab_repo'`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.assessments (
  id uuid PRIMARY KEY, asset_id uuid NOT NULL REFERENCES ` + s + `.assets(id), connection_id uuid NOT NULL REFERENCES ` + s + `.connections(id), connection_revision bigint NOT NULL,
  request jsonb NOT NULL, requested_by text NOT NULL, actor_id uuid NOT NULL,

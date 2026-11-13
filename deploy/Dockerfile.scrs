@@ -22,7 +22,9 @@ FROM alpine:3.24 AS certificates
 RUN apk add --no-cache ca-certificates
 
 FROM scratch
-LABEL io.scrs.project="scrstack"
+LABEL io.scrs.project="scrstack" \
+      org.opencontainers.image.title="SCRS: Software Supply Chain Risk Stack" \
+      org.opencontainers.image.description="Software supply-chain assessments with SBOM and MBOM, malware scanning and a risk register"
 COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/scrs /usr/local/bin/scrs
 COPY --from=scanner-build /out/osv-scanner /usr/local/bin/osv-scanner

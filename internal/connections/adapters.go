@@ -29,6 +29,7 @@ type NativeAdapters struct {
 	GitHubAPI string // overridden only by tests
 	DockerAPI string // overridden only by tests
 	GoogleAPI string // overridden only by tests
+	GitHubGit string // git smart-HTTP origin; overridden only by tests
 	// RegistryHost pins image pulls to one plain-HTTP registry; tests only.
 	RegistryHost string
 }
@@ -48,12 +49,27 @@ func (a NativeAdapters) List(ctx context.Context, c Connection, secret json.RawM
 		return a.dockerHub(ctx, c, secret)
 	case "gar":
 		return a.gar(ctx, c, secret)
+	case "gitlab":
+		return a.gitLab(ctx, c, secret)
+	case "harbor":
+		return a.harbor(ctx, c, secret)
+	case "oci":
+		return a.oci(ctx, c, secret)
 	default:
 		return nil, errors.New("no native adapter for provider")
 	}
 }
 
 func (a NativeAdapters) request(ctx context.Context, method, target, token string, body []byte) ([]byte, error) {
+	return a.do(ctx, method, target, func(r *http.Request) {
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+	}, body)
+}
+
+// do sends one bounded provider API request with the given authentication.
+func (a NativeAdapters) do(ctx context.Context, method, target string, auth func(*http.Request), body []byte) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, errors.New("provider request invalid")
@@ -62,9 +78,7 @@ func (a NativeAdapters) request(ctx context.Context, method, target, token strin
 	if strings.HasPrefix(target, strings.TrimSuffix(a.GitHubAPI, "/")+"/") {
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+	auth(req)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
