@@ -12,14 +12,29 @@ import (
 
 func allowedProxyHost(host string) bool {
 	switch strings.ToLower(host) {
-	case "api.deps.dev", "deps.dev", "registry.npmjs.org":
+	case "api.deps.dev", "deps.dev", "registry.npmjs.org", "repo.maven.apache.org", "repo1.maven.org":
 		return true
 	}
 	return false
 }
+
+var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("64:ff9b::/96"),
+}
+
 func publicAddress(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	return ip.IsGlobalUnicast() && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
+		return false
+	}
+	for _, p := range nonPublic {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 func EgressProxy() http.Handler {
 	slots := make(chan struct{}, 8)

@@ -61,9 +61,45 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	principal := r.Context().Value(principalKey{}).(connections.Token)
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	w.Header().Set("X-Request-Id", uuid.NewString())
+	if r.URL.Path == BasePath+"/assessments:batch" {
+		h.batch(ctx, w, r, principal)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/last-known-good") {
+		asset, err := uuid.Parse(r.PathValue("id"))
+		if err != nil {
+			writeError(w, 404, "asset unavailable")
+			return
+		}
+		a, err := h.store.LastKnownGood(ctx, asset, r.URL.Query().Get("ref"))
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"asset_id": asset, "ref": r.URL.Query().Get("ref"), "commit": a.Commit, "assessment": a})
+		return
+	}
+	if r.URL.Path == BasePath+"/assessments/latest" {
+		q := r.URL.Query()
+		asset, err := pageUUID(r, "asset_id")
+		if err != nil {
+			writeError(w, 400, "invalid asset")
+			return
+		}
+		actor := uuid.Nil
+		if !principal.Allows("read") && !principal.Allows("write") {
+			actor = principal.ID
+		}
+		a, err := h.store.Latest(ctx, asset, q.Get("repository"), q.Get("commit"), actor)
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		writeJSON(w, 200, a)
+		return
+	}
 	if r.URL.Path == BasePath+"/remediation/capabilities" {
-		writeJSON(w, 200, map[string]any{"enabled": h.remediationEnabled, "capabilities": []map[string]any{{"ecosystem": "npm", "manifest": "package-lock.json", "strategies": []string{"in-place"}, "supported": h.remediationEnabled}, {"ecosystem": "Maven", "supported": false}}, "repository_writes": false})
+		writeJSON(w, 200, map[string]any{"enabled": h.remediationEnabled, "capabilities": []map[string]any{{"ecosystem": "npm", "manifest": "package-lock.json", "strategies": []string{"in-place"}, "supported": h.remediationEnabled}, {"ecosystem": "Maven", "manifest": "pom.xml", "strategies": []string{"override"}, "supported": h.remediationEnabled}}, "repository_writes": false})
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, BasePath+"/assets/") {
@@ -124,21 +160,31 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, status, a)
 			return
 		}
-		after, err := pageUUID(r, "cursor")
-		if err != nil {
+		q := r.URL.Query()
+		filter := assessments.ListFilter{Status: q.Get("status"), Verdict: q.Get("verdict"), Ref: q.Get("ref"), Commit: q.Get("commit"), Actor: q.Get("actor")}
+		var err error
+		if filter.After, err = pageUUID(r, "cursor"); err != nil {
 			writeError(w, 400, "invalid cursor")
 			return
 		}
-		asset, err := pageUUID(r, "asset_id")
-		if err != nil {
+		if filter.Asset, err = pageUUID(r, "asset_id"); err != nil {
 			writeError(w, 400, "invalid asset")
 			return
 		}
-		actor := uuid.Nil
-		if !principal.Allows("read") && !principal.Allows("write") {
-			actor = principal.ID
+		for key, target := range map[string]**time.Time{"created_after": &filter.Since, "created_before": &filter.Until} {
+			if raw := q.Get(key); raw != "" {
+				parsed, err := time.Parse(time.RFC3339, raw)
+				if err != nil {
+					writeError(w, 400, key+" must be RFC 3339")
+					return
+				}
+				*target = &parsed
+			}
 		}
-		items, err := h.store.List(ctx, after, asset, r.URL.Query().Get("status"), actor)
+		if !principal.Allows("read") && !principal.Allows("write") {
+			filter.ActorID = principal.ID
+		}
+		items, err := h.store.List(ctx, filter)
 		if err != nil {
 			assessmentError(w, err)
 			return
@@ -187,6 +233,30 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 405, "method not allowed")
 		return
 	}
+	// TRG-009 long-poll: wait up to 60 s for a queued or running assessment.
+	if raw := r.URL.Query().Get("wait"); raw != "" && len(parts) == 1 {
+		seconds, err := strconv.Atoi(raw)
+		if err != nil || seconds < 0 || seconds > 60 {
+			writeError(w, 400, "wait must be 0 to 60 seconds")
+			return
+		}
+		deadline := time.Now().Add(time.Duration(seconds) * time.Second)
+		for (a.Status == "queued" || a.Status == "running") && time.Now().Before(deadline) {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(time.Second):
+			}
+			pollCtx, pollCancel := context.WithTimeout(r.Context(), 5*time.Second)
+			next, err := h.store.Get(pollCtx, id)
+			pollCancel()
+			if err != nil {
+				assessmentError(w, err)
+				return
+			}
+			a = next
+		}
+	}
 	if a.Status == "queued" || a.Status == "running" {
 		w.Header().Set("Retry-After", "5")
 	}
@@ -195,6 +265,18 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch parts[1] {
+	case "context":
+		profile := r.URL.Query().Get("profile")
+		if profile == "" {
+			profile = "full"
+		}
+		doc, err := h.store.ContextDocument(ctx, id, profile, principal.Allows("admin") && r.URL.Query().Get("include_contacts") == "true")
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(doc)
 	case "remediations":
 		plans, err := h.store.AutomaticPlans(ctx, id)
 		if err != nil {
@@ -265,6 +347,35 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(data)
+	case "vex":
+		doc, err := h.store.VEX(ctx, id)
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(doc)
+	case "snapshot":
+		// Source archives can contain secrets committed to the repository: admin only.
+		if !principal.Allows("admin") {
+			writeError(w, 403, "admin scope required")
+			return
+		}
+		store, ok := h.artifacts.(interface {
+			GetSnapshot(context.Context, string) ([]byte, error)
+		})
+		if a.SnapshotKey == "" || !ok {
+			writeError(w, 409, "source snapshot not available; set SCRS_SNAPSHOT_ARCHIVES=true")
+			return
+		}
+		data, err := store.GetSnapshot(ctx, a.SnapshotKey)
+		if err != nil {
+			writeError(w, 502, "snapshot retrieval failed")
+			return
+		}
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+a.Commit+`.tar.gz"`)
 		_, _ = w.Write(data)
 	case "sbom":
 		if a.SBOMKey == "" {
@@ -368,4 +479,65 @@ func (h assessmentHandler) register(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 	w.WriteHeader(204)
+}
+
+// batch admits up to 100 targets, each with its own idempotency key, and
+// reports a per-item result (TRG-011). One item failing never fails the rest.
+func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *http.Request, principal connections.Token) {
+	var input struct {
+		Items []struct {
+			IdempotencyKey string              `json:"idempotency_key"`
+			Request        assessments.Request `json:"request"`
+		} `json:"items"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF || len(input.Items) == 0 || len(input.Items) > 100 {
+		writeError(w, 400, "batch requires 1 to 100 items")
+		return
+	}
+	batchCtx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	results := make([]map[string]any, 0, len(input.Items))
+	for i, item := range input.Items {
+		if item.Request.Remediation != nil {
+			results = append(results, map[string]any{"index": i, "status": 400, "error": "use the scoped remediation endpoint"})
+			continue
+		}
+		item.Request.AutoRemediation = h.remediationEnabled
+		a, replayed, err := h.store.Enqueue(batchCtx, item.Request, principal.ID, principal.Name, item.IdempotencyKey)
+		if err != nil {
+			rec := &statusRecorder{header: http.Header{}}
+			assessmentError(rec, err)
+			results = append(results, map[string]any{"index": i, "status": rec.status, "error": rec.message()})
+			continue
+		}
+		status := 202
+		if replayed {
+			status = 200
+		}
+		results = append(results, map[string]any{"index": i, "status": status, "assessment_id": a.ID, "location": BasePath + "/assessments/" + a.ID.String()})
+	}
+	writeJSON(w, 207, map[string]any{"items": results})
+}
+
+// statusRecorder captures assessmentError output for per-item batch results.
+type statusRecorder struct {
+	header http.Header
+	status int
+	body   []byte
+}
+
+func (s *statusRecorder) Header() http.Header  { return s.header }
+func (s *statusRecorder) WriteHeader(code int) { s.status = code }
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	s.body = append(s.body, b...)
+	return len(b), nil
+}
+func (s *statusRecorder) message() string {
+	var v struct {
+		Error string `json:"error"`
+	}
+	_ = json.Unmarshal(s.body, &v)
+	return v.Error
 }

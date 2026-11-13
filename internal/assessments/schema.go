@@ -36,5 +36,26 @@ func Schema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.assessment_files(assessment_id uuid PRIMARY KEY REFERENCES ` + s + `.assessments(id),body jsonb NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.remediation_results(assessment_id uuid PRIMARY KEY REFERENCES ` + s + `.assessments(id),artifact_key text NOT NULL,sha256 text NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.advisories(id text PRIMARY KEY,body jsonb NOT NULL,imported_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
+		// 2026-11-13: diffs, request ids, source snapshots, event-based integrity entries.
+		`ALTER TABLE ` + s + `.assessments ADD COLUMN IF NOT EXISTS diff jsonb NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE ` + s + `.assessments ADD COLUMN IF NOT EXISTS request_id text NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s + `.assessments ADD COLUMN IF NOT EXISTS snapshot_key text NOT NULL DEFAULT ''`,
+		`CREATE INDEX IF NOT EXISTS assessments_baseline_idx ON ` + s + `.assessments(asset_id,(request->'target'->>'ref'),created_at DESC) WHERE status='succeeded'`,
+		`CREATE INDEX IF NOT EXISTS assessments_commit_idx ON ` + s + `.assessments(asset_id,resolved_commit,created_at DESC)`,
+		`ALTER TABLE ` + s + `.findings ALTER COLUMN last_assessment_id DROP NOT NULL`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.integrity_events(id uuid PRIMARY KEY,delivery_id text NOT NULL,kind text NOT NULL,severity text NOT NULL,repository text NOT NULL DEFAULT '',ref text NOT NULL DEFAULT '',asset_id uuid REFERENCES ` + s + `.assets(id),finding_id uuid REFERENCES ` + s + `.findings(id),actor text NOT NULL DEFAULT '',details jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),UNIQUE(delivery_id,kind))`,
+		`CREATE INDEX IF NOT EXISTS integrity_events_asset_idx ON ` + s + `.integrity_events(asset_id,created_at DESC)`,
+		`ALTER TABLE ` + s + `.inbound_events ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'trigger'`,
+		`ALTER TABLE ` + s + `.inbound_events ADD COLUMN IF NOT EXISTS event_type text NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s + `.retention_policy ADD COLUMN IF NOT EXISTS webhook_delivery_days integer NOT NULL DEFAULT 0 CHECK(webhook_delivery_days BETWEEN 0 AND 36500)`,
+		// AST-002: owners and asset attributes used for routing and context.
+		`CREATE TABLE IF NOT EXISTS ` + s + `.owners(id uuid PRIMARY KEY,name text NOT NULL UNIQUE,email text NOT NULL DEFAULT '',team text NOT NULL DEFAULT '',chat text NOT NULL DEFAULT '',secondary_contact text NOT NULL DEFAULT '',revision bigint NOT NULL DEFAULT 1,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),updated_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS owner_id uuid REFERENCES ` + s + `.owners(id)`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS environment text NOT NULL DEFAULT '' CHECK(environment IN ('','dev','stg','prod'))`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS criticality integer NOT NULL DEFAULT 0 CHECK(criticality BETWEEN 0 AND 5)`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS exposure text NOT NULL DEFAULT '' CHECK(exposure IN ('','internet','internal','offline'))`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS labels jsonb NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1`,
+		`CREATE INDEX IF NOT EXISTS assets_owner_idx ON ` + s + `.assets(owner_id)`,
 	}
 }

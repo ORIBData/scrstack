@@ -17,12 +17,13 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/httpapi"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy") {
+	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy" || os.Args[1] == "yara-install") {
 		if err := pipelineCommand(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -115,6 +116,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "artifact store unavailable")
 		os.Exit(1)
 	}
+	events, err := notify.Open(context.Background(), cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "notification store unavailable")
+		os.Exit(1)
+	}
+	defer events.Close()
 	authCtx, authCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	generated, err := store.SyncBootstrap(authCtx, bootstrapToken)
 	authCancel()
@@ -164,7 +171,7 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Assessments: assessmentStore, Artifacts: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

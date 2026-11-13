@@ -9,17 +9,21 @@ import (
 // Raw ingress retention is independent of assessment, finding and audit evidence.
 // Zero retains forever; no purge of assessed artifacts or risk history is exposed.
 type Retention struct {
-	Revision         int64 `json:"revision"`
-	InboundEventDays int   `json:"inbound_event_days"`
+	Revision            int64 `json:"revision"`
+	InboundEventDays    int   `json:"inbound_event_days"`
+	WebhookDeliveryDays int   `json:"webhook_delivery_days"`
 }
 
 func (s *Store) Retention(ctx context.Context) (Retention, error) {
 	var p Retention
-	err := s.pool.QueryRow(ctx, `SELECT revision,inbound_event_days FROM `+s.schema+`.retention_policy WHERE singleton`).Scan(&p.Revision, &p.InboundEventDays)
+	err := s.pool.QueryRow(ctx, `SELECT revision,inbound_event_days,webhook_delivery_days FROM `+s.schema+`.retention_policy WHERE singleton`).Scan(&p.Revision, &p.InboundEventDays, &p.WebhookDeliveryDays)
 	return p, err
 }
-func (s *Store) SetRetention(ctx context.Context, actor uuid.UUID, expected int64, days int) (Retention, error) {
-	if days < 0 || days > 36500 {
+
+// SetRetention replaces the policy. Zero keeps a class forever.
+func (s *Store) SetRetention(ctx context.Context, actor uuid.UUID, expected int64, policy Retention) (Retention, error) {
+	days, deliveryDays := policy.InboundEventDays, policy.WebhookDeliveryDays
+	if days < 0 || days > 36500 || deliveryDays < 0 || deliveryDays > 36500 {
 		return Retention{}, ErrInput
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -27,22 +31,22 @@ func (s *Store) SetRetention(ctx context.Context, actor uuid.UUID, expected int6
 		return Retention{}, err
 	}
 	defer tx.Rollback(ctx)
-	var old int
-	if err = tx.QueryRow(ctx, `SELECT inbound_event_days FROM `+s.schema+`.retention_policy WHERE singleton FOR UPDATE`).Scan(&old); err != nil {
+	var old, oldDeliveries int
+	if err = tx.QueryRow(ctx, `SELECT inbound_event_days,webhook_delivery_days FROM `+s.schema+`.retention_policy WHERE singleton FOR UPDATE`).Scan(&old, &oldDeliveries); err != nil {
 		return Retention{}, err
 	}
-	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.retention_policy SET inbound_event_days=$1,revision=revision+1 WHERE singleton AND revision=$2`, days, expected)
+	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.retention_policy SET inbound_event_days=$1,webhook_delivery_days=$3,revision=revision+1 WHERE singleton AND revision=$2`, days, expected, deliveryDays)
 	if err != nil {
 		return Retention{}, err
 	}
 	if tag.RowsAffected() != 1 {
 		return Retention{}, ErrConflict
 	}
-	details, _ := json.Marshal(map[string]any{"actor_id": actor, "old_days": old, "new_days": days, "revision": expected + 1})
+	details, _ := json.Marshal(map[string]any{"actor_id": actor, "old_days": old, "new_days": days, "old_webhook_delivery_days": oldDeliveries, "new_webhook_delivery_days": deliveryDays, "revision": expected + 1})
 	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('retention.policy_changed',$1)`, details); err != nil {
 		return Retention{}, err
 	}
-	return Retention{Revision: expected + 1, InboundEventDays: days}, tx.Commit(ctx)
+	return Retention{Revision: expected + 1, InboundEventDays: days, WebhookDeliveryDays: deliveryDays}, tx.Commit(ctx)
 }
 func (s *Store) PreviewRetention(ctx context.Context, days int) (map[string]int64, error) {
 	if days < 0 || days > 36500 {

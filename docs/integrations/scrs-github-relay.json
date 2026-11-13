@@ -1,0 +1,88 @@
+{
+  "name": "SCRS - GitHub relay",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "github-scrs",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "6a1f0c64-1d2e-4c3b-9a01-000000000001",
+      "name": "GitHub organization webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "6a1f0c64-1d2e-4c3b-9a01-0000000000a1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SCRS_BASE_URL }}/scrs/v1/ingest/github",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-GitHub-Event",
+              "value": "={{ $json.headers['x-github-event'] }}"
+            },
+            {
+              "name": "X-GitHub-Delivery",
+              "value": "={{ $json.headers['x-github-delivery'] }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "6a1f0c64-1d2e-4c3b-9a01-000000000002",
+      "name": "Relay unchanged body to SCRS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. Retries are safe: the delivery GUID is the idempotency key.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "GitHub organization webhook": {
+      "main": [
+        [
+          {
+            "node": "Relay unchanged body to SCRS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

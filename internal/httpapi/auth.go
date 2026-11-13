@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -27,10 +29,13 @@ type principalKey struct{}
 type Security struct {
 	GitHubWebhookSecret string
 	RemediationEnabled  bool
+	RelayEnabled        bool
 	Assessments         *assessments.Store
 	Artifacts           interface {
 		GetSBOM(context.Context, string) ([]byte, error)
 	}
+	Notify         *notify.Store
+	Logger         *slog.Logger
 	Store          TokenStore
 	Redis          *redis.Client
 	DocsPublic     bool
@@ -62,13 +67,39 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle(BasePath+"/connections", security.protect("admin", handler))
 	mux.Handle(BasePath+"/connections/", security.protect("admin", handler))
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
+	m := newMetrics(security.Assessments, security.Notify)
+	mux.Handle("GET "+BasePath+"/system/metrics", security.protect("read", m.handler()))
+	if admin, ok := store.(assetAdmin); ok {
+		assetsHandler := assetHandler{admin}
+		mux.Handle("GET "+BasePath+"/owners", security.protect("read|write", assetsHandler))
+		mux.Handle("POST "+BasePath+"/owners", security.protect("write", assetsHandler))
+		mux.Handle("PATCH "+BasePath+"/owners/{id}", security.protect("write", assetsHandler))
+		mux.Handle("GET "+BasePath+"/assets/{id}", security.protect("read|write", assetsHandler))
+		mux.Handle("PATCH "+BasePath+"/assets/{id}", security.protect("write", assetsHandler))
+	}
 	mux.Handle(BasePath+"/tokens", security.protect("admin", http.HandlerFunc(security.tokens)))
 	mux.Handle(BasePath+"/tokens/", security.protect("admin", http.HandlerFunc(security.tokens)))
+	if security.Notify != nil {
+		subscriptions := security.protect("admin", subscriptionHandler{security.Notify})
+		mux.Handle(BasePath+"/webhooks", subscriptions)
+		mux.Handle(BasePath+"/webhooks/", subscriptions)
+	}
 	if security.Assessments != nil {
 		for _, path := range []string{"/settings/retention", "/settings/retention:preview", "/settings/retention:purge"} {
 			mux.Handle(BasePath+path, security.protect("admin", retentionHandler(security.Assessments)))
 		}
-		mux.Handle("POST "+BasePath+"/webhooks/github", githubWebhook(security.Assessments, security.GitHubWebhookSecret, security.RemediationEnabled))
+		ingest := newGitHubIngest(security.Assessments, security.GitHubWebhookSecret, security.RemediationEnabled, security.RelayEnabled)
+		direct, relay := ingest.direct(), security.protect("ingest:relay", ingest.relay())
+		mux.Handle("POST "+BasePath+"/webhooks/github", direct)
+		// ING-001/TRG-002: one provider endpoint, two entry modes. A provider
+		// signature selects direct mode; a bearer token selects relay mode.
+		mux.Handle("POST "+BasePath+"/ingest/github", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("X-Hub-Signature-256") == "" && r.Header.Get("Authorization") != "" {
+				relay.ServeHTTP(w, r)
+				return
+			}
+			direct.ServeHTTP(w, r)
+		}))
 		mux.Handle(BasePath+"/feeds/indicators", security.protect("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			defer cancel()
@@ -102,8 +133,14 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 			}
 			writeJSON(w, 201, map[string]string{"version": version})
 		})))
+		maintenance := security.protect("admin", maintenanceHandler{security.Assessments, security.Notify})
+		mux.Handle(BasePath+"/maintenance/", maintenance)
+		mux.Handle(BasePath+"/events/inbound", maintenance)
+		mux.Handle(BasePath+"/events/inbound/", maintenance)
 		h := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts, remediationEnabled: security.RemediationEnabled}
 		mux.Handle("POST "+BasePath+"/assessments", security.protect("write|trigger", h))
+		mux.Handle("POST "+BasePath+"/assessments:batch", security.protect("write|trigger", h))
+		mux.Handle("GET "+BasePath+"/assets/{id}/last-known-good", security.protect("read|write", h))
 		mux.Handle("GET "+BasePath+"/assessments", security.protect("read|write|trigger", h))
 		mux.Handle(BasePath+"/assessments/", security.protect("read|write|trigger", h))
 		mux.Handle("GET "+BasePath+"/remediation/capabilities", security.protect("read|write", h))
@@ -111,7 +148,7 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle(BasePath+"/register", security.protect("read|write", h))
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
 	}
-	return security.cors(mux)
+	return security.observe(m, security.cors(mux))
 }
 func (s Security) protect(scope string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +201,9 @@ func (s Security) protect(scope string, next http.Handler) http.Handler {
 			w.Header().Set("Retry-After", "60")
 			writeError(w, 429, "token rate limit exceeded")
 			return
+		}
+		if info, ok := r.Context().Value(infoKey{}).(*requestInfo); ok {
+			info.principal = principal.Name
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, principal)))
 	})

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -29,6 +30,24 @@ func (syntheticSource) List(context.Context, connections.Connection, json.RawMes
 }
 func (syntheticSource) GitHubSnapshot(_ context.Context, _ connections.Connection, _ json.RawMessage, _, _, _ string) ([]byte, string, bool, error) {
 	return []byte("synthetic archive"), strings.Repeat("a", 40), false, nil
+}
+
+// recordingSource captures the ref the worker asks the provider to resolve.
+type recordingSource struct {
+	syntheticSource
+	refs []string
+}
+
+func (r *recordingSource) GitHubSnapshot(ctx context.Context, c connections.Connection, s json.RawMessage, repo, ref, commit string) ([]byte, string, bool, error) {
+	r.refs = append(r.refs, ref)
+	return r.syntheticSource.GitHubSnapshot(ctx, c, s, repo, ref, commit)
+}
+
+type snapshotSink struct{ keys int }
+
+func (s *snapshotSink) PutSnapshot(context.Context, []byte) (string, error) {
+	s.keys++
+	return "snapshots/" + strings.Repeat("b", 64) + ".tar.gz", nil
 }
 
 type artifactSink struct{ saved []byte }
@@ -104,6 +123,27 @@ func TestPostgresWorkerPublishesAndRejectsRevokedScope(t *testing.T) {
 	if err != nil || result.Status != "succeeded" || result.Verdict != "incomplete" || result.Commit != strings.Repeat("a", 40) || len(sink.saved) == 0 {
 		t.Fatal("worker result not persisted", result, err)
 	}
+	// A PR assessment pins the head commit and must not resolve its "pull/N" label as a ref.
+	prReq := assessments.Request{Target: assessments.Target{Type: "git", Repository: "org/repo", Commit: strings.Repeat("a", 40), PullRequest: &assessments.PullRequest{Number: 9, BaseRef: "main"}}}
+	if _, _, err := jobs.Enqueue(ctx, prReq, actor, "tester", "pull-request"); err != nil {
+		t.Fatal(err)
+	}
+	prJob, err := jobs.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder, snaps := &recordingSource{}, &snapshotSink{}
+	prWorker := w
+	prWorker.Source, prWorker.Snapshots = recorder, snaps
+	if err := prWorker.run(ctx, &prJob); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.refs) != 1 || recorder.refs[0] != "" || snaps.keys != 1 {
+		t.Fatal("PR label resolved as a ref or snapshot not stored", recorder.refs, snaps.keys)
+	}
+	if saved, err := jobs.Get(ctx, prJob.ID); err != nil || saved.SnapshotKey == "" || saved.Request.Target.Ref != "pull/9" {
+		t.Fatal("PR assessment or snapshot link not persisted", saved, err)
+	}
 	if _, _, err := jobs.Enqueue(ctx, req, actor, "tester", "revocation"); err != nil {
 		t.Fatal(err)
 	}
@@ -117,5 +157,96 @@ func TestPostgresWorkerPublishesAndRejectsRevokedScope(t *testing.T) {
 	}
 	if err := w.run(ctx, &revoked); err != assessments.ErrScope {
 		t.Fatal("revoked configuration accepted", err)
+	}
+}
+
+type imageInventory struct{}
+
+func (imageInventory) List(context.Context, connections.Connection, json.RawMessage) ([]connections.Resource, error) {
+	return []connections.Resource{{Type: "container_image", Locator: "docker.io/library/app"}}, nil
+}
+
+// fakeRegistry streams a synthetic archive and reports a platform digest.
+type fakeRegistry struct{ digest string }
+
+func (f fakeRegistry) ImageArchive(_ context.Context, _ connections.Connection, _ json.RawMessage, locator, tag, digest, platform string, _ int64, w io.Writer) (string, error) {
+	if locator != "docker.io/library/app" || platform != "linux/amd64" || (tag != "1.2" && digest != f.digest) {
+		return "", errors.New("unexpected image request")
+	}
+	_, err := io.WriteString(w, "synthetic image archive")
+	return f.digest, err
+}
+
+func TestPostgresWorkerAssessesImageByDigest(t *testing.T) {
+	db := os.Getenv("SCRS_TEST_DATABASE_URL")
+	if db == "" {
+		t.Skip("requires disposable PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	schema := "qa_" + uuid.NewString()[:8]
+	if err := storage.BootstrapDatabase(ctx, storage.Config{DatabaseURL: db, DatabaseSchema: schema}); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	defer func() { _, _ = pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") }()
+	providers, err := connections.Open(ctx, db, schema, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{4}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providers.Close()
+	hub := connections.Connection{Name: "hub", Provider: "dockerhub", Config: json.RawMessage(`{"namespace":"library","identifier":"bot"}`), Scope: connections.Scope{Include: []string{"docker.io/library/*"}}}
+	if _, err := providers.Put(ctx, hub, json.RawMessage(`{"token":"synthetic"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providers.Discover(ctx, "hub", imageInventory{}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := assessments.Open(ctx, db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobs.Close()
+	actor := uuid.New()
+	for _, bad := range []assessments.Target{{Type: "image", Repository: "docker.io/library/app", Ref: "bad tag!"}, {Type: "image", Repository: "docker.io/library/app", Platform: "windows/amd64"}, {Type: "image", Repository: "docker.io/library/app", Commit: strings.Repeat("a", 40)}} {
+		if _, _, err := jobs.Enqueue(ctx, assessments.Request{Target: bad}, actor, "tester", ""); !errors.Is(err, assessments.ErrInput) {
+			t.Fatal("invalid image target accepted", bad, err)
+		}
+	}
+	if _, _, err := jobs.Enqueue(ctx, assessments.Request{Target: assessments.Target{Type: "image", Repository: "docker.io/library/other"}}, actor, "tester", ""); !errors.Is(err, assessments.ErrScope) {
+		t.Fatal("undiscovered image admitted", err)
+	}
+	if _, _, err := jobs.Enqueue(ctx, assessments.Request{Target: assessments.Target{Type: "image", Repository: "docker.io/library/app", Ref: "1.2"}}, actor, "tester", "image"); err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobs.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token := strings.Repeat("x", 40)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.URL.Path != "/scan-image" || string(body) != "synthetic image archive" || r.Header.Get("Authorization") != "Bearer "+token {
+			t.Error("image not streamed to the scanner image endpoint")
+		}
+		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "busybox", Version: "1.36.1-r15", Ecosystem: "Alpine:v3.19", PURL: "pkg:apk/alpine/busybox@1.36.1-r15", Path: "lib/apk/db/installed"}}, SBOM: json.RawMessage(`{"bomFormat":"CycloneDX","specVersion":"1.6"}`), Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "malware", Status: "skipped"}}})
+	}))
+	defer server.Close()
+	digest := "sha256:" + strings.Repeat("d", 64)
+	w := Worker{Store: jobs, Connections: providers, Images: fakeRegistry{digest}, Artifacts: &artifactSink{}, ScannerURL: server.URL + "/scan", ScannerToken: token, Logger: slog.Default()}
+	if err := w.run(ctx, &job); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := jobs.Get(ctx, job.ID)
+	if err != nil || saved.Status != "succeeded" || saved.Commit != digest || saved.Verdict != "incomplete" || saved.Request.Target.Platform != "linux/amd64" {
+		t.Fatal("image assessment not published by digest", saved, err)
+	}
+	latest, err := jobs.Latest(ctx, uuid.Nil, "docker.io/library/app", digest, uuid.Nil)
+	if err != nil || latest.ID != job.ID {
+		t.Fatal("latest-by-digest lookup failed", err)
 	}
 }

@@ -104,3 +104,46 @@ required.
    once `scrs-scanner` is healthy. ClamAV downloads signatures on first start; until
    then malware coverage reads `partial`.
 6. Set `SCRS_PUBLIC_BASE_URL` and run `make deployment-acceptance`.
+
+## Update 2026-11-13: outbound webhooks, relay and M1–M7 completion
+
+**Delivered:**
+- **Outbound webhooks.** Signed delivery from a transactional outbox, with retries, dead-letter and redelivery. Summary, full and agent profiles; SSRF-safe dialing.
+- **n8n relay ingestion.** GitHub `pull_request` assessments and integrity alerts (INT-001/002/008/009/010/011).
+- **M1:** owners and asset attributes, metrics, request IDs, access logs.
+- **M2:** batch trigger, latest-by-commit, long-poll, filters, last-known-good, diffs and new-versus-existing gating.
+- **M3:** YARA (via ClamAV, proven by canary), campaign indicator types, KEV/EPSS.
+- **M5:** scheduler, maintenance actions, inbound-event log with replay, delivery-log retention, source snapshots, n8n reference workflows.
+- **M6:** Docker Hub/GAR images by digest.
+- **M7:** Maven remediation, OpenVEX, load testing.
+
+**Defects found and fixed while building:**
+
+| Severity | Finding | Fix |
+| --- | --- | --- |
+| High | PR assessments passed the `pull/<n>` label to GitHub as a ref to resolve; every PR scan would have failed. | PR scans pin only the head commit. Worker regression test. |
+| High | Integrity change records (workflow changes, provider events) would have auto-closed as `fixed` once the integrity stage completed. | Excluded from absence-based closure; they stay open until reviewed. |
+| High | Every non-hash indicator was matched as a domain, so new indicator types would have counted as coverage without matching anything. | One matcher per type; event-only patterns no longer count as content coverage. |
+| Medium | SSRF checks treated carrier-grade NAT (100.64.0.0/10) and other special ranges as public, in both webhook delivery and the remediation egress proxy. | Shared non-public range list in both. |
+| Medium | First deploy: a scratch-image container mounting ClamAV's empty volume first would leave it root-owned and unwritable. | The installer starts after ClamAV and retries until writable. Verified in a live Compose run. |
+| Medium | `docker/cli` v28.2.2 (GO-2026-4610) arrived with the registry library. | Upgraded to v29.2.0. `docker/distribution` (GO-2026-6778, no fix) remains, unreachable from SCRS code. |
+| Low | Streaming an image through the scanner's 30 s read timeout would have cut large images off. | Scanner read/write timeouts 5 and 9 minutes; image jobs get a 9-minute deadline inside the 10-minute lease. |
+
+**Verification (2026-11-13):**
+- `make qa`, `scanner-test`, `database-test`, `malware-test`, `image-scan-test` and `storage-integration` all pass.
+- staticcheck (all non-style checks) is clean; govulncheck reports no reachable vulnerabilities.
+- **Live checks:**
+  - real OSV-Scanner with the real npm and Alpine feeds;
+  - a local registry pull by digest, with 15 packages and 42 advisories matched;
+  - live CISA KEV/EPSS (Log4Shell flagged as known-exploited);
+  - live Maven and npm remediation through the egress proxy;
+  - the n8n workflows import into n8n 1.97.1.
+- **Load:** 480 concurrent admissions with p95 89 ms; 240 jobs completed exactly once across 6 workers, including 22 crash recoveries via lease expiry, with one outbox event per completion.
+- **Full `compose.dokploy.yaml` stack run locally**, covering every service, the YARA volume handoff and API port 7000.
+
+**Remaining risks:**
+- Image layers get no malware, YARA, IOC or integrity analysis, so image verdicts are `incomplete` unless they `fail`.
+- YARA runs in ClamAV's YARA subset (no modules).
+- Git-bundle history mirroring, Harbor/OCI/GitLab adapters, registry push events, Trivy/SARIF import, licences, SAST and reachability are not built.
+- Webhook receivers must verify `X-SCRS-Signature`.
+- Live Traefik/TLS acceptance on the VPS is still pending.

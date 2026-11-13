@@ -3,18 +3,22 @@ package assessments
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"path"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
 func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
-	if !commitPattern.MatchString(r.Commit) || len(r.Components) > 20000 || len(r.Findings) > 10000 || len(r.Files) > 10000 {
+	if !validRevision(r.Commit) || len(r.Components) > 20000 || len(r.Findings) > 10000 || len(r.Files) > 10000 {
 		return ErrInput
 	}
-	required := map[string]bool{"resolve": false, "fetch": false, "inventory": false, "sbom": false, "match_vuln": false, "match_malicious": false, "malware": false, "ioc": false, "integrity": false}
+	required := map[string]bool{"resolve": false, "fetch": false, "inventory": false, "sbom": false, "match_vuln": false, "match_malicious": false, "malware": false, "yara": false, "ioc": false, "integrity": false}
 	for _, stage := range r.Stages {
 		if _, ok := required[stage.Name]; ok {
 			required[stage.Name] = stage.Status == "ok"
@@ -113,10 +117,20 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessment_files(assessment_id,body) VALUES($1,$2)`, a.ID, files); err != nil {
 		return err
 	}
-	batch := &pgx.Batch{}
-	for i, component := range r.Components {
-		body, _ := json.Marshal(component)
-		batch.Queue(`INSERT INTO `+s.schema+`.components(assessment_id,ordinal,body) VALUES($1,$2,$3)`, a.ID, i, body)
+	// Baseline: the newest prior successful scan of the same ref, or of the
+	// base branch for a pull request. It decides new versus existing (TRG-006).
+	baseRef := a.Request.Target.Ref
+	if pr := a.Request.Target.PullRequest; pr != nil {
+		baseRef = pr.BaseRef
+	}
+	var baseline uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT id FROM `+s.schema+`.assessments WHERE asset_id=$1 AND request->'target'->>'ref'=$2 AND status='succeeded' AND request->'remediation' IS NULL AND id<>$3 ORDER BY created_at DESC,id DESC LIMIT 1`, a.AssetID, baseRef, a.ID).Scan(&baseline)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	baseFindings, err := stringSet(ctx, tx, `SELECT concat_ws(chr(31),snapshot->>'type',snapshot->>'advisory_id',snapshot->'component'->>'purl',snapshot->'component'->>'path') FROM `+s.schema+`.assessment_findings WHERE assessment_id=$1`, baseline)
+	if err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	unique := []Finding{}
@@ -126,7 +140,33 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 			continue
 		}
 		seen[f.Fingerprint] = true
+		f.Change = "new"
+		if baseline != uuid.Nil && baseFindings[strings.Join([]string{f.Type, f.AdvisoryID, f.Component.PURL, f.Component.Path}, "\x1f")] {
+			f.Change = "existing"
+		}
 		unique = append(unique, f)
+	}
+	fingerprints := make([]string, len(unique))
+	for i, f := range unique {
+		fingerprints[i] = f.Fingerprint
+	}
+	// Register entries that did not exist before this scan drive finding.created.
+	registered, err := stringSet(ctx, tx, `SELECT fingerprint FROM `+s.schema+`.findings WHERE fingerprint=ANY($1)`, fingerprints)
+	if err != nil {
+		return err
+	}
+	diff, err := s.componentDiff(ctx, tx, baseline, r.Components)
+	if err != nil {
+		return err
+	}
+	batch := &pgx.Batch{}
+	for i, component := range r.Components {
+		body, _ := json.Marshal(component)
+		batch.Queue(`INSERT INTO `+s.schema+`.components(assessment_id,ordinal,body) VALUES($1,$2,$3)`, a.ID, i, body)
+	}
+	var created []Finding
+	for i := range unique {
+		f := &unique[i]
 		f.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(f.Fingerprint))
 		f.AssetID = a.AssetID
 		f.Ref = a.Request.Target.Ref
@@ -135,6 +175,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		f.LastSeen = f.FirstSeen
 		if !json.Valid(f.Evidence) || !json.Valid(f.Guidance) || f.Score < 0 || f.Score > 100 {
 			return ErrInput
+		}
+		if !registered[f.Fingerprint] {
+			created = append(created, *f)
 		}
 		component, _ := json.Marshal(f.Component)
 		snapshot, _ := json.Marshal(f)
@@ -145,7 +188,7 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if a.Request.AutoRemediation && a.Request.Remediation == nil {
 		manifests := map[string]bool{}
 		for _, c := range r.Components {
-			if c.Ecosystem == "npm" && (c.Path == "package-lock.json" || strings.HasSuffix(c.Path, "/package-lock.json")) {
+			if (c.Ecosystem == "npm" && path.Base(c.Path) == "package-lock.json") || (c.Ecosystem == "Maven" && path.Base(c.Path) == "pom.xml") {
 				manifests[c.Path] = true
 			}
 		}
@@ -159,46 +202,89 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// Only a scan of the ref's current head can close prior findings, and only
 	// for finding types whose producing stages completed. A webhook push names
 	// both commit and ref; ref_moved tells whether that commit is still the head.
+	// Change records (workflow changes, provider events) need human review and
+	// are never closed by absence.
 	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
 		if err != nil {
 			return err
 		}
 	}
 	r.Findings = unique
 	// Register triage (waivers, suppressions) applies to the gate; snapshots keep the raw detection.
-	fingerprints := make([]string, len(unique))
-	for i, f := range unique {
-		fingerprints[i] = f.Fingerprint
-	}
-	waived := map[string]bool{}
-	rows, err := tx.Query(ctx, `SELECT fingerprint FROM `+s.schema+`.findings WHERE fingerprint=ANY($1) AND (status IN ('suppressed','false_positive') OR (status='accepted' AND waiver_until>clock_timestamp()))`, fingerprints)
+	waived, err := stringSet(ctx, tx, `SELECT fingerprint FROM `+s.schema+`.findings WHERE fingerprint=ANY($1) AND (status IN ('suppressed','false_positive') OR (status='accepted' AND waiver_until>clock_timestamp()))`, fingerprints)
 	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var fp string
-		if err := rows.Scan(&fp); err != nil {
-			rows.Close()
-			return err
-		}
-		waived[fp] = true
-	}
-	rows.Close()
-	if err = rows.Err(); err != nil {
 		return err
 	}
 	v, counts := verdict(r, waived)
 	stages, _ := json.Marshal(r.Stages)
 	countJSON, _ := json.Marshal(counts)
-	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256)
+	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff)
 	if err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES('assessment.completed',$1,$2)`, a.ID, countJSON); err != nil {
 		return err
 	}
+	done, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, a.ID))
+	if err != nil {
+		return err
+	}
+	if err := s.emitCompletion(ctx, tx, done, created); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// stringSet runs a single-column query and returns its values as a set.
+func stringSet(ctx context.Context, tx pgx.Tx, query string, args ...any) (map[string]bool, error) {
+	out := map[string]bool{}
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var v *string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		if v != nil {
+			out[*v] = true
+		}
+	}
+	return out, rows.Err()
+}
+
+// componentDiff compares package identities with the baseline (OUT-006 diff).
+func (s *Store) componentDiff(ctx context.Context, tx pgx.Tx, baseline uuid.UUID, current []Component) ([]byte, error) {
+	if baseline == uuid.Nil {
+		return []byte(`{"base_assessment_id":null}`), nil
+	}
+	before, err := stringSet(ctx, tx, `SELECT body->>'purl' FROM `+s.schema+`.components WHERE assessment_id=$1`, baseline)
+	if err != nil {
+		return nil, err
+	}
+	after := map[string]bool{}
+	for _, c := range current {
+		after[c.PURL] = true
+	}
+	added, removed := []string{}, []string{}
+	for purl := range after {
+		if !before[purl] {
+			added = append(added, purl)
+		}
+	}
+	for purl := range before {
+		if !after[purl] {
+			removed = append(removed, purl)
+		}
+	}
+	slices.Sort(added)
+	slices.Sort(removed)
+	addedTotal, removedTotal := len(added), len(removed)
+	added, removed = added[:min(len(added), 200)], removed[:min(len(removed), 200)]
+	return json.Marshal(map[string]any{"base_assessment_id": baseline, "components_added": added, "components_removed": removed, "added_total": addedTotal, "removed_total": removedTotal, "truncated": addedTotal > len(added) || removedTotal > len(removed)})
 }
 func (s *Store) Components(ctx context.Context, id uuid.UUID, after int) ([]Component, error) {
 	rows, err := s.pool.Query(ctx, `SELECT body FROM `+s.schema+`.components WHERE assessment_id=$1 AND ordinal>$2 ORDER BY ordinal LIMIT 101`, id, after)
@@ -282,12 +368,20 @@ func (s *Store) Transition(ctx context.Context, id, actor uuid.UUID, status, rea
 		return err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.findings SET status=$2,waiver_until=$3,revision=revision+1 WHERE id=$1`, id, status, until)
+	var previous string
+	var asset uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT status,asset_id FROM `+s.schema+`.findings WHERE id=$1 FOR UPDATE`, id).Scan(&previous, &asset)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return ErrNotFound
+	if _, err = tx.Exec(ctx, `UPDATE `+s.schema+`.findings SET status=$2,waiver_until=$3,revision=revision+1 WHERE id=$1`, id, status, until); err != nil {
+		return err
+	}
+	if _, err := notify.Emit(ctx, tx, s.schema, "finding.status_changed", map[string]any{"finding_id": id, "asset_id": asset, "previous_status": previous, "status": status, "waiver_until": until, "actor_id": actor, "link": notify.Link("/register/" + id.String() + "/events")}, nil); err != nil {
+		return err
 	}
 	details, _ := json.Marshal(map[string]any{"status": status, "reason": reason, "expires_at": until, "actor_id": actor})
 	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.finding_events(finding_id,actor_id,action,details) VALUES($1,$2,'status_changed',$3)`, id, actor, details); err != nil {

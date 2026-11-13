@@ -24,16 +24,25 @@ func TestVerdictGate(t *testing.T) {
 		{"integrity entry fails by default", Result{Complete: true, Findings: []Finding{workflow}}, nil, "fail"},
 		{"waived critical no longer gates", Result{Complete: true, Findings: []Finding{critical}}, map[string]bool{"c": true}, "pass"},
 		{"waived malware never drops below warn", Result{Complete: true, Findings: []Finding{malware}}, map[string]bool{"m": true}, "warn"},
+		{"existing critical warns", Result{Complete: true, Findings: []Finding{withChange(critical, "existing")}}, nil, "warn"},
+		{"existing high does not gate", Result{Complete: true, Findings: []Finding{withChange(high, "existing")}}, nil, "pass"},
+		{"existing malware still fails", Result{Complete: true, Findings: []Finding{withChange(malware, "existing")}}, nil, "fail"},
+		{"new critical fails", Result{Complete: true, Findings: []Finding{withChange(critical, "new")}}, nil, "fail"},
+		{"existing serious integrity warns", Result{Complete: true, Findings: []Finding{withChange(workflow, "existing")}}, nil, "warn"},
+		{"new medium integrity warns", Result{Complete: true, Findings: []Finding{{Fingerprint: "i", Type: "integrity", Severity: "medium", Change: "new"}}}, nil, "warn"},
+		{"existing medium integrity does not gate", Result{Complete: true, Findings: []Finding{{Fingerprint: "i", Type: "integrity", Severity: "medium", Change: "existing"}}}, nil, "pass"},
 	} {
 		if got, _ := verdict(tc.result, tc.waived); got != tc.expected {
 			t.Errorf("%s: got %s, want %s", tc.name, got, tc.expected)
 		}
 	}
-	_, counts := verdict(Result{Findings: []Finding{critical, high}}, map[string]bool{"c": true})
-	if counts["total"] != 2 || counts["waived"] != 1 || counts["critical"] != 1 {
+	_, counts := verdict(Result{Findings: []Finding{critical, withChange(high, "new")}}, map[string]bool{"c": true})
+	if counts["total"] != 2 || counts["waived"] != 1 || counts["critical"] != 1 || counts["new"] != 1 {
 		t.Fatalf("unexpected counts %v", counts)
 	}
 }
+
+func withChange(f Finding, change string) Finding { f.Change = change; return f }
 
 func TestClosableTypesRequireProducingStages(t *testing.T) {
 	stages := []Stage{{"resolve", "ok", ""}, {"fetch", "ok", ""}, {"inventory", "ok", ""}, {"sbom", "ok", ""}, {"match_vuln", "ok", ""}, {"match_malicious", "ok", ""}, {"malware", "partial", ""}, {"ioc", "skipped", ""}, {"integrity", "partial", ""}}

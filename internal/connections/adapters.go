@@ -29,6 +29,8 @@ type NativeAdapters struct {
 	GitHubAPI string // overridden only by tests
 	DockerAPI string // overridden only by tests
 	GoogleAPI string // overridden only by tests
+	// RegistryHost pins image pulls to one plain-HTTP registry; tests only.
+	RegistryHost string
 }
 
 var providerSegment = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -135,8 +137,9 @@ func (a NativeAdapters) github(ctx context.Context, c Connection, secret json.Ra
 		}
 		var result struct {
 			Repositories []struct {
-				FullName string `json:"full_name"`
-				Private  bool   `json:"private"`
+				FullName      string `json:"full_name"`
+				Private       bool   `json:"private"`
+				DefaultBranch string `json:"default_branch"`
 			} `json:"repositories"`
 		}
 		if json.Unmarshal(data, &result) != nil {
@@ -145,7 +148,7 @@ func (a NativeAdapters) github(ctx context.Context, c Connection, secret json.Ra
 		for _, repo := range result.Repositories {
 			parts := strings.Split(repo.FullName, "/")
 			if len(parts) == 2 && strings.EqualFold(parts[0], cfg.Organization) && providerSegment.MatchString(parts[1]) {
-				metadata, _ := json.Marshal(map[string]any{"private": repo.Private})
+				metadata, _ := json.Marshal(map[string]any{"private": repo.Private, "default_branch": repo.DefaultBranch})
 				resources = append(resources, Resource{Type: "github_repo", Locator: repo.FullName, Metadata: metadata})
 			}
 		}
@@ -168,9 +171,10 @@ func (a NativeAdapters) githubUserRepositories(ctx context.Context, organization
 			return nil, err
 		}
 		var repos []struct {
-			FullName string `json:"full_name"`
-			Private  bool   `json:"private"`
-			Owner    struct {
+			FullName      string `json:"full_name"`
+			Private       bool   `json:"private"`
+			DefaultBranch string `json:"default_branch"`
+			Owner         struct {
 				Login string `json:"login"`
 			} `json:"owner"`
 		}
@@ -180,7 +184,7 @@ func (a NativeAdapters) githubUserRepositories(ctx context.Context, organization
 		for _, repo := range repos {
 			parts := strings.Split(repo.FullName, "/")
 			if len(parts) == 2 && strings.EqualFold(parts[0], organization) && strings.EqualFold(repo.Owner.Login, organization) && providerSegment.MatchString(parts[1]) {
-				metadata, _ := json.Marshal(map[string]any{"private": repo.Private})
+				metadata, _ := json.Marshal(map[string]any{"private": repo.Private, "default_branch": repo.DefaultBranch})
 				resources = append(resources, Resource{Type: "github_repo", Locator: repo.FullName, Metadata: metadata})
 			}
 		}

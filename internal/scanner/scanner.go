@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -30,6 +31,8 @@ type Engine struct {
 	RemediationEnabled          bool
 	RemediationProxy            string
 	ClamdAddress, IndicatorFile string
+	// MaxImageBytes caps a streamed image archive (SCRS_MAX_IMAGE_BYTES).
+	MaxImageBytes int64
 }
 type Output struct {
 	Files      []FileEvidence          `json:"files"`
@@ -207,114 +210,18 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 	if err != nil {
 		return out, err
 	}
-	var results struct {
-		Results []struct {
-			Source struct {
-				Path string `json:"path"`
-			} `json:"source"`
-			Packages []struct {
-				Package         assessments.Component `json:"package"`
-				Vulnerabilities []json.RawMessage     `json:"vulnerabilities"`
-				Groups          []struct {
-					IDs []string `json:"ids"`
-					Max string   `json:"max_severity"`
-				} `json:"groups"`
-			} `json:"packages"`
-		} `json:"results"`
-	}
-	if json.Unmarshal(raw, &results) != nil {
-		return out, errors.New("invalid scanner result")
-	}
-	for _, result := range results.Results {
-		relative, err := filepath.Rel(source, result.Source.Path)
+	enrich := loadEnrichment(database)
+	components, findings, err := e.parseResults(raw, enrich, func(p string) (string, error) {
+		relative, err := filepath.Rel(source, p)
 		if err != nil || !filepath.IsLocal(relative) {
-			return out, errors.New("scanner source path escaped workspace")
+			return "", errors.New("scanner source path escaped workspace")
 		}
-		for _, pkg := range result.Packages {
-			c := pkg.Package
-			c.Path = filepath.ToSlash(relative)
-			if c.PURL == "" {
-				return out, errors.New("scanner omitted package identity")
-			}
-			out.Components = append(out.Components, c)
-			for _, raw := range pkg.Vulnerabilities {
-				var v struct {
-					ID       string `json:"id"`
-					Summary  string `json:"summary"`
-					Database struct {
-						Severity string `json:"severity"`
-					} `json:"database_specific"`
-					Affected []struct {
-						Package struct {
-							Name      string `json:"name"`
-							Ecosystem string `json:"ecosystem"`
-						} `json:"package"`
-						Ranges []struct {
-							Events []struct {
-								Fixed string `json:"fixed"`
-							} `json:"events"`
-						} `json:"ranges"`
-					} `json:"affected"`
-				}
-				if json.Unmarshal(raw, &v) != nil || v.ID == "" {
-					return out, errors.New("invalid advisory result")
-				}
-				severity := strings.ToLower(v.Database.Severity)
-				score := 20
-				for _, group := range pkg.Groups {
-					for _, id := range group.IDs {
-						if id == v.ID {
-							if cvss, err := strconv.ParseFloat(group.Max, 64); err == nil {
-								switch {
-								case cvss >= 9:
-									severity = "critical"
-								case cvss >= 7:
-									severity = "high"
-								case cvss >= 4:
-									severity = "medium"
-								case cvss > 0:
-									severity = "low"
-								}
-							}
-						}
-					}
-				}
-				switch severity {
-				case "critical":
-					score = 60
-				case "high":
-					score = 45
-				case "moderate", "medium":
-					severity = "medium"
-					score = 25
-				case "low":
-					score = 10
-				default:
-					severity = "unknown"
-				}
-				kind := "vulnerability"
-				if strings.HasPrefix(v.ID, "MAL-") {
-					kind = "malicious_dependency"
-					severity = "critical"
-					score = 100
-				}
-				fixed := []string{}
-				for _, affected := range v.Affected {
-					if affected.Package.Name != c.Name || affected.Package.Ecosystem != c.Ecosystem {
-						continue
-					}
-					for _, r := range affected.Ranges {
-						for _, event := range r.Events {
-							if event.Fixed != "" {
-								fixed = append(fixed, event.Fixed)
-							}
-						}
-					}
-				}
-				guidance, _ := json.Marshal(map[string]any{"summary": "Review the advisory and upgrade to a compatible fixed version; rerun the assessment.", "fixed_versions": fixed, "reference": "https://osv.dev/vulnerability/" + v.ID, "automatic_changes": false})
-				out.Findings = append(out.Findings, assessments.Finding{Type: kind, AdvisoryID: v.ID, Title: v.Summary, Severity: severity, Score: score, Component: c, Evidence: raw, Guidance: guidance})
-			}
-		}
+		return filepath.ToSlash(relative), nil
+	})
+	out.Components = append(out.Components, components...)
+	out.Findings = append(out.Findings, findings...)
+	if err != nil {
+		return out, err
 	}
 	if len(out.Components) == 0 || len(out.Components) > 20000 || len(out.Findings) > 10000 {
 		return out, errors.New("inventory empty or exceeded limits")
@@ -325,7 +232,14 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 	}
 	// Never expose ephemeral filesystem paths from the scanner's document.
 	out.SBOM = bytes.ReplaceAll(out.SBOM, []byte(source+string(os.PathSeparator)), []byte(""))
-	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}}
+	enrichStage := assessments.Stage{Name: "enrich", Status: "skipped", Detail: "KEV and EPSS feeds not available in this snapshot"}
+	if enrich != nil {
+		enrichStage.Status, enrichStage.Detail = "ok", fmt.Sprintf("CISA KEV (%d) and EPSS (%d) exploitation context", len(enrich.kev), len(enrich.epss))
+		if enrich.kev == nil || enrich.epss == nil {
+			enrichStage.Status = "partial"
+		}
+	}
+	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}, enrichStage}
 
 	return out, nil
 }
@@ -350,7 +264,16 @@ func reportsProblem(stderr string) bool {
 func (e Engine) Handler(token string) http.Handler {
 	expected := sha256.Sum256([]byte(token))
 	slots := make(chan struct{}, 1)
+	images := e.imageHandler(expected, slots)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/scan-image" {
+			if len(token) < 32 {
+				http.Error(w, "unauthorized", 401)
+				return
+			}
+			images.ServeHTTP(w, r)
+			return
+		}
 		if r.Method == "GET" && r.URL.Path == "/healthz" {
 			if _, err := pinnedFeed(e.Database); err != nil {
 				http.Error(w, "offline feeds unavailable", 503)
@@ -405,4 +328,146 @@ func (e Engine) Handler(token string) http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	})
+}
+
+// parseResults converts OSV-Scanner JSON into components and findings with
+// severity, exploitation context and package indicators. pathOf normalizes
+// each result's source path (workspace-relative or in-image).
+func (e Engine) parseResults(raw []byte, enrich *enrichment, pathOf func(string) (string, error)) (components []assessments.Component, findings []assessments.Finding, err error) {
+	var results struct {
+		Results []struct {
+			Source struct {
+				Path string `json:"path"`
+			} `json:"source"`
+			Packages []struct {
+				Package         assessments.Component `json:"package"`
+				Vulnerabilities []json.RawMessage     `json:"vulnerabilities"`
+				Groups          []struct {
+					IDs []string `json:"ids"`
+					Max string   `json:"max_severity"`
+				} `json:"groups"`
+			} `json:"packages"`
+		} `json:"results"`
+	}
+	if json.Unmarshal(raw, &results) != nil {
+		return nil, nil, errors.New("invalid scanner result")
+	}
+	purls := map[string][]Indicator{}
+	if e.Indicators != nil {
+		for _, i := range e.Indicators.Active("purl", time.Now()) {
+			purls[strings.ToLower(i.Value)] = append(purls[strings.ToLower(i.Value)], i)
+		}
+	}
+	for _, result := range results.Results {
+		relative, err := pathOf(result.Source.Path)
+		if err != nil {
+			return components, findings, err
+		}
+		for _, pkg := range result.Packages {
+			c := pkg.Package
+			c.Path = relative
+			if c.PURL == "" {
+				return components, findings, errors.New("scanner omitted package identity")
+			}
+			components = append(components, c)
+			for _, i := range purls[strings.ToLower(c.PURL)] {
+				f := contentFinding("ioc_match", i.ID, "Component matches active package indicator", c.Path, "")
+				f.Component = c
+				findings = append(findings, f)
+			}
+			for _, raw := range pkg.Vulnerabilities {
+				var v struct {
+					ID       string   `json:"id"`
+					Aliases  []string `json:"aliases"`
+					Summary  string   `json:"summary"`
+					Database struct {
+						Severity string `json:"severity"`
+					} `json:"database_specific"`
+					Affected []struct {
+						Package struct {
+							Name      string `json:"name"`
+							Ecosystem string `json:"ecosystem"`
+						} `json:"package"`
+						Ranges []struct {
+							Events []struct {
+								Fixed string `json:"fixed"`
+							} `json:"events"`
+						} `json:"ranges"`
+					} `json:"affected"`
+				}
+				if json.Unmarshal(raw, &v) != nil || v.ID == "" {
+					return components, findings, errors.New("invalid advisory result")
+				}
+				severity := strings.ToLower(v.Database.Severity)
+				score := 20
+				for _, group := range pkg.Groups {
+					for _, id := range group.IDs {
+						if id == v.ID {
+							if cvss, err := strconv.ParseFloat(group.Max, 64); err == nil {
+								switch {
+								case cvss >= 9:
+									severity = "critical"
+								case cvss >= 7:
+									severity = "high"
+								case cvss >= 4:
+									severity = "medium"
+								case cvss > 0:
+									severity = "low"
+								}
+							}
+						}
+					}
+				}
+				switch severity {
+				case "critical":
+					score = 60
+				case "high":
+					score = 45
+				case "moderate", "medium":
+					severity = "medium"
+					score = 25
+				case "low":
+					score = 10
+				default:
+					severity = "unknown"
+				}
+				kind := "vulnerability"
+				if strings.HasPrefix(v.ID, "MAL-") {
+					kind = "malicious_dependency"
+					severity = "critical"
+					score = 100
+				}
+				fixed := []string{}
+				for _, affected := range v.Affected {
+					if affected.Package.Name != c.Name || affected.Package.Ecosystem != c.Ecosystem {
+						continue
+					}
+					for _, r := range affected.Ranges {
+						for _, event := range r.Events {
+							if event.Fixed != "" {
+								fixed = append(fixed, event.Fixed)
+							}
+						}
+					}
+				}
+				// VUL-005: known exploitation raises priority; EPSS adds likelihood.
+				kev, epss := false, 0.0
+				if enrich != nil {
+					kev, epss = enrich.apply(append([]string{v.ID}, v.Aliases...))
+					if kev {
+						if severity != "critical" && kind == "vulnerability" {
+							severity = "high"
+						}
+						score = min(100, max(score, 45)+30)
+					}
+					if epss >= 0.5 {
+						score = min(100, score+10)
+					}
+				}
+				guidance, _ := json.Marshal(map[string]any{"summary": "Review the advisory and upgrade to a compatible fixed version; rerun the assessment.", "fixed_versions": fixed, "reference": "https://osv.dev/vulnerability/" + v.ID, "aliases": v.Aliases, "kev": kev, "epss": epss, "automatic_changes": false})
+				findings = append(findings, assessments.Finding{Type: kind, AdvisoryID: v.ID, Title: v.Summary, Severity: severity, Score: score, Component: c, Evidence: raw, Guidance: guidance})
+			}
+		}
+	}
+	return components, findings, nil
 }

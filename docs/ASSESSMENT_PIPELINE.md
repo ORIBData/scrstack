@@ -121,9 +121,13 @@ Deployed egress isolation and representative private-provider acceptance are sti
 
 Consequently successful execution can still return `incomplete`: independent YARA and full integrity coverage remain missing; absent/expired IOC bundles and unavailable or stale ClamAV also prevent complete coverage. Do not interpret incomplete as a clean repository.
 
-Verdict precedence is `fail` > `incomplete` > `warn` > `pass`. A critical, malware,
-malicious-dependency, IOC or integrity entry yields `fail` even when coverage is partial,
-so a CI gate must block on `fail` and must not treat `incomplete` as `pass`. Register
+Verdict precedence is `fail` > `incomplete` > `warn` > `pass`. Malware, malicious
+dependencies and IOC matches fail whether new or existing; a new critical
+vulnerability and a new high or critical integrity entry fail. "New" means absent
+from the previous successful scan of the same ref, or of the base branch for a
+pull request. An existing critical, a new high, a new medium integrity entry or an
+existing serious one warns. `fail` is reported even when coverage is partial, so a
+CI gate must block on `fail` and must not treat `incomplete` as `pass`. Register
 triage applies to the gate: unexpired `accepted`, `suppressed` and `false_positive`
 entries do not gate (counted under `counts.waived`), except that waived malicious
 content still yields at least `warn` (MAL-007). Assessment snapshots keep raw detections.

@@ -12,11 +12,11 @@ import (
 
 func TestWebhookSignatureAndEventValidation(t *testing.T) {
 	secret := strings.Repeat("x", 40)
-	handler := githubWebhook(nil, secret, true)
+	handler := newGitHubIngest(nil, secret, true, false).direct()
 	for _, tc := range []struct {
 		event, body, signature string
 		status                 int
-	}{{"push", `{}`, "bad", 401}, {"ping", `{}`, "valid", 200}, {"issues", `{}`, "valid", 422}, {"push", `{"ref":"refs/heads/main","repository":{"full_name":"org/repo"}}`, "valid", 400}, {"push", `{"ref":"refs/tags/v1.0.0","after":"` + strings.Repeat("a", 40) + `","repository":{"full_name":"org/repo"}}`, "valid", 200}} {
+	}{{"push", `{}`, "bad", 401}, {"ping", `{}`, "valid", 200}, {"issues", `{}`, "valid", 200}, {"push", `{"ref":"main"}`, "valid", 400}, {"push", `not json`, "valid", 400}} {
 		r := httptest.NewRequest("POST", BasePath+"/webhooks/github", strings.NewReader(tc.body))
 		r.Header.Set("X-GitHub-Delivery", uuid.NewString())
 		r.Header.Set("X-GitHub-Event", tc.event)
