@@ -212,20 +212,22 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// Change records (workflow changes, provider events) need human review and
 	// are never closed by absence.
 	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
 		if err != nil {
 			return err
 		}
 	}
-	// A newer import of the same tool closes what only that tool reports:
-	// Trivy misconfigurations and secrets, or one SARIF tool's code findings.
-	// Shared types (vulnerabilities) stay with SCRS's own complete scans.
-	if imp := a.Request.Import; imp != nil && a.Request.Target.Ref != "" {
-		types, tool := []string{"misconfiguration", "secret"}, ""
+	// Imported findings are closed only by a later import of the same tool
+	// whose caller declares it the tool's full result for this ref
+	// (replace_previous). A partial run, such as secrets only, must not mark
+	// the tool's other findings fixed. SCRS's own scans never close them:
+	// tools name the same issue differently (CVE versus GHSA ids).
+	if imp := a.Request.Import; imp != nil && imp.Replace && a.Request.Target.Ref != "" {
+		tool := ""
 		if imp.Format == "sarif" {
-			types, tool = []string{"code"}, imp.Tool
+			tool = imp.Tool
 		}
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND evidence->>'source'=$5 AND ($6='' OR lower(evidence->>'tool')=$6) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_import',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, types, imp.Format, tool)
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND evidence->>'source'=$4 AND ($5='' OR lower(evidence->>'tool')=$5) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_import',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, imp.Format, tool)
 		if err != nil {
 			return err
 		}

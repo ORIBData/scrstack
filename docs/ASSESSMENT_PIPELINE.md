@@ -157,10 +157,13 @@ do not apply to images; `integrity` says so in its detail.
 `POST /assessments:import` records a Trivy JSON or SARIF 2.1.0 report against a
 discovered asset revision (`target.commit` required). The assessment has one
 stage, `import`, and no SBOM. Findings join the register (`misconfiguration`,
-`secret` and `code` types are import-only) and gate like SCRS findings. A newer
-import from the same tool closes that tool's import-only findings. Imports never
-close vulnerabilities, never serve as a baseline for SCRS scans and never count
-as last-known-good. Trivy secret matches are discarded; only rule, file and line
+`secret` and `code` types are import-only) and gate like SCRS findings. Imported
+findings are closed only by a later import of the same tool for the same ref
+sent with `replace_previous: true`, which declares the report the tool's full
+result; a partial run (secrets only, say) must leave it `false`. SCRS's own
+scans never close imported findings, because tools name the same issue
+differently (CVE versus GHSA ids). Imports never close SCRS findings, never
+serve as a baseline for SCRS scans and never count as last-known-good. Trivy secret matches are discarded; only rule, file and line
 are kept.
 
 ## Git history mirrors

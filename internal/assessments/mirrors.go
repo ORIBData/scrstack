@@ -108,6 +108,14 @@ func (s *Store) ClaimMirror(ctx context.Context) (Mirror, error) {
 		return Mirror{}, err
 	}
 	m, err := scanMirror(tx.QueryRow(ctx, `UPDATE `+s.schema+`.asset_mirrors SET status='running',lease=$1,lease_until=clock_timestamp()+interval '30 minutes' WHERE id=(SELECT id FROM `+s.schema+`.asset_mirrors WHERE status='queued' ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING `+mirrorColumns, uuid.New()))
+	if errors.Is(err, ErrNotFound) {
+		// Commit the expiry above even when nothing is queued; otherwise a
+		// mirror whose worker died would stay running and block its asset.
+		if err := tx.Commit(ctx); err != nil {
+			return m, err
+		}
+		return m, ErrNotFound
+	}
 	if err != nil {
 		return m, err
 	}

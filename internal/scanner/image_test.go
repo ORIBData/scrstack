@@ -250,3 +250,34 @@ func TestImageLayerContentScan(t *testing.T) {
 		}
 	}
 }
+
+// A layer that expands far beyond its compressed size must stop at the byte
+// budget and report partial coverage, never ok.
+func TestImageLayerBudget(t *testing.T) {
+	image, err := mutate.AppendLayers(empty.Image, layerOf(t, map[string]string{"big.bin": strings.Repeat("\x00", 4<<20)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := filepath.Join(t.TempDir(), "image.tar")
+	ref, _ := name.NewTag("registry.example/bomb:scrs")
+	if err := tarball.WriteToFile(archive, ref, image); err != nil {
+		t.Fatal(err)
+	}
+	_, _, stages := Engine{ClamdAddress: contentClamd(t), MaxLayerBytes: 1 << 20}.scanLayers(context.Background(), archive)
+	for _, s := range stages {
+		if s.Name == "malware" && s.Status != "partial" {
+			t.Fatal("over-budget layer reported", s)
+		}
+		if s.Name == "integrity" && !strings.Contains(s.Detail, "limit exceeded") {
+			t.Fatal("budget not reported", s)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, stages = Engine{ClamdAddress: contentClamd(t)}.scanLayers(ctx, archive)
+	for _, s := range stages {
+		if s.Name == "malware" && s.Status == "ok" {
+			t.Fatal("cancelled scan reported ok")
+		}
+	}
+}

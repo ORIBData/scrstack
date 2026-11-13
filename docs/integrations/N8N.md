@@ -71,10 +71,10 @@ Use `/assessments:batch` for up to 100 targets in one call. For an image, send
 
 GitHub's HMAC covers the exact bytes it sent, so the relay must forward the
 **unchanged body** and the `X-GitHub-Event`, `X-GitHub-Delivery` and
-`X-Hub-Signature-256` headers. When the signature is forwarded, SCRS verifies
-it against `SCRS_GITHUB_WEBHOOK_SECRET`, so neither n8n nor anything between
-it and GitHub can alter or forge events. Without the header, the relay token
-alone is trusted.
+`X-Hub-Signature-256` headers. When the signature is forwarded and
+`SCRS_GITHUB_WEBHOOK_SECRET` is configured, SCRS verifies it, so neither n8n
+nor anything between it and GitHub can alter or forge events. Without the
+header or without the secret, the relay token alone is trusted.
 
 - **Webhook node:** HTTP method `POST`, Respond `Immediately`, and enable the
   **Raw Body** option so the original bytes are kept as binary.
@@ -99,8 +99,11 @@ Equivalent without n8n: point a second organization webhook straight at
 GitLab group webhooks (Push, Tag push and Merge request events) can call
 `/scrs/v1/ingest/gitlab` directly with the "Secret token" set to
 `SCRS_GITLAB_WEBHOOK_SECRET`, or go through `scrs-gitlab-relay.json`, which
-forwards `X-Gitlab-Event`, `X-Gitlab-Event-UUID` and `X-Gitlab-Token` (verified
-by SCRS). The event UUID is the idempotency key. GitLab does not report force
+forwards `X-Gitlab-Event`, `Idempotency-Key`, `X-Gitlab-Event-UUID` and
+`X-Gitlab-Token` (verified by SCRS when the secret is configured). GitLab's
+`Idempotency-Key` is the idempotency key, since it is stable across retries of
+one delivery; the event UUID, which recursive hooks share, is the fallback for
+GitLab versions that do not send it. GitLab does not report force
 pushes; deletions, branch churn, mass deletions and pattern matches still alert.
 
 ### Container registries

@@ -84,8 +84,11 @@ func TestRelayVerifiesForwardedSignatures(t *testing.T) {
 	r.Header.Set("X-Gitlab-Token", "anything")
 	w := httptest.NewRecorder()
 	g.relay("gitlab").ServeHTTP(w, r)
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatal("unverifiable forwarded token must not pass", w.Code)
+	// With no provider secret configured the forwarded value cannot be
+	// checked: the relay token alone decides, and processing continues to
+	// header validation instead of breaking relays that forward it.
+	if w.Code != http.StatusBadRequest {
+		t.Fatal("relay without a configured provider secret should rely on the token", w.Code)
 	}
 	w = httptest.NewRecorder()
 	g.direct("gitlab").ServeHTTP(w, httptest.NewRequest("POST", "/", strings.NewReader(`{}`)))

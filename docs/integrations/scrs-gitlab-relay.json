@@ -35,6 +35,10 @@
               "value": "={{ $json.headers['x-gitlab-event'] }}"
             },
             {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.headers['idempotency-key'] || '' }}"
+            },
+            {
               "name": "X-Gitlab-Event-UUID",
               "value": "={{ $json.headers['x-gitlab-event-uuid'] }}"
             },
@@ -67,7 +71,7 @@
         260,
         0
       ],
-      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. SCRS verifies the forwarded X-Gitlab-Token against SCRS_GITLAB_WEBHOOK_SECRET. The event UUID is the idempotency key.",
+      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. SCRS verifies the forwarded X-Gitlab-Token against SCRS_GITLAB_WEBHOOK_SECRET when it is configured. GitLab's Idempotency-Key is the idempotency key; the event UUID is the fallback.",
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000

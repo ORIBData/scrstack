@@ -33,6 +33,8 @@ type Engine struct {
 	ClamdAddress, IndicatorFile string
 	// MaxImageBytes caps a streamed image archive (SCRS_MAX_IMAGE_BYTES).
 	MaxImageBytes int64
+	// MaxLayerBytes caps uncompressed layer bytes inspected per image (default 8 GiB).
+	MaxLayerBytes int64
 }
 type Output struct {
 	Files      []FileEvidence          `json:"files"`

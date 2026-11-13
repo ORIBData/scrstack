@@ -71,13 +71,29 @@ func (e Engine) scanLayers(ctx context.Context, archivePath string) ([]FileEvide
 		return files, scan.findings, scan.stages()
 	}
 	total := 0
+	// Evidence lists flagged files only, keyed by path and digest.
+	flagged := map[string]int{}
+	flag := func(record FileEvidence) {
+		key := record.Path + "\x00" + record.SHA256
+		if _, ok := flagged[key]; !ok && len(files) < 10000 {
+			flagged[key] = len(files)
+			files = append(files, record)
+		}
+	}
+	// Layers are attacker-controlled and compress well: bound the bytes read
+	// after decompression and stop mid-file when the deadline passes.
+	budget := &budgetReader{ctx: ctx, remaining: e.MaxLayerBytes}
+	if budget.remaining <= 0 {
+		budget.remaining = 8 << 30
+	}
 	walk := func(layer v1.Layer) error {
 		rc, err := layer.Uncompressed()
 		if err != nil {
 			return err
 		}
 		defer rc.Close()
-		reader := tar.NewReader(rc)
+		budget.r = rc
+		reader := tar.NewReader(budget)
 		for {
 			h, err := reader.Next()
 			if err == io.EOF {
@@ -97,25 +113,56 @@ func (e Engine) scanLayers(ctx context.Context, archivePath string) ([]FileEvide
 				return errors.New("image file limit exceeded")
 			}
 			before := len(scan.findings)
-			record, err := scan.file(ctx, name, h.Size, reader)
+			record, err := scan.file(name, h.Size, reader)
 			if err != nil {
 				return err
 			}
-			if (record.Malware != "clean" && record.Malware != "skipped") || len(scan.findings) != before {
-				if len(files) < 10000 {
-					files = append(files, record)
-				}
+			if record.Malware == "skipped_oversize" || len(scan.findings) != before {
+				flag(record)
 			}
 		}
 	}
+	var walkErr error
 	for _, layer := range layers {
-		if err := walk(layer); err != nil {
-			scan.incomplete("Layer inspection did not complete: " + err.Error())
-			return files, scan.findings, scan.stages()
+		if walkErr = walk(layer); walkErr != nil {
+			break
 		}
+	}
+	scan.finish(func(f FileEvidence) {
+		if i, ok := flagged[f.Path+"\x00"+f.SHA256]; ok {
+			files[i].Malware = f.Malware
+		} else if f.Malware != "clean" {
+			flag(f)
+		}
+	})
+	if walkErr != nil {
+		scan.incomplete("Layer inspection did not complete: " + walkErr.Error())
+		return files, scan.findings, scan.stages()
 	}
 	scan.malware.Detail += fmt.Sprintf("; %d files across %d layers", total, len(layers))
 	return files, scan.findings, scan.stages()
+}
+
+// budgetReader fails once its byte budget is spent or its context ends.
+type budgetReader struct {
+	ctx       context.Context
+	r         io.Reader
+	remaining int64
+}
+
+func (b *budgetReader) Read(p []byte) (int, error) {
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if b.remaining <= 0 {
+		return 0, errors.New("uncompressed layer size limit exceeded")
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
 }
 
 // inventoryImage runs the OSV-Scanner half of RunImage.

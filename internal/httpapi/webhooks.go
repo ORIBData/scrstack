@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,8 @@ func newGitHubIngest(store *assessments.Store, secret string, remediation, relay
 	}
 	return &githubIngest{store: store, secret: secret, gitlabSecret: os.Getenv("SCRS_GITLAB_WEBHOOK_SECRET"), remediation: remediation, relayEnabled: relay, massDeletion: threshold, slots: make(chan struct{}, 8)}
 }
+
+var deliveryID = regexp.MustCompile(`^[A-Za-z0-9._:-]{8,128}$`)
 
 var webhookActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:github-webhook"))
 var gitlabActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:gitlab-webhook"))
@@ -111,16 +114,15 @@ func (g *githubIngest) relay(provider string) http.Handler {
 		if !ok {
 			return
 		}
-		forwarded, secret, valid := r.Header.Get("X-Hub-Signature-256") != "", g.secret, false
+		forwarded, secret := r.Header.Get("X-Hub-Signature-256") != "", g.secret
 		if provider == "gitlab" {
 			forwarded, secret = r.Header.Get("X-Gitlab-Token") != "", g.gitlabSecret
 		}
-		if forwarded {
-			if len(secret) < 32 {
-				writeError(w, 503, "forwarded provider signature cannot be verified; configure the "+provider+" webhook secret")
-				return
-			}
-			valid = g.verifyGitHub(r, body)
+		// The relay token already authenticates the caller. When SCRS also
+		// holds the provider secret, a forwarded signature must be valid; with
+		// no secret configured it cannot be checked and is ignored.
+		if forwarded && len(secret) >= 32 {
+			valid := g.verifyGitHub(r, body)
 			if provider == "gitlab" {
 				valid = g.verifyGitLab(r)
 			}
@@ -210,14 +212,15 @@ type githubPayload struct {
 }
 
 func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []byte, provider, mode string, actor uuid.UUID, actorName string) {
-	var delivery uuid.UUID
+	var delivery string
 	var event string
 	var p githubPayload
-	var err error
 	if provider == "gitlab" {
-		delivery, err = uuid.Parse(firstNonEmpty(r.Header.Get("X-Gitlab-Event-UUID"), r.Header.Get("Idempotency-Key")))
-		if err != nil {
-			writeError(w, 400, "valid X-Gitlab-Event-UUID required")
+		// Idempotency-Key is stable across GitLab's retries of one delivery.
+		// X-Gitlab-Event-UUID is shared by recursive hooks, so it is the fallback.
+		delivery = firstNonEmpty(r.Header.Get("Idempotency-Key"), r.Header.Get("X-Gitlab-Event-UUID"))
+		if !deliveryID.MatchString(delivery) {
+			writeError(w, 400, "Idempotency-Key or X-Gitlab-Event-UUID header required")
 			return
 		}
 		var ok bool
@@ -230,10 +233,12 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 			return
 		}
 	} else {
-		if delivery, err = uuid.Parse(r.Header.Get("X-GitHub-Delivery")); err != nil {
+		parsed, err := uuid.Parse(r.Header.Get("X-GitHub-Delivery"))
+		if err != nil {
 			writeError(w, 400, "valid delivery ID required")
 			return
 		}
+		delivery = parsed.String()
 		event = r.Header.Get("X-GitHub-Event")
 		if event == "ping" {
 			writeJSON(w, 200, map[string]string{"status": "ok"})
@@ -330,7 +335,7 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 			signals = append(signals, assessments.IntegrityEvent{Kind: "org_" + p.Action, Severity: "high", Title: "Organization " + strings.ReplaceAll(p.Action, "_", " "), Repository: p.Organization.Login, Actor: claimed, Details: map[string]any{"member": p.Membership.User.Login, "role": p.Membership.Role}})
 		}
 	}
-	recorded, err := g.store.RecordIntegrity(ctx, delivery.String(), actor, body, mode, storedEvent(provider, event), signals)
+	recorded, err := g.store.RecordIntegrity(ctx, delivery, actor, body, mode, storedEvent(provider, event), signals)
 	if err != nil {
 		assessmentError(w, err)
 		return
@@ -341,9 +346,9 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 	}
 	request.Trigger.Origin = provider + "_" + mode
 	request.Trigger.Event = event
-	request.Trigger.DeliveryID = delivery.String()
+	request.Trigger.DeliveryID = delivery
 	request.Trigger.Actor = truncate(claimed, 100)
-	a, replay, err := g.store.EnqueueEvent(ctx, *request, actor, actorName, delivery.String(), body, mode, storedEvent(provider, event))
+	a, replay, err := g.store.EnqueueEvent(ctx, *request, actor, actorName, delivery, body, mode, storedEvent(provider, event))
 	if errors.Is(err, assessments.ErrScope) {
 		// AST-004: events for undiscovered or out-of-scope repositories are
 		// acknowledged, never scanned. Integrity signals above still alert.

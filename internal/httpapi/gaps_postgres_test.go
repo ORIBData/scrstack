@@ -150,6 +150,16 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 	if queued.Request.Target.Provider != "gitlab" || queued.Request.Target.Repository != "team/platform/app" || queued.Request.Trigger.Origin != "gitlab_direct" {
 		t.Fatal("GitLab push not normalized", queued.Request)
 	}
+	// GitLab retries reuse Idempotency-Key (not a UUID) while recursive hooks
+	// share X-Gitlab-Event-UUID: the key decides.
+	other := strings.Replace(created, sha, strings.Repeat("9", 40), 1)
+	shared := uuid.NewString()
+	retry := map[string]string{"X-Gitlab-Token": gitlabSecret, "X-Gitlab-Event": "Push Hook", "X-Gitlab-Event-UUID": shared, "Idempotency-Key": strings.Repeat("ab", 32)}
+	must(call(handler, "POST", "/ingest/gitlab", "", other, retry), 202)
+	must(call(handler, "POST", "/ingest/gitlab", "", other, retry), 200)
+	third := strings.Replace(created, sha, strings.Repeat("8", 40), 1)
+	must(call(handler, "POST", "/ingest/gitlab", "", third, map[string]string{"X-Gitlab-Token": gitlabSecret, "X-Gitlab-Event": "Push Hook", "X-Gitlab-Event-UUID": shared, "Idempotency-Key": strings.Repeat("cd", 32)}), 202)
+	must(call(handler, "POST", "/ingest/gitlab", "", third, map[string]string{"X-Gitlab-Token": gitlabSecret, "X-Gitlab-Event": "Push Hook"}), 400)
 	deleted := `{"object_kind":"push","ref":"refs/heads/tmp","before":"` + sha + `","after":"` + zero + `","user_username":"dev","project":{"path_with_namespace":"team/platform/app","default_branch":"main"},"commits":[]}`
 	var outcome struct {
 		Status  string `json:"status"`
@@ -195,12 +205,18 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 
 	// Imports: Trivy into the register and gate; secrets never stored.
 	commit := strings.Repeat("e", 40)
+	replace := "false"
 	trivy := func(misconfig bool) string {
 		results := `{"Target":"package-lock.json","Type":"npm","Vulnerabilities":[{"VulnerabilityID":"CVE-2024-9","PkgName":"lodash","InstalledVersion":"4.17.0","FixedVersion":"4.17.21","Severity":"CRITICAL","Title":"pp","PkgIdentifier":{"PURL":"pkg:npm/lodash@4.17.0"}}]},{"Target":".env","Secrets":[{"RuleID":"aws-access-key-id","Severity":"HIGH","Title":"AWS key","StartLine":2,"Match":"AKIAIOSFODNN7EXAMPLE"}]}`
 		if misconfig {
 			results += `,{"Target":"Dockerfile","Misconfigurations":[{"ID":"DS002","Title":"root","Severity":"HIGH","Status":"FAIL"}]}`
 		}
-		return `{"target":{"type":"git","repository":"org/api","ref":"main","commit":"` + commit + `"},"format":"trivy","report":{"SchemaVersion":2,"Results":[` + results + `]}}`
+		return `{"target":{"type":"git","repository":"org/api","ref":"main","commit":"` + commit + `"},"format":"trivy","replace_previous":` + replace + `,"report":{"SchemaVersion":2,"Results":[` + results + `]}}`
+	}
+	status := func(advisory string) string {
+		var v string
+		_ = pool.QueryRow(ctx, "SELECT status FROM "+schema+".findings WHERE advisory_id=$1", advisory).Scan(&v)
+		return v
 	}
 	must(call(handler, "POST", "/assessments:import", reader, trivy(true), nil), 403)
 	must(call(handler, "POST", "/assessments:import", writer, `{"target":{"type":"git","repository":"org/api","ref":"main"},"format":"trivy","report":{"SchemaVersion":2}}`, nil), 400)
@@ -223,20 +239,53 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 			t.Fatal("import left claimable")
 		}
 	}
-	// A newer Trivy import without the misconfiguration closes it, but never
-	// closes the shared vulnerability type.
+	// A partial Trivy run (no misconfiguration scan) must not mark the
+	// earlier misconfiguration fixed.
 	must(call(handler, "POST", "/assessments:import", writer, trivy(false), nil), 201)
-	var misconfig, vuln string
-	_ = pool.QueryRow(ctx, "SELECT status FROM "+schema+".findings WHERE advisory_id='DS002'").Scan(&misconfig)
-	_ = pool.QueryRow(ctx, "SELECT status FROM "+schema+".findings WHERE advisory_id='CVE-2024-9'").Scan(&vuln)
-	if misconfig != "fixed" || vuln != "open" {
-		t.Fatal("import closure wrong", misconfig, vuln)
+	if status("DS002") != "open" {
+		t.Fatal("partial import closed another scanner's finding", status("DS002"))
 	}
+	// A complete SCRS scan of the ref never closes imported findings: SCRS
+	// and Trivy name the same issue differently.
+	scan := assessments.Request{Target: assessments.Target{Type: "git", Repository: "org/api", Ref: "main", Commit: commit}}
+	if _, _, err := jobs.Enqueue(ctx, scan, uuid.New(), "qa", ""); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		claimed, err := jobs.Claim(ctx)
+		if err != nil {
+			break
+		}
+		if claimed.Request.Target.Repository != "org/api" {
+			_ = jobs.Fail(ctx, claimed, "not under test", false)
+			continue
+		}
+		sbom := assessments.Hash([]byte("sbom"))
+		var all []assessments.Stage
+		for _, n := range []string{"resolve", "fetch", "inventory", "sbom", "match_vuln", "match_malicious", "malware", "yara", "ioc", "integrity"} {
+			all = append(all, assessments.Stage{Name: n, Status: "ok"})
+		}
+		if err := jobs.Complete(ctx, claimed, assessments.Result{Commit: commit, Stages: all, Components: []assessments.Component{{Name: "x", PURL: "pkg:npm/x@1"}}, SBOMKey: "sbom/" + sbom + ".cdx.json", SBOMSHA256: sbom}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if status("CVE-2024-9") != "open" || status("aws-access-key-id") != "open" {
+		t.Fatal("SCRS scan closed imported findings", status("CVE-2024-9"), status("aws-access-key-id"))
+	}
+	// Declared complete, the next Trivy import closes what it no longer reports.
+	replace = "true"
+	must(call(handler, "POST", "/assessments:import", writer, trivy(false), nil), 201)
+	if status("DS002") != "fixed" || status("CVE-2024-9") != "open" {
+		t.Fatal("replace_previous closure wrong", status("DS002"), status("CVE-2024-9"))
+	}
+	replace = "false"
 	sarif := `{"target":{"type":"git","repository":"org/api","ref":"main","commit":"` + commit + `"},"format":"sarif","report":{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Semgrep","rules":[{"id":"r1","properties":{"security-severity":"7.5"}}]}},"results":[{"ruleId":"r1","message":{"text":"x"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"a.go"},"region":{"startLine":3}}}]}]}]}}`
 	decode(must(call(handler, "POST", "/assessments:import", writer, sarif, nil), 201), &imported)
 	if imported.Verdict != "warn" || imported.Request.Import.Tool != "semgrep" {
 		t.Fatal("SARIF high finding should warn", imported.Verdict, imported.Request.Import)
 	}
+	// Callers cannot claim origins SCRS assigns to provider events.
+	must(call(handler, "POST", "/assessments", writer, `{"target":{"type":"git","repository":"org/api","ref":"main"},"trigger":{"origin":"github_direct"}}`, nil), 400)
 	// The internal import marker cannot be injected through a normal trigger.
 	decode(must(call(handler, "POST", "/assessments", writer, `{"target":{"type":"git","repository":"org/api","ref":"main"},"import":{"format":"trivy","tool":"x"}}`, nil), 202), &queued)
 	if queued.Request.Import != nil || queued.Status != "queued" {
@@ -307,4 +356,20 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 	if n, err := jobs.ScheduleMirrors(ctx, time.Nanosecond); err != nil || n != 1 {
 		t.Fatal("stale labelled mirror not scheduled", n, err)
 	}
+	// A mirror whose worker died is released even when nothing else is
+	// queued, so the asset can be mirrored again.
+	dead, err := jobs.ClaimMirror(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "UPDATE "+schema+".asset_mirrors SET lease_until=clock_timestamp()-interval '1 minute' WHERE id=$1", dead.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.ClaimMirror(ctx); err != assessments.ErrNotFound {
+		t.Fatal("expected empty queue", err)
+	}
+	if got, err := jobs.GetMirror(ctx, gh, dead.ID); err != nil || got.Status != "failed" {
+		t.Fatal("expired mirror still blocks its asset", got.Status, err)
+	}
+	must(call(handler, "POST", "/assets/"+gh.String()+"/mirrors", writer, "", nil), 202)
 }

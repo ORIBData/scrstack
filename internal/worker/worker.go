@@ -260,7 +260,13 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if a.Request.Target.PullRequest != nil {
 		ref = ""
 	}
-	archive, commit, moved, err := source.Snapshot(ctx, c, secret, a.Request.Target.Repository, ref, revision)
+	// Fetch by the locator discovery recorded: requests are lowercased, and
+	// not every git host resolves paths case-insensitively.
+	asset, err := w.Connections.Asset(ctx, a.AssetID)
+	if err != nil {
+		return assessments.ErrScope
+	}
+	archive, commit, moved, err := source.Snapshot(ctx, c, secret, asset.Locator, ref, revision)
 	if err != nil {
 		return err
 	}

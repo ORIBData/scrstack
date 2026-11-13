@@ -834,8 +834,8 @@ paths:
         - `trivy`: Trivy JSON (`SchemaVersion: 2`): vulnerabilities, misconfigurations, secrets. Secret values are discarded.
         - `sarif`: SARIF 2.1.0 from Semgrep, CodeQL and similar tools, as `code` findings. Severity comes from `security-severity`, else from `level`.
 
-        A newer import from the same tool closes that tool's misconfiguration, secret or code findings. Imports never close vulnerabilities and never serve as a baseline or last-known-good.
-        Body limit 16 MiB. Scope `write` or `trigger`.
+        Imported findings are closed only by a later import of the same tool (same SARIF tool name) for the same ref with `replace_previous: true`, which declares the report the tool's full result: findings it no longer lists are marked fixed. Leave it `false` for partial runs such as secrets only. SCRS's own scans never close imported findings, and imports never close SCRS findings or serve as a baseline or last-known-good.
+        Body limit 16 MiB; two imports are processed at a time, others get `429` with `Retry-After`. Scope `write` or `trigger`.
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
         required: true
@@ -850,6 +850,7 @@ paths:
                 connection: {type: string}
                 format: {type: string, enum: [trivy, sarif]}
                 notify: {type: array, maxItems: 10, items: {type: string}}
+                replace_previous: {type: boolean, default: false, description: This report is the tool's full result for the ref; the tool's earlier findings absent from it are marked fixed}
                 report: {type: object, description: The unmodified Trivy JSON or SARIF document}
             example:
               target: {type: git, repository: acme/api, ref: main, commit: 0123456789abcdef0123456789abcdef01234567}
@@ -997,7 +998,7 @@ paths:
       operationId: ingestGitHub
       summary: GitHub events (direct or relay)
       description: |
-        Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified too.
+        Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified when `SCRS_GITHUB_WEBHOOK_SECRET` is configured; otherwise the relay token alone is trusted.
         `push` and `pull_request` (opened, synchronize, reopened) queue assessments. `push`, `delete`, `create`, `repository`, `member` and `organization` raise integrity alerts (force push, deletions, branch churn, mass deletion, visibility and membership changes, campaign patterns). Other events return `200`.
       security: [{}, {bearerAuth: []}]
       parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
@@ -1016,12 +1017,13 @@ paths:
       operationId: ingestGitLab
       summary: GitLab events (direct or relay)
       description: |
-        Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified too.
-        `X-Gitlab-Event-UUID` is the idempotency key. Push Hook and Merge Request Hook (open, reopen, update with new commits) queue assessments. Pushes raise ref-deletion, branch-churn, mass-deletion and pattern alerts. Tag pushes raise alerts only. Other hooks return `200`.
+        Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified when the secret is configured, otherwise the relay token alone is trusted.
+        GitLab's `Idempotency-Key` header (stable across retries of one delivery) is the idempotency key; `X-Gitlab-Event-UUID`, which recursive hooks share, is the fallback. One of the two is required. Push Hook and Merge Request Hook (open, reopen, update with new commits) queue assessments. Pushes raise ref-deletion, branch-churn, mass-deletion and pattern alerts. Tag pushes raise alerts only. Other hooks return `200`.
       security: [{}, {bearerAuth: []}]
       parameters:
         - {name: X-Gitlab-Event, in: header, required: true, schema: {type: string, enum: [Push Hook, Tag Push Hook, Merge Request Hook]}}
-        - {name: X-Gitlab-Event-UUID, in: header, required: true, schema: {type: string, format: uuid}}
+        - {name: Idempotency-Key, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}, description: Sent by GitLab 17.4 and later; preferred delivery id}
+        - {name: X-Gitlab-Event-UUID, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}, description: Delivery id when `Idempotency-Key` is absent}
         - {name: X-Gitlab-Token, in: header, schema: {type: string}, description: Shared secret (required in direct mode)}
       requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
@@ -1592,7 +1594,7 @@ components:
       additionalProperties: false
       description: Who triggered the assessment and why. Echoed in outbound events; never affects the scan.
       properties:
-        origin: {type: string, maxLength: 100, example: n8n}
+        origin: {type: string, maxLength: 100, example: n8n, description: 'Your system name. Values SCRS assigns itself are rejected with `400`: `replay`, `scheduler` and anything starting with `github_`, `gitlab_`, `registry_` or `import_`'}
         event: {type: string, maxLength: 100, example: release.requested}
         delivery_id: {type: string, maxLength: 128, description: Caller's event or execution id}
         actor: {type: string, maxLength: 100, description: Claimed human or bot behind the request}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -146,6 +147,10 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if input.Remediation != nil {
 				writeError(w, 400, "use the scoped remediation endpoint")
+				return
+			}
+			if reservedOrigin.MatchString(input.Trigger.Origin) {
+				writeError(w, 400, "trigger.origin is reserved; use your own system name")
 				return
 			}
 			input.AutoRemediation = h.remediationEnabled
@@ -520,6 +525,10 @@ func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *
 			results = append(results, map[string]any{"index": i, "status": 400, "error": "use the scoped remediation endpoint"})
 			continue
 		}
+		if reservedOrigin.MatchString(item.Request.Trigger.Origin) {
+			results = append(results, map[string]any{"index": i, "status": 400, "error": "trigger.origin is reserved; use your own system name"})
+			continue
+		}
 		item.Request.AutoRemediation = h.remediationEnabled
 		a, replayed, err := h.store.Enqueue(batchCtx, item.Request, principal.ID, principal.Name, item.IdempotencyKey)
 		if err != nil {
@@ -537,6 +546,12 @@ func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *
 	writeJSON(w, 207, map[string]any{"items": results})
 }
 
+var importSlots = make(chan struct{}, 2)
+
+// reservedOrigin matches trigger origins SCRS assigns itself. API callers may
+// not claim them, so the audit trail can tell a provider event from a request.
+var reservedOrigin = regexp.MustCompile(`^(github|gitlab|registry|import)_|^(replay|scheduler)$`)
+
 // importReport records a Trivy or SARIF report as a completed assessment.
 func (h assessmentHandler) importReport(w http.ResponseWriter, r *http.Request, principal connections.Token) {
 	var input struct {
@@ -544,7 +559,17 @@ func (h assessmentHandler) importReport(w http.ResponseWriter, r *http.Request, 
 		Connection string             `json:"connection"`
 		Format     string             `json:"format"`
 		Notify     []string           `json:"notify"`
+		Replace    bool               `json:"replace_previous"`
 		Report     json.RawMessage    `json:"report"`
+	}
+	// Each import holds its report (up to 16 MiB) several times in memory.
+	select {
+	case importSlots <- struct{}{}:
+		defer func() { <-importSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, 429, "import capacity exceeded; retry shortly")
+		return
 	}
 	// Reports up to 16 MiB need longer than the server's default read timeout.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -557,7 +582,7 @@ func (h assessmentHandler) importReport(w http.ResponseWriter, r *http.Request, 
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
 	request := assessments.Request{Target: input.Target, Connection: input.Connection, Notify: input.Notify}
-	a, replayed, err := h.store.Import(ctx, request, principal.ID, principal.Name, r.Header.Get("Idempotency-Key"), input.Format, input.Report)
+	a, replayed, err := h.store.Import(ctx, request, principal.ID, principal.Name, r.Header.Get("Idempotency-Key"), input.Format, input.Replace, input.Report)
 	if err != nil {
 		if errors.Is(err, assessments.ErrInput) && err != assessments.ErrInput {
 			writeError(w, 400, err.Error())

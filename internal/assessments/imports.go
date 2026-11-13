@@ -17,6 +17,9 @@ type ImportSource struct {
 	Format      string `json:"format"`
 	Tool        string `json:"tool"`
 	ToolVersion string `json:"tool_version,omitempty"`
+	// Replace declares this report the tool's full result for the ref, so
+	// the same tool's findings absent from it are marked fixed.
+	Replace bool `json:"replace_previous,omitempty"`
 }
 
 var severityScore = map[string]int{"critical": 60, "high": 45, "medium": 25, "low": 10, "unknown": 0}
@@ -255,10 +258,15 @@ func sarifSeverity(score, level string) string {
 // in-scope asset revision. Imported findings join the risk register and gate
 // like SCRS findings, but an import never closes register entries and never
 // serves as a baseline: it did not observe the whole revision.
-func (s *Store) Import(ctx context.Context, request Request, actor uuid.UUID, name, key, format string, report []byte) (Assessment, bool, error) {
+func (s *Store) Import(ctx context.Context, request Request, actor uuid.UUID, name, key, format string, replace bool, report []byte) (Assessment, bool, error) {
 	src, components, findings, err := ParseReport(format, report)
 	if err != nil {
 		return Assessment{}, false, err
+	}
+	// Tool names come from the report; keep them printable in stage details.
+	src.Tool, src.ToolVersion, src.Replace = clean(src.Tool, 64), clean(src.ToolVersion, 64), replace
+	if src.Tool == "" {
+		src.Tool = format
 	}
 	if len(components) > 20000 || len(findings) > 10000 {
 		return Assessment{}, false, fmt.Errorf("%w: report exceeds 20000 components or 10000 findings", ErrInput)

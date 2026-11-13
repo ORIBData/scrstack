@@ -10,8 +10,8 @@ window.addEventListener('load', function () {
     filter: true,
     displayOperationId: true,
     displayRequestDuration: true,
-    // Keeps the bearer token across reloads in this browser only.
-    persistAuthorization: true,
+    // Tokens are long-lived secrets: never keep them in browser storage.
+    persistAuthorization: false,
     tryItOutEnabled: false
   });
 });

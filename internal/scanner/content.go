@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
@@ -172,18 +173,92 @@ func newIndicatorSet(b IndicatorBundle, now time.Time) indicatorSet {
 // contentScan holds one assessment's malware, YARA, IOC and integrity state.
 // Repository walks and image layer streams feed it one file at a time.
 type contentScan struct {
+	ctx                           context.Context
 	address                       string
 	set                           indicatorSet
 	malware, yara, ioc, integrity assessments.Stage
 	findings                      []assessments.Finding
-	// verdicts caches clamd results by content digest; image layers repeat files.
+	// Files are streamed to clamd by a few workers; one file at a time made
+	// large repositories and images exceed their time budget. verdicts holds
+	// results by content digest (guarded by mu), queued the digests submitted,
+	// and pending the files awaiting a verdict until finish.
+	mu       sync.Mutex
 	verdicts map[string]string
+	queued   map[string]bool
+	pending  []FileEvidence
+	jobs     chan clamJob
+	wg       sync.WaitGroup
 	// image disables repository-only rules (workflows, hooks, root helpers).
 	image bool
 }
 
+type clamJob struct {
+	sha  string
+	data []byte
+}
+
+// clamWorkers stays well below clamd's default MaxThreads (10).
+const clamWorkers = 4
+
+// submit queues one distinct content for a malware verdict. It blocks while
+// all workers are busy, which bounds the file data held in memory.
+func (c *contentScan) submit(sha string, data []byte) {
+	if c.queued[sha] {
+		return
+	}
+	c.queued[sha] = true
+	if c.jobs == nil {
+		c.jobs = make(chan clamJob)
+		for i := 0; i < clamWorkers; i++ {
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				for job := range c.jobs {
+					verdict := "clean"
+					if sig, err := clamd(c.ctx, c.address, bytes.NewReader(job.data)); err != nil {
+						verdict = "error"
+					} else if sig != "" {
+						verdict = "infected:" + sig
+					}
+					c.mu.Lock()
+					c.verdicts[job.sha] = verdict
+					c.mu.Unlock()
+				}
+			}()
+		}
+	}
+	c.jobs <- clamJob{sha, data}
+}
+
+// finish waits for outstanding verdicts, records malware findings and reports
+// each pending file's final status. Call it once, after the last file.
+func (c *contentScan) finish(resolve func(FileEvidence)) {
+	if c.jobs != nil {
+		close(c.jobs)
+		c.wg.Wait()
+		c.jobs = nil
+	}
+	for _, p := range c.pending {
+		p.Malware = "clean"
+		verdict := c.verdicts[p.SHA256]
+		if sig, infected := strings.CutPrefix(verdict, "infected:"); infected {
+			p.Malware = "infected"
+			finding := contentFinding("malware", sig, "ClamAV detected "+sig, p.Path, p.SHA256)
+			if strings.HasPrefix(sig, "YARA.") {
+				finding.Title = "YARA rule matched: " + strings.TrimSuffix(strings.TrimPrefix(sig, "YARA."), ".UNOFFICIAL")
+			}
+			c.findings = append(c.findings, finding)
+		} else if verdict != "clean" {
+			p.Malware = "error"
+			c.malware.Status = "partial"
+		}
+		resolve(p)
+	}
+	c.pending = nil
+}
+
 func (e Engine) newContentScan(ctx context.Context, image bool) *contentScan {
-	c := &contentScan{address: e.ClamdAddress, image: image, verdicts: map[string]string{}, findings: []assessments.Finding{}}
+	c := &contentScan{ctx: ctx, address: e.ClamdAddress, image: image, verdicts: map[string]string{}, queued: map[string]bool{}, findings: []assessments.Finding{}}
 	c.malware = assessments.Stage{Name: "malware", Status: "ok", Detail: "ClamAV regular-file INSTREAM coverage"}
 	c.yara = assessments.Stage{Name: "yara", Status: "skipped", Detail: "ClamAV endpoint not configured"}
 	if e.ClamdAddress == "" {
@@ -241,7 +316,7 @@ func (e Engine) newContentScan(ctx context.Context, image bool) *contentScan {
 
 // file inspects one regular file of known size. Files up to the ClamAV stream
 // limit are read once into memory and reused for hashing, malware and text rules.
-func (c *contentScan) file(ctx context.Context, relative string, size int64, r io.Reader) (FileEvidence, error) {
+func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEvidence, error) {
 	record := FileEvidence{Path: relative, Size: size, Malware: "skipped"}
 	var data []byte
 	if size <= 25<<20 {
@@ -262,34 +337,14 @@ func (c *contentScan) file(ctx context.Context, relative string, size int64, r i
 		record.SHA256 = hex.EncodeToString(h.Sum(nil))
 	}
 	if c.address != "" {
-		switch {
-		case data == nil:
+		if data == nil {
 			record.Malware = "skipped_oversize"
 			c.malware.Status = "partial"
-		case c.verdicts[record.SHA256] != "":
-			record.Malware = c.verdicts[record.SHA256]
-		default:
-			sig, err := clamd(ctx, c.address, bytes.NewReader(data))
-			switch {
-			case err != nil:
-				record.Malware = "error"
-				c.malware.Status = "partial"
-			case sig != "":
-				record.Malware = "infected:" + sig
-			default:
-				record.Malware = "clean"
-			}
-			if err == nil {
-				c.verdicts[record.SHA256] = record.Malware
-			}
-		}
-		if sig, infected := strings.CutPrefix(record.Malware, "infected:"); infected {
-			record.Malware = "infected"
-			finding := contentFinding("malware", sig, "ClamAV detected "+sig, record.Path, record.SHA256)
-			if strings.HasPrefix(sig, "YARA.") {
-				finding.Title = "YARA rule matched: " + strings.TrimSuffix(strings.TrimPrefix(sig, "YARA."), ".UNOFFICIAL")
-			}
-			c.findings = append(c.findings, finding)
+		} else {
+			// Resolved by finish.
+			record.Malware = "pending"
+			c.pending = append(c.pending, record)
+			c.submit(record.SHA256, data)
 		}
 	}
 	for _, i := range c.set.hashes[record.SHA256] {
@@ -335,6 +390,7 @@ func (c *contentScan) stages() []assessments.Stage {
 func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
 	scan := e.newContentScan(ctx, false)
 	files := []FileEvidence{}
+	index := map[string]int{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -361,13 +417,15 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 		if err != nil {
 			return err
 		}
-		record, err := scan.file(ctx, filepath.ToSlash(relative), info.Size(), f)
+		record, err := scan.file(filepath.ToSlash(relative), info.Size(), f)
 		if err != nil {
 			return err
 		}
+		index[record.Path] = len(files)
 		files = append(files, record)
 		return nil
 	})
+	scan.finish(func(f FileEvidence) { files[index[f.Path]].Malware = f.Malware })
 	if walkErr != nil {
 		scan.incomplete("Content walk did not complete")
 	}
