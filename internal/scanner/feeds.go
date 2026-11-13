@@ -75,6 +75,7 @@ func SyncFeeds(ctx context.Context, root string, ecosystems []string) error {
 			return err
 		}
 	}
+	syncEnrichment(ctx, root, snapshot)
 	manifest, _ := json.Marshal(FeedManifest{FetchedAt: time.Now().UTC(), Ecosystems: ecosystems})
 	if err := os.WriteFile(filepath.Join(snapshot, "manifest.json"), manifest, 0644); err != nil {
 		return err

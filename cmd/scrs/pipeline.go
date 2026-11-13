@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/scanner"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/ORIBData/scrstack/internal/worker"
@@ -38,6 +40,46 @@ func pipelineCommand() error {
 		}
 		return err
 
+	case "yara-install":
+		// One-shot: install the embedded YARA ruleset into ClamAV's database volume.
+		// ClamAV populates and owns its volume on first start, so retry until
+		// the directory is writable, then reload clamd to apply the rules.
+		directory := setting("SCRS_CLAMAV_DATABASE", "/clamav-db")
+		deadline := time.Now().Add(10 * time.Minute)
+		for {
+			err := scanner.InstallRules(directory)
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return err
+			}
+			logger.Warn("waiting for ClamAV database directory", "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+			}
+		}
+		logger.Info("YARA ruleset installed", "version", scanner.RulesVersion)
+		if address := os.Getenv("SCRS_CLAMD_ADDRESS"); address != "" {
+			for attempt := 0; attempt < 30; attempt++ {
+				reloadCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+				err := scanner.ReloadClamd(reloadCtx, address)
+				cancel()
+				if err == nil {
+					logger.Info("clamd reloaded with SCRS YARA ruleset")
+					return nil
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(10 * time.Second):
+				}
+			}
+			logger.Warn("clamd reload not confirmed; rules apply at its next SelfCheck")
+		}
+		return nil
 	case "scanner-healthcheck":
 		client := &http.Client{Timeout: 2 * time.Second}
 		response, err := client.Get("http://127.0.0.1:8081/healthz")
@@ -85,10 +127,15 @@ func pipelineCommand() error {
 			return errors.New("set a random SCRS_SCANNER_API_TOKEN of at least 32 characters")
 		}
 		engine := scanner.Engine{ClamdAddress: os.Getenv("SCRS_CLAMD_ADDRESS"), IndicatorFile: os.Getenv("SCRS_INDICATOR_FILE"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RemediationProxy: os.Getenv("SCRS_REMEDIATION_PROXY"), Binary: setting("SCRS_OSV_BINARY", "/usr/local/bin/osv-scanner"), WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Database: setting("SCRS_OSV_DB", "/feeds/current")}
+		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
+			engine.MaxImageBytes = limit
+		} else {
+			engine.MaxImageBytes = 400 << 20
+		}
 		if _, err := os.Stat(engine.Binary); err != nil {
 			return errors.New("pinned OSV-Scanner binary unavailable")
 		}
-		server := &http.Server{Addr: setting("SCRS_SCANNER_ADDR", ":8081"), Handler: engine.Handler(token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 250 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+		server := &http.Server{Addr: setting("SCRS_SCANNER_ADDR", ":8081"), Handler: engine.Handler(token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Minute, WriteTimeout: 9 * time.Minute, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 		go func() {
 			<-ctx.Done()
 			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -119,7 +166,26 @@ func pipelineCommand() error {
 		if err != nil {
 			return err
 		}
-		w := worker.Worker{AutoRemediation: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger}
+		events, err := notify.Open(ctx, cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
+		if err != nil {
+			return err
+		}
+		defer events.Close()
+		w := worker.Worker{AutoRemediation: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger, Notify: events}
+		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
+			w.MaxImageBytes = limit
+		}
+		if os.Getenv("SCRS_SNAPSHOT_ARCHIVES") == "true" {
+			w.Snapshots = artifacts
+		}
+		dispatcher := &notify.Dispatcher{Store: events, Logger: logger, Document: store.ProfileDocument}
+		go dispatcher.Run(ctx)
+		go w.MonitorFeeds(ctx, 5*time.Minute)
+		rescan := time.Duration(0)
+		if hours, err := strconv.Atoi(os.Getenv("SCRS_RESCAN_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*90 {
+			rescan = time.Duration(hours) * time.Hour
+		}
+		go w.Maintain(ctx, time.Hour, rescan)
 		return w.Run(ctx)
 	}
 	return errors.New("unknown pipeline command")

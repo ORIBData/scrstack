@@ -1,23 +1,30 @@
 openapi: 3.1.0
 info:
   title: Supply Chain Risk Stack API
-  version: 0.1.0
-  description: Foundation API with managed tokens and provider connection management. Authenticated requests allow 120 calls per token per sliding minute and return 429 with Retry-After when exhausted. Redis/auth-store outages fail closed with 503. GitHub assessment jobs provide offline OSV matching, CycloneDX SBOMs and persisted findings. Missing malware, IOC and integrity stages force incomplete verdicts. Guided npm remediation is enabled by deployment configuration and automatically queued for supported npm manifests; plans never write to repositories.
+  version: 0.2.0
+  description: >-
+    Supply-chain risk assessments for GitHub repositories with offline OSV matching, CycloneDX SBOMs,
+    ClamAV and YARA malware scanning, IOC matching, workflow and install-hook integrity checks,
+    KEV/EPSS enrichment and a persistent risk register. Authenticated requests allow 120 calls per
+    token per sliding minute (429 with Retry-After). Redis/auth-store outages fail closed with 503.
+    Verdict precedence is fail > incomplete > warn > pass; a partial scan is never pass. Every
+    response carries X-Request-Id. Outbound webhooks are signed with X-SCRS-Signature
+    (sha256 HMAC of the exact body) and carry Idempotency-Key (event id). Guided npm and Maven
+    remediation plans never write to repositories.
 servers:
   - url: /scrs/v1
 paths:
   /webhooks/github:
     post:
       operationId: githubPushWebhook
-      summary: Verify HMAC-SHA256 and enqueue a discovered in-scope GitHub push
-      description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. Only push and ping are supported. Delivery replay is idempotent for 24 hours. No bearer token is used on this provider endpoint.
+      summary: Direct GitHub delivery (HMAC); same processing as /ingest/github
+      description: Requires X-Hub-Signature-256, X-GitHub-Delivery UUID and X-GitHub-Event. push and pull_request (opened, synchronize, reopened) queue assessments; push, delete, create, repository, member and organization events raise integrity alerts (force push, ref deletion, branch churn, mass deletion, default-branch, visibility and membership changes, campaign patterns). Other event types are acknowledged with 200. Delivery replay is idempotent for 24 hours.
       responses:
         '202': {description: Push durably queued with raw event}
         '200': {description: Replay, ping, deleted-ref or non-branch (tag) push acknowledgement}
         '401': {description: Invalid provider signature}
-        '404': {description: Repository outside registered scope}
         '409': {description: Same delivery ID with different payload}
-        '422': {description: Unsupported event or ambiguous connection}
+        '422': {description: Ambiguous connection}
         '503': {description: Webhook secret not configured}
   /feeds/indicators:
     get:
@@ -144,6 +151,16 @@ paths:
                     repository: {type: string, example: organization/repository}
                     ref: {type: string, default: HEAD}
                     commit: {type: string, pattern: '^[a-fA-F0-9]{40}$'}
+                    pull_request:
+                      type: object
+                      description: Assess a PR head commit (commit required); ref becomes pull/<number>; base_ref is the new-versus-existing baseline
+                      required: [number, base_ref]
+                      properties:
+                        number: {type: integer, minimum: 1}
+                        base_ref: {type: string}
+                        head_ref: {type: string}
+                        title: {type: string, maxLength: 512}
+                notify: {type: array, maxItems: 10, items: {type: string}, description: Restrict completion events to these webhook subscription names (TRG-008)}
                 trigger:
                   type: object
                   additionalProperties: false
@@ -168,14 +185,22 @@ paths:
         - {name: cursor, in: query, schema: {type: string, format: uuid}}
         - {name: asset_id, in: query, schema: {type: string, format: uuid}}
         - {name: status, in: query, schema: {type: string, enum: [queued, running, succeeded, failed, cancelled, superseded]}}
+        - {name: verdict, in: query, schema: {type: string, enum: [pass, warn, fail, incomplete]}}
+        - {name: ref, in: query, schema: {type: string}}
+        - {name: commit, in: query, schema: {type: string, pattern: '^[a-fA-F0-9]{40}$'}}
+        - {name: actor, in: query, schema: {type: string}, description: Claimed actor (INT-016)}
+        - {name: created_after, in: query, schema: {type: string, format: date-time}}
+        - {name: created_before, in: query, schema: {type: string, format: date-time}}
       responses:
         '200': {description: Up to 100 items with next_cursor}
   /assessments/{id}:
     parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
     get:
       operationId: getAssessment
-      summary: Read status, immutable revision, coverage, counts and verdict
+      summary: Read status, revision, coverage, counts (including new and waived), diff and verdict
       security: [{bearerAuth: []}]
+      parameters:
+        - {name: wait, in: query, schema: {type: integer, minimum: 0, maximum: 60}, description: Long-poll while queued or running (TRG-009)}
       responses:
         '200': {description: Assessment; succeeded describes execution and does not imply a pass verdict}
         '404': {description: Assessment unavailable to caller}
@@ -230,7 +255,7 @@ paths:
     get:
       operationId: remediationCapabilities
       security: [{bearerAuth: []}]
-      summary: Runtime capability and enablement; npm in-place only, Maven unavailable
+      summary: Runtime capability and enablement; npm in-place and Maven override
       responses:
         '200': {description: Capability matrix; repository_writes is always false}
   /assets/{id}/remediations:
@@ -250,8 +275,8 @@ paths:
               required: [assessment_id, manifest]
               properties:
                 assessment_id: {type: string, format: uuid}
-                manifest: {type: string, example: package-lock.json}
-                strategy: {type: string, enum: [in-place], default: in-place}
+                manifest: {type: string, example: package-lock.json, description: package-lock.json (npm) or pom.xml (Maven)}
+                strategy: {type: string, enum: [in-place, override], description: Defaults to in-place for npm and override for Maven}
       responses:
         '202': {description: Plan queued with assessment Location}
         '200': {description: Idempotent replay}
@@ -551,6 +576,252 @@ paths:
             text/html:
               schema:
                 type: string
+  /ingest/github:
+    post:
+      operationId: ingestGitHub
+      summary: GitHub events in direct (X-Hub-Signature-256) or relay mode (Bearer ingest:relay token, SCRS_RELAY_ENABLED=true)
+      description: Relay mode lets automation such as n8n forward GitHub's unchanged JSON body with X-GitHub-Event and X-GitHub-Delivery. Processing, idempotency and responses match /webhooks/github; the entry mode is recorded on the raw event.
+      security: [{bearerAuth: []}, {}]
+      responses:
+        '202': {description: Assessment queued}
+        '200': {description: Replay, acknowledgement, out-of-scope or integrity-only event}
+        '401': {description: Invalid signature or token}
+        '403': {description: Token lacks ingest:relay}
+        '503': {description: Relay disabled or webhook secret not configured}
+  /webhooks:
+    get:
+      operationId: listWebhookSubscriptions
+      summary: Outbound webhook subscriptions (admin); secrets are never returned
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Subscriptions}
+    post:
+      operationId: createWebhookSubscription
+      summary: Create a subscription; returns its signing secret once (admin)
+      security: [{bearerAuth: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, url, events]
+              properties:
+                name: {type: string, maxLength: 100}
+                url: {type: string, description: https URL to a public host; http or private addresses only for hosts in SCRS_WEBHOOK_PRIVATE_HOSTS}
+                events: {type: array, items: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, ping]}}
+                profile: {type: string, enum: [summary, full, agent], default: summary, description: full and agent replace assessment.completed data with the context document (OUT-005)}
+                egress_ack: {type: boolean, description: Required for the agent profile}
+                include_contacts: {type: boolean, default: false}
+      responses:
+        '201': {description: Subscription and one-time secret}
+        '400': {description: URL, events or profile rejected}
+        '409': {description: Name exists}
+  /webhooks/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getWebhookSubscription
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Subscription with ETag revision}
+    patch:
+      operationId: updateWebhookSubscription
+      summary: Change url, events, profile, egress_ack, include_contacts or enabled (If-Match required)
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Updated}
+        '409': {description: Stale revision}
+        '428': {description: If-Match missing}
+    delete:
+      operationId: disableWebhookSubscription
+      summary: Disable and keep the delivery log (If-Match required)
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Disabled}
+  /webhooks/{id}:rotate-secret:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: rotateWebhookSecret
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: New secret, returned once}
+  /webhooks/{id}:test:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: pingWebhookSubscription
+      security: [{bearerAuth: []}]
+      responses:
+        '202': {description: Ping event queued}
+  /webhooks/{id}/deliveries:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: listWebhookDeliveries
+      summary: Delivery log; deliveries are dead-lettered after 8 attempts
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [pending, sending, delivered, dead]}}
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Up to 100 deliveries with next_cursor}
+  /webhooks/{id}/deliveries/{delivery}:redeliver:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string, format: uuid}}
+      - {name: delivery, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      operationId: redeliverWebhook
+      summary: Requeue a delivered or dead delivery with the same event id
+      security: [{bearerAuth: []}]
+      responses:
+        '202': {description: Requeued}
+        '409': {description: Delivery still pending}
+  /assessments:batch:
+    post:
+      operationId: batchAssessments
+      summary: Queue up to 100 targets with per-item idempotency keys (write or trigger, TRG-011)
+      security: [{bearerAuth: []}]
+      responses:
+        '207': {description: Per-item status, assessment_id or error}
+        '400': {description: Empty or oversized batch}
+  /assessments/latest:
+    get:
+      operationId: latestAssessment
+      summary: Newest assessment of an exact commit (UC13); never treat incomplete as pass
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: commit, in: query, required: true, schema: {type: string, pattern: '^[a-fA-F0-9]{40}$'}}
+        - {name: repository, in: query, schema: {type: string}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Assessment}
+        '404': {description: No assessment of that commit}
+  /assessments/{id}/context:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentContext
+      summary: Full or agent context document (OUT-005 to OUT-007) with untrusted_paths and a size cap
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: profile, in: query, schema: {type: string, enum: [full, agent], default: full}}
+      responses:
+        '200': {description: Context document}
+  /assessments/{id}/vex:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentVEX
+      summary: OpenVEX 0.2.0 statements from register triage
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: OpenVEX document}
+  /assessments/{id}/snapshot:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: assessmentSnapshot
+      summary: Download the stored source archive (admin; SCRS_SNAPSHOT_ARCHIVES=true)
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Integrity-verified gzip tarball}
+        '409': {description: No snapshot stored}
+  /assets/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getAsset
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Asset with owner, environment, criticality, exposure, labels and ETag}
+    patch:
+      operationId: updateAsset
+      summary: Set owner_id (or null), environment, criticality 0-5, exposure, labels (write, If-Match)
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Updated}
+        '400': {description: Invalid attribute or unknown owner}
+        '409': {description: Stale revision}
+  /assets/{id}/last-known-good:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: lastKnownGood
+      summary: Newest passing revision of a ref with no open integrity entry (INT-017)
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: ref, in: query, required: true, schema: {type: string}}
+      responses:
+        '200': {description: Commit and assessment}
+        '404': {description: No qualifying revision}
+  /owners:
+    get:
+      operationId: listOwners
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Owners}
+    post:
+      operationId: createOwner
+      summary: Create an owner (write); contacts are excluded from event payloads unless opted in
+      security: [{bearerAuth: []}]
+      responses:
+        '201': {description: Owner}
+        '409': {description: Name exists}
+  /owners/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    patch:
+      operationId: updateOwner
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Updated (If-Match required)}
+  /system/metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus metrics (read scope); queue, verdict and delivery values come from PostgreSQL
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Prometheus text format}
+  /maintenance/run:
+    post:
+      operationId: runMaintenance
+      summary: Apply retention and expire idempotency keys now (admin); also runs hourly in the worker
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Maintenance report}
+  /maintenance/rescan:
+    post:
+      operationId: rescanDefaultBranches
+      summary: Queue default-branch assessments of all in-scope repositories (admin)
+      security: [{bearerAuth: []}]
+      responses:
+        '202': {description: Count queued}
+  /maintenance/redeliver-dead:
+    post:
+      operationId: redeliverDeadWebhooks
+      security: [{bearerAuth: []}]
+      responses:
+        '202': {description: Count requeued}
+  /events/inbound:
+    get:
+      operationId: listInboundEvents
+      summary: Stored raw deliveries and triggers (admin); filter by claimed actor or event type
+      security: [{bearerAuth: []}]
+      parameters:
+        - {name: actor, in: query, schema: {type: string}}
+        - {name: event_type, in: query, schema: {type: string}}
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Up to 100 events with next_cursor}
+  /events/inbound/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getInboundEvent
+      security: [{bearerAuth: []}]
+      responses:
+        '200': {description: Event including raw body}
+  /events/inbound/{id}:replay:
+    parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: replayInboundEvent
+      summary: Re-assess the revision an event produced, as a new assessment (admin)
+      security: [{bearerAuth: []}]
+      responses:
+        '202': {description: New assessment queued}
+        '409': {description: Event produced no assessment}
 components:
   securitySchemes:
     bearerAuth:

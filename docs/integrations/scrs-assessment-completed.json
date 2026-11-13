@@ -1,0 +1,165 @@
+{
+  "name": "SCRS - assessment completed",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "scrs-events",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "7b2e1d75-2e3f-4d4c-8b12-000000000001",
+      "name": "SCRS events",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "7b2e1d75-2e3f-4d4c-8b12-0000000000a1"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Requires NODE_FUNCTION_ALLOW_BUILTIN=crypto and SCRS_WEBHOOK_SECRET in n8n's environment.\nconst crypto = require('crypto');\nconst item = $input.first();\nconst raw = Buffer.from(item.binary.data.data, 'base64');\nconst expected = 'sha256=' + crypto.createHmac('sha256', $env.SCRS_WEBHOOK_SECRET).update(raw).digest('hex');\nconst given = item.json.headers['x-scrs-signature'] || '';\nif (given.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected))) {\n  throw new Error('Invalid SCRS signature');\n}\nconst event = JSON.parse(raw.toString('utf8'));\nreturn [{ json: { type: event.event.type, verdict: event.data.assessment ? event.data.assessment.verdict : null, event } }];"
+      },
+      "id": "7b2e1d75-2e3f-4d4c-8b12-000000000002",
+      "name": "Verify signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.type }}",
+              "rightValue": "assessment.completed",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            },
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.verdict }}",
+              "rightValue": "fail",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7b2e1d75-2e3f-4d4c-8b12-000000000003",
+      "name": "Verdict is fail?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $json.event.data.assessment.repository }}/statuses/{{ $json.event.data.assessment.commit }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: 'failure', context: 'scrs/supply-chain', description: 'SCRS verdict: fail', target_url: $json.event.data.links.report }) }}",
+        "options": {}
+      },
+      "id": "7b2e1d75-2e3f-4d4c-8b12-000000000004",
+      "name": "Set failing commit status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        -100
+      ],
+      "notes": "Uses n8n's own GitHub credential (statuses:write). SCRS never writes to GitHub."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.github.com/repos/{{ $json.event.data.assessment.repository }}/statuses/{{ $json.event.data.assessment.commit }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "githubApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ state: $json.verdict === 'incomplete' ? 'pending' : 'success', context: 'scrs/supply-chain', description: 'SCRS verdict: ' + $json.verdict, target_url: $json.event.data.links.report }) }}",
+        "options": {}
+      },
+      "id": "7b2e1d75-2e3f-4d4c-8b12-000000000005",
+      "name": "Set neutral or passing status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        100
+      ],
+      "notes": "incomplete is reported as pending: partial coverage is never a pass."
+    }
+  ],
+  "connections": {
+    "SCRS events": {
+      "main": [
+        [
+          {
+            "node": "Verify signature",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify signature": {
+      "main": [
+        [
+          {
+            "node": "Verdict is fail?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verdict is fail?": {
+      "main": [
+        [
+          {
+            "node": "Set failing commit status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set neutral or passing status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

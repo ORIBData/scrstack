@@ -125,3 +125,54 @@ to allow signature-reload headroom; this is a memory limit, not a reservation. C
 its volume. Freshclam needs outbound access for signature updates. Stale signatures
 make malware coverage partial and create a posture finding. YARA remains separate
 and is not implemented by loading rules into ClamAV.
+
+## 2026-11-13 release additions
+
+**New service.** `scrs-yara-rules` runs once per deploy as the ClamAV image's
+`clamav` user (uid 1000). It waits until ClamAV has populated its signature
+volume, writes the embedded YARA ruleset as `scrs.yar`, then sends clamd a
+`RELOAD`. Assessments prove the rules are live with a canary; if the
+installer failed, the `yara` stage reads `skipped` and verdicts stay
+`incomplete`. Check `docker logs <project>-scrs-yara-rules-1` after deploy.
+
+**Outbound access** now also needed: `www.cisa.gov` (KEV) and
+`epss.empiricalsecurity.com` (EPSS) from `scrs-feed-sync`; for Maven
+remediation, `repo.maven.apache.org` and `repo1.maven.org` through the egress
+proxy; and your n8n or other webhook receivers from `scrs-worker`. KEV/EPSS
+outages never block scanning; the previous copy is carried forward.
+
+**Settings** (all optional; see `.env.example`):
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_RELAY_ENABLED` | API | Accept n8n relay deliveries on `/scrs/v1/ingest/github` |
+| `SCRS_PUBLIC_BASE_URL` | API, worker | Absolute links in webhook payloads; deployment acceptance |
+| `SCRS_WEBHOOK_PRIVATE_HOSTS` | API, worker | Hostnames allowed as http or private-address webhook targets |
+| `SCRS_EVENT_MAX_BYTES`, `SCRS_EVENT_FIELD_MAX`, `SCRS_EVENT_REDACT` | API, worker | Context-document limits and JSON Pointer redaction |
+| `SCRS_MASS_DELETION_FILES` | API | Mass-deletion alert threshold (default 50 files) |
+| `SCRS_MAX_IMAGE_BYTES`, `SCRS_SCANNER_MEMORY` | worker, scanner | Image size cap (400 MiB) and scanner memory (3 GiB) |
+| `SCRS_SNAPSHOT_ARCHIVES` | worker | Store each fetched source archive in S3 for restore |
+| `SCRS_RESCAN_INTERVAL_HOURS` | worker | Scheduled default-branch rescans; 0 disables |
+
+**Image assessment** requires the image's OS ecosystems in
+`SCRS_OSV_ECOSYSTEMS`, for example `npm,Go,Maven,Alpine,Debian`. Each adds to
+the first feed download, which the scanner healthcheck now allows up to
+15 minutes for.
+
+**Monitoring.** Scrape `https://<domain>/scrs/v1/system/metrics` with a
+`read` token (Prometheus `authorization` credentials). Queue depth, oldest
+queued age, verdict totals, duration quantiles and undelivered webhooks come
+from PostgreSQL, so one scrape target covers the API and worker. Alert on
+`scrs_store_up == 0`, a growing `scrs_assessment_oldest_queued_seconds`, and
+`scrs_webhook_deliveries{status="dead"} > 0`.
+
+**Verified locally on 2026-11-13.** This Compose file (port 7000) ran
+end to end with disposable PostgreSQL, Redis and MinIO:
+- storage initialized;
+- the YARA installer wrote into ClamAV's volume and the live clamd matched the canary;
+- feed sync delivered OSV, KEV and EPSS;
+- the scanner health gate released the worker;
+- the API answered over the proxy network;
+- the worker's dispatcher attempted outbound delivery and scheduled a retry.
+
+Live Traefik/TLS on the VPS remains to be accepted with `make deployment-acceptance`.

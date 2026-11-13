@@ -34,6 +34,13 @@ services:
       <<: *scrs-storage-env
       SCRS_HTTP_ADDR: ":7000"
       SCRS_GITHUB_WEBHOOK_SECRET: ${SCRS_GITHUB_WEBHOOK_SECRET:-}
+      SCRS_RELAY_ENABLED: ${SCRS_RELAY_ENABLED:-false}
+      SCRS_MASS_DELETION_FILES: ${SCRS_MASS_DELETION_FILES:-50}
+      SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
+      SCRS_WEBHOOK_PRIVATE_HOSTS: ${SCRS_WEBHOOK_PRIVATE_HOSTS:-}
+      SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
+      SCRS_EVENT_FIELD_MAX: ${SCRS_EVENT_FIELD_MAX:-512}
+      SCRS_EVENT_REDACT: ${SCRS_EVENT_REDACT:-}
       SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY}
       SCRS_BOOTSTRAP_API_TOKEN: ${SCRS_BOOTSTRAP_API_TOKEN:?Set SCRS_BOOTSTRAP_API_TOKEN}
       SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
@@ -83,8 +90,17 @@ services:
       <<: *scrs-storage-env
       SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY}
       SCRS_SCANNER_URL: http://scrs-scanner:8081/scan
+      SCRS_MAX_IMAGE_BYTES: ${SCRS_MAX_IMAGE_BYTES:-419430400}
+      SCRS_SNAPSHOT_ARCHIVES: ${SCRS_SNAPSHOT_ARCHIVES:-false}
+      SCRS_RESCAN_INTERVAL_HOURS: ${SCRS_RESCAN_INTERVAL_HOURS:-0}
       SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
       SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set a separate random scanner service token}
+      # Outbound webhooks are delivered from the worker (OUT-001/002).
+      SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
+      SCRS_WEBHOOK_PRIVATE_HOSTS: ${SCRS_WEBHOOK_PRIVATE_HOSTS:-}
+      SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
+      SCRS_EVENT_FIELD_MAX: ${SCRS_EVENT_FIELD_MAX:-512}
+      SCRS_EVENT_REDACT: ${SCRS_EVENT_REDACT:-}
     depends_on:
       scrs-storage-init:
         condition: service_completed_successfully
@@ -110,13 +126,15 @@ services:
       SCRS_INDICATOR_FILE: ${SCRS_INDICATOR_FILE:-}
       SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
       SCRS_REMEDIATION_PROXY: http://scrs-egress-proxy:8082
+      SCRS_MAX_IMAGE_BYTES: ${SCRS_MAX_IMAGE_BYTES:-419430400}
     networks: [scanning]
     volumes: ["scrs-feeds:/feeds:ro"]
-    tmpfs: ["/work:size=536870912,mode=1777,noexec,nosuid"]
+    # Holds one extracted repository or one streamed image archive at a time.
+    tmpfs: ["/work:size=1073741824,mode=1777,noexec,nosuid"]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
-    mem_limit: 2g
+    mem_limit: ${SCRS_SCANNER_MEMORY:-3g}
     cpus: 2
     pids_limit: 128
     labels: ["traefik.enable=false"]
@@ -142,6 +160,28 @@ services:
     cpus: 2
     pids_limit: 128
     security_opt: [no-new-privileges:true]
+    labels: ["traefik.enable=false"]
+
+  # Installs the embedded YARA ruleset into ClamAV's database volume after
+  # ClamAV has created and owns it, then asks clamd to reload. Runs as the
+  # clamav uid of the pinned official image (1000). Re-runs on each deploy.
+  scrs-yara-rules:
+    image: ${SCRS_IMAGE:?Set SCRS_IMAGE}
+    command: ["yara-install"]
+    user: "1000:1000"
+    restart: "no"
+    environment:
+      SCRS_CLAMAV_DATABASE: /clamav-db
+      SCRS_CLAMD_ADDRESS: ${SCRS_CLAMD_ADDRESS:-scrs-clamav:3310}
+    depends_on:
+      scrs-clamav:
+        condition: service_started
+    networks: [scanning]
+    volumes: ["scrs-clamav-signatures:/clamav-db"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
     labels: ["traefik.enable=false"]
 
   scrs-egress-proxy:

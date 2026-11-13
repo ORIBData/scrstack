@@ -10,13 +10,26 @@ import (
 	"strings"
 )
 
+// RemediationKind maps a manifest and strategy to a supported remediation
+// (REM-001): npm lockfiles in place, Maven manifests by dependency override.
+func RemediationKind(manifest, strategy string) string {
+	switch {
+	case filepath.Base(manifest) == "package-lock.json" && strategy == "in-place":
+		return "npm"
+	case filepath.Base(manifest) == "pom.xml" && strategy == "override":
+		return "maven"
+	}
+	return ""
+}
+
 // Remediate operates only on a disposable copy. The sandbox has no shell,
 // package manager or provider credentials and its network is proxy-allowlisted.
 func (e Engine) Remediate(ctx context.Context, archive []byte, manifest, strategy string) (json.RawMessage, error) {
 	if !e.RemediationEnabled || e.RemediationProxy == "" {
 		return nil, errors.New("remediation sandbox disabled")
 	}
-	if strategy != "in-place" || !filepath.IsLocal(manifest) || strings.Contains(manifest, "\\") || filepath.Base(manifest) != "package-lock.json" {
+	kind := RemediationKind(manifest, strategy)
+	if kind == "" || !filepath.IsLocal(manifest) || strings.Contains(manifest, "\\") {
 		return nil, errors.New("unsupported remediation manifest or strategy")
 	}
 	database, err := pinnedFeed(e.Database)
@@ -40,7 +53,12 @@ func (e Engine) Remediate(ctx context.Context, archive []byte, manifest, strateg
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, errors.New("remediation lockfile unavailable")
 	}
-	command := exec.CommandContext(ctx, e.Binary, "fix", "--strategy=in-place", "--format=json", "--no-introduce", "--offline-vulnerabilities", "--lockfile", target)
+	args := []string{"fix", "--strategy=in-place", "--format=json", "--no-introduce", "--offline-vulnerabilities", "--lockfile", target}
+	if kind == "maven" {
+		// Maven resolves through deps.dev and Maven Central metadata via the allow-listed proxy.
+		args = []string{"fix", "--strategy=override", "--format=json", "--offline-vulnerabilities", "--manifest", target}
+	}
+	command := exec.CommandContext(ctx, e.Binary, args...)
 	command.Dir = directory
 	command.Env = []string{"HOME=" + directory, "TMPDIR=" + directory, "OSV_SCANNER_LOCAL_DB_CACHE_DIRECTORY=" + database, "HTTPS_PROXY=" + e.RemediationProxy, "HTTP_PROXY=" + e.RemediationProxy, "npm_config_ignore_scripts=true", "NO_COLOR=1"}
 	stdout := &cappedBuffer{limit: 8 << 20}

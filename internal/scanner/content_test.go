@@ -114,3 +114,59 @@ func TestLiveClamdEICAR(t *testing.T) {
 		t.Fatal("EICAR not detected", signature, err)
 	}
 }
+
+// Requires the disposable ClamAV from scripts/test_malware.sh, which mounts
+// rules/scrs.yar exactly as the yara-install step places it in production.
+func TestLiveClamdYARARules(t *testing.T) {
+	address := os.Getenv("SCRS_TEST_CLAMD_ADDRESS")
+	if address == "" {
+		t.Skip("requires disposable ClamAV")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	for sample, rule := range map[string]string{
+		yaraCanary: "SCRS_Canary",
+		"pool = stratum+tcp://pool.example:3333\n":                "SCRS_Miner_Stratum_Pool",
+		"echo Y3VybCBldmls | base64 -d | bash\n":                  "SCRS_Base64_Decode_Execute",
+		`{"donate-level": 1, "randomx": {"mode": "auto"}}` + "\n": "SCRS_XMRig_Configuration",
+	} {
+		signature, err := clamd(ctx, address, strings.NewReader(sample))
+		if err != nil || !strings.Contains(signature, rule) {
+			t.Fatalf("rule %s not matched: %q %v", rule, signature, err)
+		}
+	}
+	if signature, err := clamd(ctx, address, strings.NewReader("base64 encoding notes; see the stratum docs\n")); err != nil || signature != "" {
+		t.Fatal("benign text matched a rule", signature, err)
+	}
+	if err := ReloadClamd(ctx, address); err != nil {
+		t.Fatal("clamd reload rejected", err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("clean"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, stages := Engine{ClamdAddress: address}.inspectContent(ctx, root)
+	for _, s := range stages {
+		if s.Name == "yara" && s.Status != "ok" {
+			t.Fatal("YARA stage not proven by canary", s)
+		}
+	}
+}
+
+func TestInstallRulesIsAtomicAndComplete(t *testing.T) {
+	dir := t.TempDir()
+	if err := InstallRules(dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "scrs.yar"))
+	if err != nil || !bytes.Equal(data, rules) || !strings.Contains(string(data), "rule SCRS_Canary") {
+		t.Fatal("ruleset not installed intact", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatal("temporary files left behind", entries)
+	}
+	if InstallRules(filepath.Join(dir, "missing")) == nil {
+		t.Fatal("missing database directory accepted")
+	}
+}

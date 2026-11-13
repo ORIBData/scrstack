@@ -105,16 +105,75 @@ func loadIndicators(filename string) (IndicatorBundle, error) {
 }
 
 var contentDomain = regexp.MustCompile(`(?i)\b[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}\b`)
+var contentIPv4 = regexp.MustCompile(`\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b`)
 var secretsPattern = regexp.MustCompile(`(?i)tojson\s*\(\s*secrets\s*\)`)
+
+// INT-010: fetch-and-execute in build files that developers run locally.
+var remoteExec = regexp.MustCompile(`(?i)\b(curl|wget)\b[^\n|;&]*\|\s*(sudo\s+)?(ba|z|da)?sh\b`)
+var hiddenHelper = regexp.MustCompile(`^\.ci-[A-Za-z0-9_-]+\.sh$`)
+
+// yaraCanary is matched only by the SCRS_Canary rule shipped in rules/scrs.yar.
+const yaraCanary = "SCRS-YARA-CANARY-7f3c9a1e5b2d4086-coverage-probe"
 
 func contentFinding(kind, id, title, path, digest string) assessments.Finding {
 	evidence, _ := json.Marshal(map[string]string{"path": path, "sha256": digest, "rule_id": id})
 	return assessments.Finding{Type: kind, AdvisoryID: id, Title: title, Severity: "critical", Score: 100, Component: assessments.Component{Path: path}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Quarantine this revision, review the matched file, and rotate exposed credentials when applicable. Do not execute suspicious content.","automatic_changes":false}`)}
 }
+
+func integrityFinding(id, title, severity, path, digest string, detail map[string]any) assessments.Finding {
+	f := contentFinding("integrity", id, title, path, digest)
+	f.Severity = severity
+	f.Score = map[string]int{"critical": 100, "high": 60, "medium": 30}[severity]
+	evidence := map[string]any{"path": path, "sha256": digest, "rule_id": id}
+	for k, v := range detail {
+		evidence[k] = v
+	}
+	f.Evidence, _ = json.Marshal(evidence)
+	f.Guidance = json.RawMessage(`{"summary":"Confirm the change is intended. Install hooks and fetch-and-execute steps run on developer machines and build hosts, not only in CI.","automatic_changes":false}`)
+	return f
+}
+
+// indicatorSet groups active content indicators by matcher (TIF, INT-008).
+type indicatorSet struct {
+	hashes, domains, ips map[string][]Indicator
+	paths, contents      []intelligence.Pattern
+	steps                []Indicator
+	active               int
+}
+
+func newIndicatorSet(b IndicatorBundle, now time.Time) indicatorSet {
+	set := indicatorSet{hashes: map[string][]Indicator{}, domains: map[string][]Indicator{}, ips: map[string][]Indicator{}}
+	for _, i := range b.Indicators {
+		if !now.Before(i.ValidUntil) {
+			continue
+		}
+		switch i.Type {
+		case "sha256":
+			set.hashes[strings.ToLower(i.Value)] = append(set.hashes[strings.ToLower(i.Value)], i)
+		case "domain":
+			set.domains[i.Value] = append(set.domains[i.Value], i)
+		case "ipv4":
+			set.ips[i.Value] = append(set.ips[i.Value], i)
+		case "workflow_step_name":
+			set.steps = append(set.steps, i)
+		case "purl":
+			// Matched against the SBOM after SCA.
+		default:
+			continue // event-only patterns (titles, branches, messages)
+		}
+		set.active++
+	}
+	set.paths = b.Patterns("file_path_regex", now)
+	set.contents = b.Patterns("file_content_regex", now)
+	set.active += len(set.paths) + len(set.contents)
+	return set
+}
+
 func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
 	files := []FileEvidence{}
 	findings := []assessments.Finding{}
-	malware := assessments.Stage{Name: "malware", Status: "ok", Detail: "ClamAV regular-file INSTREAM coverage; separate YARA stage reports its own coverage"}
+	malware := assessments.Stage{Name: "malware", Status: "ok", Detail: "ClamAV regular-file INSTREAM coverage"}
+	yara := assessments.Stage{Name: "yara", Status: "skipped", Detail: "ClamAV endpoint not configured"}
 	if e.ClamdAddress == "" {
 		malware.Status = "skipped"
 		malware.Detail = "ClamAV endpoint not configured"
@@ -135,6 +194,16 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 				findings = append(findings, f)
 			}
 		}
+		// Prove the SCRS YARA ruleset is loaded instead of assuming it.
+		sig, err := clamd(ctx, e.ClamdAddress, strings.NewReader(yaraCanary))
+		switch {
+		case err != nil:
+			yara.Status, yara.Detail = "partial", "YARA canary could not be scanned"
+		case strings.Contains(sig, "SCRS_Canary"):
+			yara.Status, yara.Detail = "ok", "SCRS YARA ruleset "+RulesVersion+" loaded in ClamAV (canary detected)"
+		default:
+			yara.Status, yara.Detail = "skipped", "SCRS YARA ruleset not loaded in ClamAV; run the yara-install step"
+		}
 	}
 	ioc := assessments.Stage{Name: "ioc", Status: "skipped", Detail: "Indicator bundle not configured"}
 	bundle, err := loadIndicators(e.IndicatorFile)
@@ -142,32 +211,22 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 		bundle = *e.Indicators
 		err = nil
 	}
-	hashRules := map[string][]Indicator{}
-	domainRules := map[string][]Indicator{}
+	set := indicatorSet{}
 	if e.IndicatorFile != "" || e.Indicators != nil {
 		if err != nil {
 			ioc.Status = "failed"
 			ioc.Detail = "Invalid indicator bundle"
 		} else {
+			set = newIndicatorSet(bundle, time.Now())
 			ioc.Status = "ok"
-			ioc.Detail = "SHA256 and bounded text domain matching; bundle " + bundle.Version
-			active := 0
-			for _, i := range bundle.Indicators {
-				if time.Now().Before(i.ValidUntil) {
-					active++
-					if i.Type == "sha256" {
-						hashRules[strings.ToLower(i.Value)] = append(hashRules[strings.ToLower(i.Value)], i)
-					} else {
-						domainRules[strings.ToLower(i.Value)] = append(domainRules[strings.ToLower(i.Value)], i)
-					}
-				}
-			}
-			if active == 0 {
+			ioc.Detail = "Hash, domain, IPv4, path, content and workflow-step matching; bundle " + bundle.Version
+			if set.active == 0 {
 				ioc.Status = "skipped"
 				ioc.Detail = "No unexpired indicators"
 			}
 		}
 	}
+	integrity := assessments.Stage{Name: "integrity", Status: "ok", Detail: "Workflow secret serialization, install hooks, fetch-and-execute and hidden helper scripts; workflow changes against the prior revision"}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -214,14 +273,27 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 					malware.Status = "partial"
 				} else if sig != "" {
 					record.Malware = "infected"
-					findings = append(findings, contentFinding("malware", sig, "ClamAV detected "+sig, record.Path, record.SHA256))
+					finding := contentFinding("malware", sig, "ClamAV detected "+sig, record.Path, record.SHA256)
+					if strings.HasPrefix(sig, "YARA.") {
+						finding.Title = "YARA rule matched: " + strings.TrimSuffix(strings.TrimPrefix(sig, "YARA."), ".UNOFFICIAL")
+					}
+					findings = append(findings, finding)
 				} else {
 					record.Malware = "clean"
 				}
 			}
 		}
-		for _, i := range hashRules[record.SHA256] {
+		for _, i := range set.hashes[record.SHA256] {
 			findings = append(findings, contentFinding("ioc_match", i.ID, "File hash matches active indicator", record.Path, record.SHA256))
+		}
+		for _, p := range set.paths {
+			if p.MatchString(record.Path) {
+				findings = append(findings, contentFinding("ioc_match", p.ID, "File path matches active indicator", record.Path, record.SHA256))
+			}
+		}
+		base := filepath.Base(record.Path)
+		if !strings.Contains(record.Path, "/") && hiddenHelper.MatchString(base) {
+			findings = append(findings, integrityFinding("SCRS-HIDDEN-CI-HELPER", "Hidden CI helper script at repository root", "high", record.Path, record.SHA256, nil))
 		}
 		if info.Size() <= 1<<20 {
 			if _, err = f.Seek(0, 0); err != nil {
@@ -232,24 +304,11 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 				return err
 			}
 			if !strings.ContainsRune(string(data), 0) {
-				seen := map[string]bool{}
-				for _, domain := range contentDomain.FindAllString(string(data), -1) {
-					domain = strings.ToLower(domain)
-					if seen[domain] {
-						continue
-					}
-					seen[domain] = true
-					for _, i := range domainRules[domain] {
-						findings = append(findings, contentFinding("ioc_match", i.ID, "Text domain matches active indicator", record.Path, record.SHA256))
-					}
-				}
-				if strings.HasPrefix(record.Path, ".github/workflows/") && secretsPattern.Match(data) {
-					findings = append(findings, contentFinding("integrity", "SCRS-WORKFLOW-SECRETS", "Workflow serializes repository secrets", record.Path, record.SHA256))
-				}
+				findings = append(findings, inspectText(record, string(data), set)...)
 			}
-		} else if ioc.Status == "ok" && len(domainRules) > 0 {
+		} else if ioc.Status == "ok" && (len(set.domains) > 0 || len(set.ips) > 0 || len(set.contents) > 0) {
 			ioc.Status = "partial"
-			ioc.Detail = "Text-domain scan skipped files above 1 MiB"
+			ioc.Detail = "Text indicators skipped files above 1 MiB"
 		}
 		files = append(files, record)
 		if len(findings) > 10000 {
@@ -260,8 +319,77 @@ func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence
 	if walkErr != nil {
 		malware.Status = "partial"
 		ioc.Status = "partial"
+		integrity.Status = "partial"
+		integrity.Detail = "Content walk did not complete"
 	}
-	return files, findings, []assessments.Stage{malware, ioc, {Name: "yara", Status: "skipped", Detail: "Independent YARA analyzer not yet configured"}, {Name: "integrity", Status: "partial", Detail: "Workflow secret serialization checked; baseline and provider metadata checks pending"}}
+	return files, findings, []assessments.Stage{malware, yara, ioc, integrity}
+}
+
+// inspectText applies text indicators and INT-009/INT-010 rules to one file.
+func inspectText(record FileEvidence, text string, set indicatorSet) []assessments.Finding {
+	var out []assessments.Finding
+	seen := map[string]bool{}
+	for _, domain := range contentDomain.FindAllString(text, -1) {
+		domain = strings.ToLower(domain)
+		if seen[domain] {
+			continue
+		}
+		seen[domain] = true
+		for _, i := range set.domains[domain] {
+			out = append(out, contentFinding("ioc_match", i.ID, "Text domain matches active indicator", record.Path, record.SHA256))
+		}
+	}
+	if len(set.ips) > 0 {
+		for _, ip := range contentIPv4.FindAllString(text, -1) {
+			if seen[ip] {
+				continue
+			}
+			seen[ip] = true
+			for _, i := range set.ips[ip] {
+				out = append(out, contentFinding("ioc_match", i.ID, "Text IPv4 address matches active indicator", record.Path, record.SHA256))
+			}
+		}
+	}
+	for _, p := range set.contents {
+		if p.MatchString(text) {
+			out = append(out, contentFinding("ioc_match", p.ID, "File content matches active indicator", record.Path, record.SHA256))
+		}
+	}
+	workflow := strings.HasPrefix(record.Path, ".github/workflows/")
+	if workflow {
+		if secretsPattern.MatchString(text) {
+			out = append(out, contentFinding("integrity", "SCRS-WORKFLOW-SECRETS", "Workflow serializes repository secrets", record.Path, record.SHA256))
+		}
+		lower := strings.ToLower(text)
+		for _, i := range set.steps {
+			if strings.Contains(lower, "name: "+strings.ToLower(i.Value)) || strings.Contains(lower, "name: \""+strings.ToLower(i.Value)) || strings.Contains(lower, "name: '"+strings.ToLower(i.Value)) {
+				out = append(out, contentFinding("ioc_match", i.ID, "Workflow step name matches active indicator", record.Path, record.SHA256))
+			}
+		}
+	}
+	base := filepath.Base(record.Path)
+	if base == "package.json" && !strings.Contains(record.Path, "node_modules/") {
+		var manifest struct {
+			Scripts map[string]string `json:"scripts"`
+		}
+		if json.Unmarshal([]byte(text), &manifest) == nil {
+			var hooks []string
+			for _, hook := range []string{"preinstall", "install", "postinstall"} {
+				if _, ok := manifest.Scripts[hook]; ok {
+					hooks = append(hooks, hook)
+				}
+			}
+			if len(hooks) > 0 {
+				out = append(out, integrityFinding("SCRS-INSTALL-HOOK", "npm install lifecycle hook runs on every install", "medium", record.Path, record.SHA256, map[string]any{"hooks": hooks}))
+			}
+		}
+	}
+	if base == "Makefile" || strings.HasSuffix(base, ".mk") || strings.HasSuffix(base, ".sh") || base == "Dockerfile" || workflow {
+		if remoteExec.MatchString(text) {
+			out = append(out, integrityFinding("SCRS-REMOTE-EXEC", "Build step downloads and executes remote content", "medium", record.Path, record.SHA256, nil))
+		}
+	}
+	return out
 }
 
 func clamdVersion(ctx context.Context, address string) (string, time.Time, error) {

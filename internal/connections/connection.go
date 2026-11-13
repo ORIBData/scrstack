@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -298,27 +299,28 @@ type Asset struct {
 	Locator      string          `json:"locator"`
 	ConnectionID uuid.UUID       `json:"connection_id"`
 	Flags        json.RawMessage `json:"flags"`
+	OwnerID      *uuid.UUID      `json:"owner_id"`
+	Environment  string          `json:"environment"`
+	Criticality  int             `json:"criticality"`
+	Exposure     string          `json:"exposure"`
+	Labels       json.RawMessage `json:"labels"`
+	Revision     int64           `json:"revision"`
+}
+
+const assetColumns = `id,type,locator,connection_id,flags,owner_id,environment,criticality,exposure,labels,revision`
+
+func scanAsset(row pgx.Row) (Asset, error) {
+	var a Asset
+	err := row.Scan(&a.ID, &a.Type, &a.Locator, &a.ConnectionID, &a.Flags, &a.OwnerID, &a.Environment, &a.Criticality, &a.Exposure, &a.Labels, &a.Revision)
+	return a, err
 }
 
 func (s *Store) ListAssets(ctx context.Context) ([]Asset, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,type,locator,connection_id,flags FROM `+s.schema+`.assets ORDER BY locator LIMIT 10000`)
-	if err != nil {
-		return nil, errors.New("asset list failed")
-	}
-	defer rows.Close()
-	assets := []Asset{}
-	for rows.Next() {
-		var asset Asset
-		if err := rows.Scan(&asset.ID, &asset.Type, &asset.Locator, &asset.ConnectionID, &asset.Flags); err != nil {
-			return nil, errors.New("asset list scan failed")
-		}
-		assets = append(assets, asset)
-	}
-	return assets, rows.Err()
+	return s.ListAssetsPage(ctx, 10000, "", uuid.Nil)
 }
 
 func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterLocator string, afterID uuid.UUID) ([]Asset, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,type,locator,connection_id,flags FROM `+s.schema+`.assets
+	rows, err := s.pool.Query(ctx, `SELECT `+assetColumns+` FROM `+s.schema+`.assets
 		WHERE ($2='' OR (locator,id)>($2,$3)) ORDER BY locator,id LIMIT $1`, limit, afterLocator, afterID)
 	if err != nil {
 		return nil, errors.New("asset page query failed")
@@ -326,8 +328,8 @@ func (s *Store) ListAssetsPage(ctx context.Context, limit int, afterLocator stri
 	defer rows.Close()
 	assets := []Asset{}
 	for rows.Next() {
-		var asset Asset
-		if err := rows.Scan(&asset.ID, &asset.Type, &asset.Locator, &asset.ConnectionID, &asset.Flags); err != nil {
+		asset, err := scanAsset(rows)
+		if err != nil {
 			return nil, errors.New("asset page scan failed")
 		}
 		assets = append(assets, asset)
@@ -370,6 +372,14 @@ func (s *Store) recordCheck(ctx context.Context, c Connection, action string, st
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES ($1,$2,$3)`, action, c.ID, auditDetails(ctx, status)); err != nil {
 		return errors.New("connection audit failed")
+	}
+	var state struct {
+		State string `json:"state"`
+	}
+	if json.Unmarshal(status, &state) == nil && state.State == "failed" {
+		if _, err := notify.Emit(ctx, tx, s.schema, "connection.degraded", map[string]any{"connection_id": c.ID, "name": c.Name, "provider": c.Provider, "check": action, "link": notify.Link("/connections/" + c.ID.String())}, nil); err != nil {
+			return errors.New("connection event failed")
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return errors.New("connection audit commit failed")

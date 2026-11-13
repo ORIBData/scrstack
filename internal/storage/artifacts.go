@@ -89,3 +89,36 @@ func (a *Artifacts) GetPlan(ctx context.Context, key string) ([]byte, error) {
 	}
 	return data, nil
 }
+
+var snapshotKey = regexp.MustCompile(`^snapshots/[a-f0-9]{64}\.tar\.gz$`)
+
+// PutSnapshot stores a fetched source archive content-addressed (INT-006).
+func (a *Artifacts) PutSnapshot(ctx context.Context, data []byte) (string, error) {
+	if len(data) > 64<<20 {
+		return "", errors.New("snapshot size exceeded")
+	}
+	hash := sha256.Sum256(data)
+	key := "snapshots/" + hex.EncodeToString(hash[:]) + ".tar.gz"
+	_, err := a.client.PutObject(ctx, a.bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/gzip"})
+	return key, err
+}
+
+func (a *Artifacts) GetSnapshot(ctx context.Context, key string) ([]byte, error) {
+	if !snapshotKey.MatchString(key) {
+		return nil, errors.New("invalid snapshot key")
+	}
+	object, err := a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer object.Close()
+	data, err := io.ReadAll(io.LimitReader(object, (64<<20)+1))
+	if err != nil || len(data) > 64<<20 {
+		return nil, errors.New("snapshot unavailable")
+	}
+	hash := sha256.Sum256(data)
+	if "snapshots/"+hex.EncodeToString(hash[:])+".tar.gz" != key {
+		return nil, errors.New("snapshot integrity check failed")
+	}
+	return data, nil
+}

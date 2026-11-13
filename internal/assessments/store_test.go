@@ -242,11 +242,11 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	if err != nil || policy.InboundEventDays != 0 {
 		t.Fatal("unsafe retention default", err)
 	}
-	policy, err = s.SetRetention(ctx, actor, policy.Revision, 1)
+	policy, err = s.SetRetention(ctx, actor, policy.Revision, assessments.Retention{InboundEventDays: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.SetRetention(ctx, actor, policy.Revision-1, 2); !errors.Is(err, assessments.ErrConflict) {
+	if _, err := s.SetRetention(ctx, actor, policy.Revision-1, assessments.Retention{InboundEventDays: 2}); !errors.Is(err, assessments.ErrConflict) {
 		t.Fatal("stale retention write accepted", err)
 	}
 	pending, _, err := s.Enqueue(ctx, request, actor, "automation", "retention-protected")

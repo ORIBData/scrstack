@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/jackc/pgx/v5"
 	"path"
 	"strings"
@@ -12,10 +13,21 @@ import (
 )
 
 func (s *Store) EnqueuePlan(ctx context.Context, parentID, asset, actor uuid.UUID, name, key, manifest, strategy string) (Assessment, bool, error) {
-	if strategy == "" {
-		strategy = "in-place"
+	ecosystem := ""
+	switch path.Base(manifest) {
+	case "package-lock.json":
+		ecosystem = "npm"
+		if strategy == "" {
+			strategy = "in-place"
+		}
+	case "pom.xml":
+		ecosystem = "Maven"
+		if strategy == "" {
+			strategy = "override"
+		}
 	}
-	if strategy != "in-place" || len(manifest) > 512 || path.Base(manifest) != "package-lock.json" || path.Clean(manifest) != manifest || (strings.HasPrefix(manifest, "/") || strings.HasPrefix(manifest, "../")) || strings.Contains(manifest, "\\") {
+	supported := (ecosystem == "npm" && strategy == "in-place") || (ecosystem == "Maven" && strategy == "override")
+	if !supported || len(manifest) > 512 || path.Clean(manifest) != manifest || (strings.HasPrefix(manifest, "/") || strings.HasPrefix(manifest, "../")) || strings.Contains(manifest, "\\") {
 		return Assessment{}, false, ErrInput
 	}
 	parent, err := s.Get(ctx, parentID)
@@ -26,7 +38,7 @@ func (s *Store) EnqueuePlan(ctx context.Context, parentID, asset, actor uuid.UUI
 		return Assessment{}, false, ErrInput
 	}
 	var exists bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.components WHERE assessment_id=$1 AND body->>'path'=$2 AND body->>'ecosystem'='npm')`, parentID, manifest).Scan(&exists); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.components WHERE assessment_id=$1 AND body->>'path'=$2 AND body->>'ecosystem'=$3)`, parentID, manifest, ecosystem).Scan(&exists); err != nil {
 		return Assessment{}, false, err
 	}
 	if !exists {
@@ -78,6 +90,13 @@ func (s *Store) CompletePlan(ctx context.Context, a Assessment, key, digest stri
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES('remediation.plan_created',$1,$2)`, a.ID, details); err != nil {
 		return err
 	}
+	done, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, a.ID))
+	if err != nil {
+		return err
+	}
+	if _, err := notify.Emit(ctx, tx, s.schema, "assessment.completed", Summary(done), done.Request.Notify); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
 }
 func (s *Store) PlanKey(ctx context.Context, id uuid.UUID) (string, error) {
@@ -119,7 +138,7 @@ func (s *Store) DispatchAutomaticPlan(ctx context.Context) error {
 		if loadErr != nil {
 			return loadErr
 		}
-		plan, _, enqueueErr := s.EnqueuePlan(ctx, parent, a.AssetID, a.ActorID, a.RequestedBy, "auto-"+Hash([]byte(parent.String()+manifest)), manifest, "in-place")
+		plan, _, enqueueErr := s.EnqueuePlan(ctx, parent, a.AssetID, a.ActorID, a.RequestedBy, "auto-"+Hash([]byte(parent.String()+manifest)), manifest, "")
 		if enqueueErr != nil {
 			if errors.Is(enqueueErr, ErrScope) || errors.Is(enqueueErr, ErrInput) {
 				_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.automatic_remediations SET status='blocked',error='Asset scope or parent eligibility changed' WHERE parent_id=$1 AND manifest=$2`, parent, manifest)

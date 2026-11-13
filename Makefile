@@ -131,3 +131,7 @@ malware-test:
 .PHONY: remediation-live-test
 remediation-live-test: scanner-test
 	SCRS_TEST_OSV_BINARY="$(CURDIR)/bin/osv-scanner" SCRS_TEST_LIVE_REMEDIATION=1 $(GO) test -race -count=1 ./internal/scanner -run TestUpstreamRemediation
+
+.PHONY: image-scan-test
+image-scan-test:
+	DOCKER=$(DOCKER) GO=$(GO) bash scripts/test_images.sh

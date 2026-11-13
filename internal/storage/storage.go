@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
@@ -138,7 +139,12 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			return errors.New("assessment schema migration failed")
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111205) ON CONFLICT DO NOTHING`); err != nil {
+	for _, ddl := range notify.Schema(schema) {
+		if _, err := tx.Exec(ctx, ddl); err != nil {
+			return errors.New("notification schema migration failed")
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111301) ON CONFLICT DO NOTHING`); err != nil {
 		return errors.New("PostgreSQL migration version record failed")
 	}
 	if err := tx.Commit(ctx); err != nil {

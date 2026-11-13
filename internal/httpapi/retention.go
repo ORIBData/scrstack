@@ -62,12 +62,13 @@ func retentionHandler(store *assessments.Store) http.Handler {
 			return
 		}
 		var input struct {
-			Days int `json:"inbound_event_days"`
+			Days         int `json:"inbound_event_days"`
+			DeliveryDays int `json:"webhook_delivery_days"`
 		}
 		if !readBody(w, r, &input) {
 			return
 		}
-		p, err := store.SetRetention(ctx, actor.ID, revision, input.Days)
+		p, err := store.SetRetention(ctx, actor.ID, revision, assessments.Retention{InboundEventDays: input.Days, WebhookDeliveryDays: input.DeliveryDays})
 		if err != nil {
 			assessmentError(w, err)
 			return

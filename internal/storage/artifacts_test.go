@@ -53,7 +53,24 @@ func TestS3ArtifactsRoundTripAndTamper(t *testing.T) {
 	if _, err := a.GetSBOM(ctx, key); err == nil {
 		t.Fatal("artifact corruption not detected")
 	}
-	for _, object := range []string{key, planKey} {
+	archive := []byte("\x1f\x8bsynthetic-archive")
+	snapKey, err := a.PutSnapshot(ctx, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, err := a.GetSnapshot(ctx, snapKey); err != nil || !bytes.Equal(archive, data) {
+		t.Fatal("snapshot roundtrip failed", err)
+	}
+	if _, err := a.GetSnapshot(ctx, "sbom/"+digest+".cdx.json"); err == nil {
+		t.Fatal("snapshot reader accepted another artifact class")
+	}
+	if _, err := a.client.PutObject(ctx, a.bucket, snapKey, strings.NewReader("tampered"), 8, minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.GetSnapshot(ctx, snapKey); err == nil {
+		t.Fatal("snapshot corruption not detected")
+	}
+	for _, object := range []string{key, planKey, snapKey} {
 		if err := a.client.RemoveObject(ctx, a.bucket, object, minio.RemoveObjectOptions{}); err != nil {
 			t.Fatal(err)
 		}
