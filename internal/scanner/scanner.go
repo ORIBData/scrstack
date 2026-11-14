@@ -26,7 +26,10 @@ import (
 )
 
 type Engine struct {
-	Indicators                  *IndicatorBundle
+	Indicators *IndicatorBundle
+	// Rules is the YARA-X rule pack sent with this scan; YARABinary runs it.
+	Rules                       *RulePack
+	YARABinary                  string
 	Binary, WorkRoot, Database  string
 	RemediationEnabled          bool
 	RemediationProxy            string
@@ -150,7 +153,9 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 		return out, err
 	}
 	contentCtx, done := context.WithTimeout(ctx, 90*time.Second)
-	files, findings, stages := e.inspectContent(contentCtx, source)
+	// YARA-X gets the request budget: compiling a new pack and scanning take
+	// longer than the in-process content rules.
+	files, findings, stages := e.inspectContent(contentCtx, ctx, source)
 	done()
 	out.Files = files
 	out.Findings = findings
@@ -300,7 +305,7 @@ func (e Engine) Handler(token string) http.Handler {
 			http.Error(w, "scanner busy", 429)
 			return
 		}
-		body, indicators, err := scanInput(w, r)
+		body, intel, err := scanInput(w, r)
 		if err != nil {
 			slog.Warn("scan input rejected", "error", err)
 			http.Error(w, "archive too large", 413)
@@ -319,9 +324,7 @@ func (e Engine) Handler(token string) http.Handler {
 			_, _ = w.Write(result)
 			return
 		}
-		engine := e
-		engine.Indicators = indicators
-		result, err := engine.Run(ctx, body)
+		result, err := intel.apply(e).Run(ctx, body)
 		if err != nil {
 			slog.Warn("scan failed", "error", err)
 			http.Error(w, "scan failed or incomplete", 422)
@@ -373,7 +376,7 @@ func (e Engine) parseResults(raw []byte, enrich *enrichment, pathOf func(string)
 			}
 			components = append(components, c)
 			for _, i := range purls[strings.ToLower(c.PURL)] {
-				f := contentFinding("ioc_match", i.ID, "Component matches active package indicator", c.Path, "")
+				f := iocFinding(i, "Component matches active package indicator", c.Path, "")
 				f.Component = c
 				findings = append(findings, f)
 			}

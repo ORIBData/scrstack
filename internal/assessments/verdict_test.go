@@ -31,6 +31,12 @@ func TestVerdictGate(t *testing.T) {
 		{"existing serious integrity warns", Result{Complete: true, Findings: []Finding{withChange(workflow, "existing")}}, nil, "warn"},
 		{"new medium integrity warns", Result{Complete: true, Findings: []Finding{{Fingerprint: "i", Type: "integrity", Severity: "medium", Change: "new"}}}, nil, "warn"},
 		{"existing medium integrity does not gate", Result{Complete: true, Findings: []Finding{{Fingerprint: "i", Type: "integrity", Severity: "medium", Change: "existing"}}}, nil, "pass"},
+		{"yara hunt never gates", Result{Complete: true, Findings: []Finding{{Fingerprint: "y", Type: "yara_hunt", Severity: "critical", Change: "new"}}}, nil, "pass"},
+		{"yara alert gates by severity", Result{Complete: true, Findings: []Finding{{Fingerprint: "y", Type: "yara_alert", Severity: "high", Change: "new"}}}, nil, "warn"},
+		{"existing yara block still fails", Result{Complete: true, Findings: []Finding{{Fingerprint: "y", Type: "yara_match", Severity: "critical", Change: "existing"}}}, nil, "fail"},
+		{"ioc hunt never gates", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_hunt", Severity: "critical", Change: "new"}}}, nil, "pass"},
+		{"new critical ioc alert fails", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "critical", Change: "new"}}}, nil, "fail"},
+		{"existing ioc alert high does not gate", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "high", Change: "existing"}}}, nil, "pass"},
 	} {
 		if got, _ := verdict(tc.result, tc.waived); got != tc.expected {
 			t.Errorf("%s: got %s, want %s", tc.name, got, tc.expected)

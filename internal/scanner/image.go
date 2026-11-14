@@ -58,7 +58,7 @@ func (e Engine) RunImage(ctx context.Context, archivePath string) (Output, error
 // Only files with a malware verdict other than clean, or with findings, are
 // recorded as evidence; whole-image inventories exceed the evidence budget.
 func (e Engine) scanLayers(ctx context.Context, archivePath string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
-	scan := e.newContentScan(ctx, true)
+	scan := e.newContentScan(ctx, ctx, true, filepath.Dir(archivePath))
 	files := []FileEvidence{}
 	image, err := tarball.ImageFromPath(archivePath, nil)
 	if err != nil {
@@ -264,14 +264,21 @@ func (e Engine) imageHandler(expected [32]byte, slots chan struct{}) http.Handle
 			http.Error(w, "work area unavailable", http.StatusInsufficientStorage)
 			return
 		}
-		n, copyErr := io.Copy(f, io.LimitReader(r.Body, limit+1))
+		stream, intel, err := imageInput(r)
+		if err != nil {
+			f.Close()
+			slog.Warn("image request rejected", "error", err)
+			http.Error(w, "invalid image request", http.StatusRequestEntityTooLarge)
+			return
+		}
+		n, copyErr := io.Copy(f, io.LimitReader(stream, limit+1))
 		closeErr := f.Close()
 		if copyErr != nil || closeErr != nil || n > limit {
 			slog.Warn("image upload rejected", "bytes", n, "error", copyErr)
 			http.Error(w, "image archive too large or incomplete", http.StatusRequestEntityTooLarge)
 			return
 		}
-		result, err := e.RunImage(r.Context(), archive)
+		result, err := intel.apply(e).RunImage(r.Context(), archive)
 		if err != nil {
 			slog.Warn("image scan failed", "error", err)
 			http.Error(w, "image scan failed", http.StatusUnprocessableEntity)

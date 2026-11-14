@@ -36,6 +36,7 @@ func ValidateInput(c Connection, credential json.RawMessage) error {
 			AuthType       string `json:"auth_type"`
 			AppID          string `json:"app_id"`
 			InstallationID int64  `json:"installation_id"`
+			WebhookSource  string `json:"webhook_source"`
 		}
 		var cred struct {
 			PrivateKeyPEM string `json:"private_key_pem"`
@@ -59,6 +60,10 @@ func ValidateInput(c Connection, credential json.RawMessage) error {
 			}
 		default:
 			return errors.New("GitHub auth type invalid")
+		}
+		// The delivery check reads the GitHub App's webhook or the organization's.
+		if cfg.WebhookSource != "" && cfg.WebhookSource != "org" && (cfg.WebhookSource != "app" || cfg.AuthType != "github_app") {
+			return errors.New("GitHub webhook_source must be org, or app with GitHub App authentication")
 		}
 	case "dockerhub":
 		var cfg struct {

@@ -148,6 +148,11 @@ analyses run concurrently:
   content is scanned once. Files over 25 MiB are hashed but not scanned
   (`malware: partial`). The scan stops at 200 000 files or 4 minutes and reports
   partial coverage. Only flagged files are listed under `/files`.
+- **YARA-X rulesets:** enabled team and third-party rulesets run on every
+  distinct repository file and image layer file up to 128 MiB (stage
+  `yara_x`). The stage is `skipped` with no rulesets; when it runs, `partial`
+  or `failed` makes the verdict `incomplete`. See
+  [THREAT_INTELLIGENCE.md](THREAT_INTELLIGENCE.md).
 
 Repository workflow rules (workflow changes, install hooks, root helper scripts)
 do not apply to images; `integrity` says so in its detail.
@@ -173,15 +178,18 @@ GitHub or GitLab asset. The worker speaks git's smart HTTP protocol directly
 (no git binary), verifies the pack checksum, and streams the bundle through a
 SHA-256 hash into S3 (`mirrors/<id>.bundle`, at most `SCRS_MIRROR_MAX_BYTES`).
 With `SCRS_MIRROR_INTERVAL_HOURS`, assets labelled `mirror=true` are mirrored
-on schedule. The newest `SCRS_MIRROR_KEEP` bundles per asset are kept; older
-ones are marked `pruned` and their objects deleted. Restore: download with an
+on schedule. A bundle is marked `pruned` and its object deleted only when it
+is beyond the newest `SCRS_MIRROR_KEEP` and older than `SCRS_MIRROR_MIN_AGE_DAYS`
+(default 30). The newest bundle taken before the asset's earliest open integrity
+finding is never pruned, so repeated mirroring of a compromised repository cannot
+replace every clean backup. Restore: download with an
 admin token, compare with `X-Content-SHA256`, then `git clone <file>.bundle`.
 SHA-256 object-format repositories are not supported.
 
 ## Remaining product gates
 
 - Licensing/SPDX/compliance policy, built-in SAST and reachability analysis (SARIF import covers external SAST tools).
-- YARA runs inside ClamAV, which supports a subset of YARA (no modules such as `pe` or `math`); rules needing modules are rejected at load.
+- The built-in starter rules run inside ClamAV, which supports a subset of YARA (no modules). Rules needing modules belong in a YARA-X ruleset (`/intel/yara-rulesets`).
 - Real private-repository and registry acceptance on the target VPS; hosted backup/restore drills.
 
 Consequently, successful execution can still return `incomplete`, for example
@@ -228,12 +236,14 @@ oversize files and stale/unavailable signature dates make coverage partial.
 Signature versions older than 26 hours produce posture findings. See the upstream
 [ClamD protocol](https://docs.clamav.net/manual/Usage/ClamdProtocol.html).
 
-An admin can `PUT /feeds/indicators` with an immutable version and up to 10,000
-SHA256/domain indicators, each with an ID and expiry. Import atomically replaces the
-active version while retaining prior JSONB and audit history. Expired indicators do
-not match. Text-domain extraction is capped at 1 MiB per file; skipped text means
-partial coverage. Other feed types and automatic remote feed synchronization remain
-unimplemented. Workflow `toJSON(secrets)` matches are critical; changes to workflow
+Indicators live in indicator sources (`/intel/indicator-sources`), each with its own
+mode (`hunt`, `alert` or `block`), severity and minimum confidence; see
+[Threat intelligence](THREAT_INTELLIGENCE.md#indicator-sources). Each scan receives the
+unexpired indicators of every enabled source. `PUT /feeds/indicators` still activates an
+immutable version of up to 10,000 indicators, keeps prior versions and audit history,
+and feeds the block-mode `bundle` source. Text matching (domains, IPv4, URLs, content
+patterns) is capped at 1 MiB per file; skipped text means partial coverage. STIX upload
+and TAXII polling are being built. Workflow `toJSON(secrets)` matches are critical; changes to workflow
 file hashes compared with the prior assessment raise high-severity integrity entries.
 This is a change baseline, not a last-known-good declaration.
 

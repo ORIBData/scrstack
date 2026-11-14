@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"hash"
 	"io"
 	"io/fs"
 	"net"
@@ -98,14 +101,15 @@ func loadIndicators(filename string) (IndicatorBundle, error) {
 		return IndicatorBundle{}, err
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, (4<<20)+1))
+	data, err := io.ReadAll(io.LimitReader(f, intelligence.MaxScanBundleBytes+1))
 	if err != nil {
 		return IndicatorBundle{}, err
 	}
-	return intelligence.Parse(data)
+	return intelligence.ParseScan(data)
 }
 
 var contentDomain = regexp.MustCompile(`(?i)\b[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}\b`)
+var contentURL = regexp.MustCompile(`(?i)\b(?:https?|hxxps?|ftp)://[^\s"'<>\x60(){}\[\]\\|^]+`)
 var contentIPv4 = regexp.MustCompile(`\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b`)
 var secretsPattern = regexp.MustCompile(`(?i)tojson\s*\(\s*secrets\s*\)`)
 
@@ -119,6 +123,29 @@ const yaraCanary = "SCRS-YARA-CANARY-7f3c9a1e5b2d4086-coverage-probe"
 func contentFinding(kind, id, title, path, digest string) assessments.Finding {
 	evidence, _ := json.Marshal(map[string]string{"path": path, "sha256": digest, "rule_id": id})
 	return assessments.Finding{Type: kind, AdvisoryID: id, Title: title, Severity: "critical", Score: 100, Component: assessments.Component{Path: path}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Quarantine this revision, review the matched file, and rotate exposed credentials when applicable. Do not execute suspicious content.","automatic_changes":false}`)}
+}
+
+// iocFinding maps an indicator match to a finding whose type carries the
+// source mode, as for YARA: ioc_match blocks like malware, ioc_alert gates by
+// the source severity and ioc_hunt is recorded only.
+func iocFinding(i Indicator, title, path, digest string) assessments.Finding {
+	f := contentFinding("ioc_match", i.Key(), title, path, digest)
+	if i.Mode == "alert" || i.Mode == "hunt" {
+		severity := i.Severity
+		if severity == "" {
+			severity = "high"
+		}
+		f.Type, f.Severity, f.Score = "ioc_"+i.Mode, severity, ruleSeverityScore[severity]
+		f.Guidance = json.RawMessage(`{"summary":"Review the matched file. For hunt sources, confirm the indicator is relevant before promoting the source. For alert sources, treat the revision as suspect until reviewed. Do not execute suspicious content.","automatic_changes":false}`)
+	}
+	if i.Source != "" {
+		evidence := map[string]any{"path": path, "sha256": digest, "rule_id": i.Key(), "indicator_id": i.ID, "indicator_type": i.Type, "source": i.Source, "mode": i.Mode}
+		if i.Confidence != nil {
+			evidence["confidence"] = *i.Confidence
+		}
+		f.Evidence, _ = json.Marshal(evidence)
+	}
+	return f
 }
 
 func integrityFinding(id, title, severity, path, digest string, detail map[string]any) assessments.Finding {
@@ -137,13 +164,14 @@ func integrityFinding(id, title, severity, path, digest string, detail map[strin
 // indicatorSet groups active content indicators by matcher (TIF, INT-008).
 type indicatorSet struct {
 	hashes, domains, ips map[string][]Indicator
+	md5s, sha1s, urls    map[string][]Indicator
 	paths, contents      []intelligence.Pattern
 	steps                []Indicator
 	active               int
 }
 
 func newIndicatorSet(b IndicatorBundle, now time.Time) indicatorSet {
-	set := indicatorSet{hashes: map[string][]Indicator{}, domains: map[string][]Indicator{}, ips: map[string][]Indicator{}}
+	set := indicatorSet{hashes: map[string][]Indicator{}, domains: map[string][]Indicator{}, ips: map[string][]Indicator{}, md5s: map[string][]Indicator{}, sha1s: map[string][]Indicator{}, urls: map[string][]Indicator{}}
 	for _, i := range b.Indicators {
 		if !now.Before(i.ValidUntil) {
 			continue
@@ -151,6 +179,12 @@ func newIndicatorSet(b IndicatorBundle, now time.Time) indicatorSet {
 		switch i.Type {
 		case "sha256":
 			set.hashes[strings.ToLower(i.Value)] = append(set.hashes[strings.ToLower(i.Value)], i)
+		case "md5":
+			set.md5s[i.Value] = append(set.md5s[i.Value], i)
+		case "sha1":
+			set.sha1s[i.Value] = append(set.sha1s[i.Value], i)
+		case "url":
+			set.urls[i.Value] = append(set.urls[i.Value], i)
 		case "domain":
 			set.domains[i.Value] = append(set.domains[i.Value], i)
 		case "ipv4":
@@ -190,6 +224,9 @@ type contentScan struct {
 	wg       sync.WaitGroup
 	// image disables repository-only rules (workflows, hooks, root helpers).
 	image bool
+	// rules runs YARA-X over distinct contents under its own deadline.
+	rules    *ruleScan
+	rulesCtx context.Context
 }
 
 type clamJob struct {
@@ -233,6 +270,7 @@ func (c *contentScan) submit(sha string, data []byte) {
 // finish waits for outstanding verdicts, records malware findings and reports
 // each pending file's final status. Call it once, after the last file.
 func (c *contentScan) finish(resolve func(FileEvidence)) {
+	c.findings = append(c.findings, c.rules.finish(c.rulesCtx)...)
 	if c.jobs != nil {
 		close(c.jobs)
 		c.wg.Wait()
@@ -257,8 +295,11 @@ func (c *contentScan) finish(resolve func(FileEvidence)) {
 	c.pending = nil
 }
 
-func (e Engine) newContentScan(ctx context.Context, image bool) *contentScan {
-	c := &contentScan{ctx: ctx, address: e.ClamdAddress, image: image, verdicts: map[string]string{}, queued: map[string]bool{}, findings: []assessments.Finding{}}
+// newContentScan prepares one assessment's content rules. rulesCtx bounds
+// YARA-X; scanDir holds its batches and is removed by the caller.
+func (e Engine) newContentScan(ctx, rulesCtx context.Context, image bool, scanDir string) *contentScan {
+	c := &contentScan{ctx: ctx, rulesCtx: rulesCtx, address: e.ClamdAddress, image: image, verdicts: map[string]string{}, queued: map[string]bool{}, findings: []assessments.Finding{}}
+	c.rules = newRuleScan(rulesCtx, e.YARABinary, e.WorkRoot, scanDir, e.Rules)
 	c.malware = assessments.Stage{Name: "malware", Status: "ok", Detail: "ClamAV regular-file INSTREAM coverage"}
 	c.yara = assessments.Stage{Name: "yara", Status: "skipped", Detail: "ClamAV endpoint not configured"}
 	if e.ClamdAddress == "" {
@@ -301,7 +342,7 @@ func (e Engine) newContentScan(ctx context.Context, image bool) *contentScan {
 		} else {
 			c.set = newIndicatorSet(bundle, time.Now())
 			c.ioc.Status = "ok"
-			c.ioc.Detail = "Hash, domain, IPv4, path, content and workflow-step matching; bundle " + bundle.Version
+			c.ioc.Detail = "Hash (SHA-256, SHA-1, MD5), domain, IPv4, URL, path, content and workflow-step matching; bundle " + bundle.Version
 			if c.set.active == 0 {
 				c.ioc.Status, c.ioc.Detail = "skipped", "No unexpired indicators"
 			}
@@ -329,12 +370,54 @@ func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEviden
 		}
 		sum := sha256.Sum256(data)
 		record.SHA256 = hex.EncodeToString(sum[:])
+		if len(c.set.md5s) > 0 {
+			sum := md5.Sum(data)
+			c.weakHashes(record, hex.EncodeToString(sum[:]), c.set.md5s, "File MD5 matches active indicator")
+		}
+		if len(c.set.sha1s) > 0 {
+			sum := sha1.Sum(data)
+			c.weakHashes(record, hex.EncodeToString(sum[:]), c.set.sha1s, "File SHA-1 matches active indicator")
+		}
 	} else {
+		// Large binaries are where pe, elf and dotnet rules matter most, so
+		// they are spilled to the YARA-X batch while being hashed.
 		h := sha256.New()
-		if _, err := io.Copy(h, r); err != nil {
+		var sink io.Writer = h
+		var weakMD5, weakSHA1 hash.Hash
+		if len(c.set.md5s) > 0 {
+			weakMD5 = md5.New()
+			sink = io.MultiWriter(sink, weakMD5)
+		}
+		if len(c.set.sha1s) > 0 {
+			weakSHA1 = sha1.New()
+			sink = io.MultiWriter(sink, weakSHA1)
+		}
+		spill, err := c.rules.writer(size)
+		if err != nil {
+			c.rules.fail("Rule scan work area write failed")
+		} else if spill != nil {
+			sink = io.MultiWriter(h, spill)
+		}
+		if _, err := io.Copy(sink, r); err != nil {
+			if spill != nil {
+				spill.Close()
+				os.Remove(spill.Name())
+			}
 			return record, err
 		}
 		record.SHA256 = hex.EncodeToString(h.Sum(nil))
+		if weakMD5 != nil {
+			c.weakHashes(record, hex.EncodeToString(weakMD5.Sum(nil)), c.set.md5s, "File MD5 matches active indicator")
+		}
+		if weakSHA1 != nil {
+			c.weakHashes(record, hex.EncodeToString(weakSHA1.Sum(nil)), c.set.sha1s, "File SHA-1 matches active indicator")
+		}
+		if spill != nil {
+			c.rules.commit(c.rulesCtx, spill, record.SHA256, record.Path, size)
+		}
+	}
+	if data != nil {
+		c.rules.add(c.rulesCtx, record.SHA256, record.Path, data)
 	}
 	if c.address != "" {
 		if data == nil {
@@ -348,11 +431,11 @@ func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEviden
 		}
 	}
 	for _, i := range c.set.hashes[record.SHA256] {
-		c.findings = append(c.findings, contentFinding("ioc_match", i.ID, "File hash matches active indicator", record.Path, record.SHA256))
+		c.findings = append(c.findings, iocFinding(i, "File hash matches active indicator", record.Path, record.SHA256))
 	}
 	for _, p := range c.set.paths {
 		if p.MatchString(record.Path) {
-			c.findings = append(c.findings, contentFinding("ioc_match", p.ID, "File path matches active indicator", record.Path, record.SHA256))
+			c.findings = append(c.findings, iocFinding(p.Indicator, "File path matches active indicator", record.Path, record.SHA256))
 		}
 	}
 	if !c.image && !strings.Contains(record.Path, "/") && hiddenHelper.MatchString(filepath.Base(record.Path)) {
@@ -367,7 +450,7 @@ func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEviden
 				c.findings = append(c.findings, inspectText(record, text, c.set)...)
 			}
 		}
-	} else if c.ioc.Status == "ok" && (len(c.set.domains) > 0 || len(c.set.ips) > 0 || len(c.set.contents) > 0) {
+	} else if c.ioc.Status == "ok" && (len(c.set.domains) > 0 || len(c.set.ips) > 0 || len(c.set.urls) > 0 || len(c.set.contents) > 0) {
 		c.ioc.Status = "partial"
 		c.ioc.Detail = "Text indicators skipped files above 1 MiB"
 	}
@@ -378,17 +461,28 @@ func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEviden
 }
 
 // incomplete marks every content stage partial after an interrupted walk.
+// weakHashes records MD5 or SHA-1 indicator matches. Those digests are only
+// computed when such indicators are active.
+func (c *contentScan) weakHashes(record FileEvidence, digest string, set map[string][]Indicator, title string) {
+	for _, i := range set[digest] {
+		c.findings = append(c.findings, iocFinding(i, title, record.Path, record.SHA256))
+	}
+}
+
 func (c *contentScan) incomplete(detail string) {
 	c.malware.Status, c.ioc.Status, c.integrity.Status = "partial", "partial", "partial"
+	if c.rules.stage.Status == "ok" {
+		c.rules.stage.Status = "partial"
+	}
 	c.integrity.Detail = detail
 }
 
 func (c *contentScan) stages() []assessments.Stage {
-	return []assessments.Stage{c.malware, c.yara, c.ioc, c.integrity}
+	return []assessments.Stage{c.malware, c.yara, c.ioc, c.integrity, c.rules.stage}
 }
 
-func (e Engine) inspectContent(ctx context.Context, root string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
-	scan := e.newContentScan(ctx, false)
+func (e Engine) inspectContent(ctx, rulesCtx context.Context, root string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
+	scan := e.newContentScan(ctx, rulesCtx, false, filepath.Dir(root))
 	files := []FileEvidence{}
 	index := map[string]int{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
@@ -443,7 +537,7 @@ func matchText(record FileEvidence, text string, set indicatorSet) []assessments
 		}
 		seen[domain] = true
 		for _, i := range set.domains[domain] {
-			out = append(out, contentFinding("ioc_match", i.ID, "Text domain matches active indicator", record.Path, record.SHA256))
+			out = append(out, iocFinding(i, "Text domain matches active indicator", record.Path, record.SHA256))
 		}
 	}
 	if len(set.ips) > 0 {
@@ -453,13 +547,25 @@ func matchText(record FileEvidence, text string, set indicatorSet) []assessments
 			}
 			seen[ip] = true
 			for _, i := range set.ips[ip] {
-				out = append(out, contentFinding("ioc_match", i.ID, "Text IPv4 address matches active indicator", record.Path, record.SHA256))
+				out = append(out, iocFinding(i, "Text IPv4 address matches active indicator", record.Path, record.SHA256))
+			}
+		}
+	}
+	if len(set.urls) > 0 {
+		for _, found := range contentURL.FindAllString(text, -1) {
+			normalized, ok := intelligence.NormalizeURL(strings.TrimRight(found, ".,;:!?'\""))
+			if !ok || seen[normalized] {
+				continue
+			}
+			seen[normalized] = true
+			for _, i := range set.urls[normalized] {
+				out = append(out, iocFinding(i, "Text URL matches active indicator", record.Path, record.SHA256))
 			}
 		}
 	}
 	for _, p := range set.contents {
 		if p.MatchString(text) {
-			out = append(out, contentFinding("ioc_match", p.ID, "File content matches active indicator", record.Path, record.SHA256))
+			out = append(out, iocFinding(p.Indicator, "File content matches active indicator", record.Path, record.SHA256))
 		}
 	}
 	return out
@@ -476,7 +582,7 @@ func inspectText(record FileEvidence, text string, set indicatorSet) []assessmen
 		lower := strings.ToLower(text)
 		for _, i := range set.steps {
 			if strings.Contains(lower, "name: "+strings.ToLower(i.Value)) || strings.Contains(lower, "name: \""+strings.ToLower(i.Value)) || strings.Contains(lower, "name: '"+strings.ToLower(i.Value)) {
-				out = append(out, contentFinding("ioc_match", i.ID, "Workflow step name matches active indicator", record.Path, record.SHA256))
+				out = append(out, iocFinding(i, "Workflow step name matches active indicator", record.Path, record.SHA256))
 			}
 		}
 	}

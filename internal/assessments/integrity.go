@@ -6,7 +6,6 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/ORIBData/scrstack/internal/intelligence"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -124,16 +123,3 @@ func (s *Store) RecentBranchCreation(ctx context.Context, repository, ref string
 }
 
 const zeroSHA = "0000000000000000000000000000000000000000"
-
-// ActiveBundle returns the parsed active indicator bundle, if any.
-func (s *Store) ActiveBundle(ctx context.Context) (*intelligence.Bundle, error) {
-	raw, err := s.ActiveIndicators(ctx)
-	if err != nil || len(raw) == 0 {
-		return nil, err
-	}
-	b, err := intelligence.Parse(raw)
-	if err != nil {
-		return nil, err
-	}
-	return &b, nil
-}

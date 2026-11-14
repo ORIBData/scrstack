@@ -2,7 +2,7 @@ package assessments
 
 // Schema is applied under the storage migration lock. No destructive DDL.
 func Schema(s string) []string {
-	return append(baseSchema(s), mirrorSchema(s)...)
+	return append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...)
 }
 
 func baseSchema(s string) []string {
@@ -62,5 +62,10 @@ func baseSchema(s string) []string {
 		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS labels jsonb NOT NULL DEFAULT '{}'`,
 		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1`,
 		`CREATE INDEX IF NOT EXISTS assets_owner_idx ON ` + s + `.assets(owner_id)`,
+		// 2026-11-13: commit lookups without an asset (Latest) and per-ref
+		// history of any status (rescan scheduling, file baselines).
+		`CREATE INDEX IF NOT EXISTS assessments_resolved_commit_idx ON ` + s + `.assessments(resolved_commit) WHERE resolved_commit<>''`,
+		`CREATE INDEX IF NOT EXISTS assessments_request_commit_idx ON ` + s + `.assessments((request->'target'->>'commit')) WHERE request->'target'->>'commit' IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS assessments_asset_ref_idx ON ` + s + `.assessments(asset_id,(request->'target'->>'ref'),created_at DESC)`,
 	}
 }

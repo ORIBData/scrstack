@@ -208,8 +208,11 @@ func (a NativeAdapters) download(ctx context.Context, target string, auth func(*
 		return nil, fmt.Errorf("archive download returned HTTP %d", resp.StatusCode)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil || int64(len(data)) > limit {
-		return nil, errors.New("archive exceeded download limit")
+	if err != nil {
+		return nil, errors.New("archive download failed")
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%w: archive exceeded download limit", ErrTooLarge)
 	}
 	return data, nil
 }

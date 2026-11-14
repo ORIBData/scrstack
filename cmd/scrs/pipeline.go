@@ -98,7 +98,7 @@ func pipelineCommand() error {
 		retry := time.Minute
 		for {
 			syncCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
-			err := scanner.SyncFeeds(syncCtx, setting("SCRS_FEED_ROOT", "/feeds"), strings.Split(setting("SCRS_OSV_ECOSYSTEMS", "npm,Go,Maven,PyPI,Alpine,Debian"), ","))
+			err := scanner.SyncFeeds(syncCtx, setting("SCRS_FEED_ROOT", "/feeds"), strings.Split(setting("SCRS_OSV_ECOSYSTEMS", "npm,Go,Maven,PyPI,Pub,SwiftURL,RubyGems,Alpine,Debian"), ","))
 			cancel()
 			if err != nil {
 				logger.Error("OSV feed synchronization failed", "error", err, "retry_in", retry.String())
@@ -126,7 +126,7 @@ func pipelineCommand() error {
 		if len(token) < 32 || strings.HasPrefix(token, "REPLACE") {
 			return errors.New("set a random SCRS_SCANNER_API_TOKEN of at least 32 characters")
 		}
-		engine := scanner.Engine{ClamdAddress: os.Getenv("SCRS_CLAMD_ADDRESS"), IndicatorFile: os.Getenv("SCRS_INDICATOR_FILE"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RemediationProxy: os.Getenv("SCRS_REMEDIATION_PROXY"), Binary: setting("SCRS_OSV_BINARY", "/usr/local/bin/osv-scanner"), WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Database: setting("SCRS_OSV_DB", "/feeds/current")}
+		engine := scanner.Engine{ClamdAddress: os.Getenv("SCRS_CLAMD_ADDRESS"), IndicatorFile: os.Getenv("SCRS_INDICATOR_FILE"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RemediationProxy: os.Getenv("SCRS_REMEDIATION_PROXY"), Binary: setting("SCRS_OSV_BINARY", "/usr/local/bin/osv-scanner"), WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Database: setting("SCRS_OSV_DB", "/feeds/current"), YARABinary: setting("SCRS_YARA_BINARY", "/usr/local/bin/yr")}
 		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
 			engine.MaxImageBytes = limit
 		} else {
@@ -194,11 +194,22 @@ func pipelineCommand() error {
 			if keep, err := strconv.Atoi(os.Getenv("SCRS_MIRROR_KEEP")); err == nil && keep > 0 && keep <= 365 {
 				w.KeepMirrors = keep
 			}
+			w.MirrorMinAgeDays = 30
+			if days, err := strconv.Atoi(os.Getenv("SCRS_MIRROR_MIN_AGE_DAYS")); err == nil && days >= 0 && days <= 3650 {
+				w.MirrorMinAgeDays = days
+			}
 			go w.RunMirrors(ctx)
 		}
 		mirror := time.Duration(0)
 		if hours, err := strconv.Atoi(os.Getenv("SCRS_MIRROR_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*90 {
 			mirror = time.Duration(hours) * time.Hour
+		}
+		hookCheck := 5 * time.Minute
+		if minutes, err := strconv.Atoi(os.Getenv("SCRS_GITHUB_HOOK_CHECK_MINUTES")); err == nil && minutes >= 0 && minutes <= 1440 {
+			hookCheck = time.Duration(minutes) * time.Minute
+		}
+		if hookCheck > 0 {
+			go w.CheckGitHubHooks(ctx, hookCheck, os.Getenv("SCRS_GITHUB_HOOK_URL"))
 		}
 		go w.Maintain(ctx, time.Hour, rescan, mirror)
 		return w.Run(ctx)

@@ -256,8 +256,9 @@ func sarifSeverity(score, level string) string {
 
 // Import records an external scanner report as a completed assessment of an
 // in-scope asset revision. Imported findings join the risk register and gate
-// like SCRS findings, but an import never closes register entries and never
-// serves as a baseline: it did not observe the whole revision.
+// like SCRS findings. An import never serves as a baseline, since it did not
+// observe the whole revision, and closes entries only with replace_previous,
+// and then only that tool's entries for the ref.
 func (s *Store) Import(ctx context.Context, request Request, actor uuid.UUID, name, key, format string, replace bool, report []byte) (Assessment, bool, error) {
 	src, components, findings, err := ParseReport(format, report)
 	if err != nil {

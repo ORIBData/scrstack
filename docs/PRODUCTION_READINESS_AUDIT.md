@@ -190,3 +190,54 @@ required.
   - Rejects undiscovered or excluded assets (`404`) and malformed context (`400`).
   - Accepts the request (`202` with `Location`); a retry replays (`200`, `Idempotent-Replayed`) and a changed body under the same key conflicts (`409`).
   - Logs the inbound event, then delivers the context back in the `assessment.completed` payload.
+
+## 2026-11-13 second-pass audit: backups, gating accuracy, back-pressure
+
+A full source review of `cmd/scrs`, `internal/*` and `api/` for business logic, authorization,
+races, data loss and performance. Defects below were not covered by earlier passes.
+
+**Fixed**
+
+| Severity | Finding | Fix | Evidence |
+| --- | --- | --- | --- |
+| High | Mirror pruning was count-only (newest `SCRS_MIRROR_KEEP`). Scheduled mirroring of a compromised repository, or seven `POST /assets/{id}/mirrors` calls by any `write` token, deleted every clean backup. | A bundle is pruned only when beyond keep **and** older than `SCRS_MIRROR_MIN_AGE_DAYS` (default 30). The newest bundle taken before the asset's earliest open integrity finding is never pruned. | DB test: pre-incident bundle survives, young bundles survive, old post-incident bundle pruned, protection lifts once the integrity entry is resolved. |
+| High | Workflow-change detection compared against a partial file list. An interrupted content walk (deadline, findings cap) reported unreached workflows as `deleted`, or as `added` on the next scan. These are new high integrity entries: verdict `fail`, never auto-closed. | Deletions require a complete current walk; additions require a complete prior walk; digest changes on paths both walks saw are always reported. | DB test passes; reverting the fix makes it fail. |
+| High | `/assessments:import` with `replace_previous: true` marks findings `fixed` but accepted `trigger`-only tokens, which cannot otherwise triage. | `replace_previous` requires `write`; OpenAPI updated. | HTTP test: trigger token gets 403. |
+| Medium | The scanner serves one job and answers 429; the worker counted that as a failed attempt. With more than one worker per scanner, jobs failed permanently from contention alone. | 429 requeues the job without spending an attempt (`Store.Release`), then the worker pauses 5 s. | DB test: attempt count restored, stale lease cannot release twice. |
+| Medium | Deterministic size failures (archive over 64 MiB, image over `SCRS_MAX_IMAGE_BYTES`, scanner 413) retried three times, re-downloading each time, with a generic error. | `connections.ErrTooLarge` and scanner 413 fail without retry, stored as "source exceeds SCRS size limits; not retried". | `TestFailurePolicy`; DB test classifies both cases. |
+| Medium | An import while a scan of the same asset was running hit the one-running-per-asset index and returned 500. | Mapped to `ErrBusy`: 409 with `Retry-After: 30`; OpenAPI updated. | DB test: 409 while running, 201 after. |
+| Medium | The worker held each repository archive twice (archive plus multipart copy). | Multipart body streams through a pipe. | DB test checks the streamed archive and indicator parts. |
+| Medium | `Latest` without an asset and the rescan scheduler filtered JSON fields with no usable index. | Indexes on `resolved_commit`, `request->target->commit`, and `(asset_id, ref, created_at)`. | Applied by idempotent DDL; `make database-test` re-bootstraps. |
+| Low | Import doc comment said imports never close findings. | Corrected. | — |
+
+**Accepted or deferred**
+
+- Snapshot and SBOM downloads are read into memory to verify their hash before sending. Bounded by the 64 MiB fetch cap and admin-only for snapshots.
+- An operator-supplied bootstrap token stores its first 8 characters as the listed prefix.
+- `PUT /settings/retention` without `webhook_delivery_days` resets it to keep-forever (full replacement).
+- `PATCH /register/{id}` has no `If-Match` check; the last writer wins.
+- Worker restarts during a scan spend an attempt.
+- staticcheck style findings (ST1005/ST1013) remain; non-style checks are clean.
+
+**Verification:** `make lint contract-check qa` and `make database-test` pass;
+staticcheck (non-style) is clean.
+
+## 2026-11-14 coverage gaps and threat-intelligence foundations
+
+**Fixed**
+
+| Severity | Finding | Fix | Evidence |
+| --- | --- | --- | --- |
+| High | GitHub never retries a failed webhook delivery. An SCRS restart or outage silently lost force-push and other integrity events, and nothing reported a missing or misconfigured hook. | A worker loop (`SCRS_GITHUB_HOOK_CHECK_MINUTES`, default 5) reads the SCRS webhook's delivery log (GitHub App or organization webhook). It requests redelivery of failed events with 5/10/20/40-minute backoff, at most five attempts. It reports rejected deliveries and hook misconfiguration, and abandons events past GitHub's three-day log with a `connection.degraded` alert. Results are at `GET /system/github-webhooks`. A failed check does not move the delivery window. | Adapter test against a fake GitHub API (pagination, off-endpoint links refused, app and org hooks); DB test covers backoff, settlement, rejection, abandonment, window anchoring and the single-replica lock; HTTP test. |
+| Medium | Flutter, Swift Package Manager and fastlane (RubyGems) lockfiles had no OSV feed, so the whole package stage failed and verdicts were `incomplete`. | `Pub`, `SwiftURL` and `RubyGems` added to the default `SCRS_OSV_ECOSYSTEMS` (about 5.5 MB). | Reproduced with OSV-Scanner offline. |
+| Medium | Image scans streamed a raw body, so the database indicator bundle never reached them; image IOC matching used only the optional `SCRS_INDICATOR_FILE`. | Image scan requests are multipart: indicators, then rules, then the image streamed last. | Worker DB test checks part order; scanner unit test. |
+| — | YARA ran only inside ClamAV, with no modules and no way to add rules. | YARA-X rulesets: team rules from the Web UI and third-party packs, with the `pe`, `elf`, `math`, `hash` and `dotnet` modules, on repositories and image layers. Hunt by default; admins promote to alert or block. `include` directives are rejected because the compiler echoes the included file in errors. See `docs/THREAT_INTELLIGENCE.md`. | Scanner tests with the real `yr` binary (modules, located errors, large-file spill, deleted layer files, cache); HTTP test for scopes, revisions and the pack. |
+| — | All indicators came from one admin-only bundle that always blocked, with no source, confidence or report-only mode, and no MD5, SHA-1 or URL types. | Indicator sources (`/intel/indicator-sources`): each has a mode (`hunt` by default, giving `ioc_hunt` findings that never gate; `alert` gives `ioc_alert`, gating by severity; `block` gives `ioc_match`), a severity and a minimum confidence. MD5, SHA-1 (hashed only when such indicators are loaded) and URL indicators were added, and defanged values are normalized. `write` manages hunt sources; `admin` promotes. On migration, the active legacy bundle becomes the block-mode `bundle` source, which keeps plain IDs so existing findings keep their fingerprints. Enabled sources are capped at 100,000 indicators so the scan bundle (32 MiB) always fits. | Parser tests; scanner test for modes, MD5 on small and streamed files, SHA-1 and URL; DB tests for confidence, expiry and disable filtering, per-source IDs, the one-time legacy migration and cascade delete; HTTP test for scopes, revisions, the limit and audit. |
+
+**Accepted or documented**
+
+- Ubuntu is not supported offline: its OSV archive is 815 MB and expands to 8.1 GiB. Use a Trivy import for Ubuntu-based images.
+- CocoaPods has no OSV feed and OSV-Scanner does not read `Podfile.lock`.
+- GitLab force-push detection is out of scope for now (GitHub only).
+- Hunt-mode event patterns (branch, commit message, PR title, pushed path) are not applied to GitHub events, because every integrity event raises an alert. They still apply to file paths during scans.
+- Every GitHub event reloads the enabled event patterns from PostgreSQL; only the four pattern types are read.

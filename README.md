@@ -63,10 +63,11 @@ was added on top. The full product specification is in
 | **Container images** | Images from any connected registry, resolved to a platform digest and streamed to the scanner (size-capped). OS and language packages, CycloneDX SBOM and offline OSV matching, plus ClamAV, YARA and IOC inspection of every layer file, including files a later layer deleted. Registry push events (Harbor, Docker Hub, GAR, CNCF Distribution) trigger assessments pinned to the pushed digest. |
 | **SBOM** | CycloneDX 1.6 Software Bill of Materials per assessment, stored content-addressed in S3 and verified by hash on download (`/assessments/{id}/sbom`). |
 | **MBOM** | CycloneDX 1.6 Manufacturing Bill of Materials per assessment (`/assessments/{id}/mbom`): the produced commit or image digest, the build definitions and pinned inputs observed in that revision with SHA-256 digests, verifying tools and stage results, linked to the SBOM. It records declared build inputs, not an observed CI run; pair it with SLSA provenance where you have it. |
-| **Vulnerabilities** | Offline OSV-Scanner matching against a local OSV mirror refreshed every six hours (default ecosystems `npm,Go,Maven,PyPI,Alpine,Debian`). Repository suppression files are ignored. CISA KEV and EPSS raise priority for known-exploited and likely-exploited advisories. |
+| **Vulnerabilities** | Offline OSV-Scanner matching against a local OSV mirror refreshed every six hours (default ecosystems `npm,Go,Maven,PyPI,Pub,SwiftURL,RubyGems,Alpine,Debian`). Repository suppression files are ignored. CISA KEV and EPSS raise priority for known-exploited and likely-exploited advisories. |
 | **Malicious packages** | OSV `MAL-` reports (OpenSSF malicious-packages data) matched during the same pass. |
 | **Malware and YARA** | Every extracted file is streamed to ClamAV (`INSTREAM`). A starter YARA ruleset (miner pools, XMRig, base64-to-shell, secret exfiltration) is installed into ClamAV on each deploy; a canary proves it is loaded. Stale signatures reduce coverage and raise a posture finding. |
-| **Threat indicators (IOC)** | Versioned indicator bundles imported through the API: file SHA-256, domains, IPv4, package URLs, file-path and file-content regexes, workflow step names, and PR-title, branch and commit-message patterns applied to incoming GitHub events (PRD Appendix E). |
+| **YARA rulesets (YARA-X)** | Team rules written in the Web UI and third-party packs (for example YARA Forge) run with YARA-X, including the `pe`, `elf`, `math`, `hash` and `dotnet` modules, on every repository file and image layer file. New rulesets hunt (record only); admins promote them to alert or block. See [docs/THREAT_INTELLIGENCE.md](docs/THREAT_INTELLIGENCE.md). |
+| **Threat indicators (IOC)** | Indicator sources, each in hunt, alert or block mode with a minimum confidence: file SHA-256, SHA-1 and MD5, domains, IPv4, URLs, package URLs, file-path and file-content regexes, workflow step names, and PR-title, branch and commit-message patterns applied to incoming GitHub events (PRD Appendix E). |
 | **Integrity** | Workflows that serialize all secrets, workflow files changed since the last revision, npm install hooks, fetch-and-execute build steps and hidden CI helper scripts. Provider events raise immediate alerts: force pushes, ref deletions, create-then-delete branch churn, mass deletions, default-branch, visibility and repository changes, new collaborators and organization members. |
 | **External scanner import** | Trivy JSON (vulnerabilities, misconfigurations, secrets with values discarded) and SARIF 2.1.0 (Semgrep, CodeQL and similar) recorded as assessments, so their findings share the register, waivers and gate. |
 | **Git history mirrors** | On-demand or scheduled git bundles of every branch and tag (GitHub and GitLab) in S3, fetched natively without a git binary, checksum-verified, pruned to the newest N, restorable with `git clone`. |
@@ -328,11 +329,14 @@ fail the build if a route is added without documentation.
 | `POST /ingest/registry/{harbor,dockerhub,gar,oci}` | ingest:relay | Registry push events |
 | `/maintenance/run`, `/maintenance/rescan`, `/maintenance/redeliver-dead`, `/events/inbound`, `:replay` | admin | Maintenance and inbound-event log |
 | `GET /system/metrics` | read | Prometheus metrics |
+| `GET /system/github-webhooks`, `POST /system/github-webhooks:check` | read, admin | GitHub webhook delivery check: redelivers missed events, reports hook misconfiguration |
 | `DELETE /assessments/{id}` | write (or owning trigger) | Cancel |
 | `GET /register`, `GET /register/{id}/events` | read, write | Risk register and finding history |
 | `PATCH /register/{id}` | write; admin to accept, suppress or mark false positive | Triage |
 | `POST /assets/{id}/remediations`, `GET /remediation/capabilities` | write / read | Guided remediation plans |
-| `GET`/`PUT /feeds/indicators` | admin | IOC bundles |
+| `GET`/`PUT /feeds/indicators` | admin | IOC bundle (the `bundle` source) |
+| `/intel/indicator-sources` (list, create, get, patch, delete, `/indicators` get and put, `:hunt`) | read, write (hunt), admin (alert, block) | Indicator sources |
+| `/intel/yara-rulesets` (list, create, `:validate`, get, patch, delete, `:hunt`) | read, write (hunt), admin (alert, block) | YARA rulesets |
 | `/settings/retention`, `:preview`, `:purge` | admin | Raw-event retention |
 | `POST /webhooks/github` | GitHub HMAC | Signed push events |
 
@@ -363,7 +367,7 @@ Milestones follow PRD section 15.2.
 | M1 Platform core | Done: tokens, audit, owners and asset attributes, metrics, request IDs, access logs |
 | M2 Repository scanning | Done: trigger, batch, latest, long-poll, direct and relay GitHub ingestion, PR assessments, diffs and new-versus-existing gating, integrity events |
 | M3 Malware and malicious dependencies | Done: ClamAV, YARA via ClamAV with canary, `MAL-` matching, campaign IOC types, KEV and EPSS |
-| M4 Threat-intelligence feeds | Done: indicator bundles, KEV/EPSS, Trivy and SARIF import. STIX/CSV, VEX import and NVD outstanding |
+| M4 Threat-intelligence feeds | Done: indicator bundles, KEV/EPSS, Trivy and SARIF import, YARA-X rulesets (team and third-party), indicator sources with modes and confidence. STIX 2.1 and TAXII 2.1 in progress; CSV, VEX import and NVD outstanding |
 | M5 Retention, maintenance, outbound | Done: signed outbound webhooks with profiles and header auth, scheduler, maintenance actions, event log and replay, n8n workflows, source snapshots, git-bundle mirrors |
 | M6 Images and registries | Done: Docker Hub, GAR, Harbor and OCI images by digest with layer malware/YARA/IOC scanning; registry push events; GitLab repositories and webhooks |
 | M7 Remediation and hardening | Done: npm and Maven plans, OpenVEX export, load and crash-recovery test |

@@ -35,6 +35,9 @@ func assessmentError(w http.ResponseWriter, err error) {
 		writeError(w, 404, "asset or assessment unavailable")
 	case errors.Is(err, assessments.ErrConflict):
 		writeError(w, 409, "request conflicts with existing state")
+	case errors.Is(err, assessments.ErrBusy):
+		w.Header().Set("Retry-After", "30")
+		writeError(w, 409, "asset has a running assessment; retry shortly")
 	case errors.Is(err, assessments.ErrCapacity):
 		w.Header().Set("Retry-After", "30")
 		writeError(w, 429, "assessment queue full")
@@ -577,6 +580,12 @@ func (h assessmentHandler) importReport(w http.ResponseWriter, r *http.Request, 
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&input); err != nil || decoder.Decode(new(any)) != io.EOF || len(input.Report) == 0 {
 		writeError(w, 400, "import requires target, format and report (max 16 MiB)")
+		return
+	}
+	// replace_previous marks register entries fixed, which is triage: a
+	// trigger-only token may add findings but not close them.
+	if input.Replace && !principal.Allows("write") {
+		writeError(w, 403, "replace_previous requires write scope")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)

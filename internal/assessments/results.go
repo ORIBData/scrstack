@@ -28,6 +28,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		if _, ok := required[stage.Name]; ok {
 			required[stage.Name] = stage.Status == "ok"
 		}
+		// YARA-X runs only when rulesets are enabled; when it runs, partial
+		// coverage is incomplete like any other content stage.
+		if stage.Name == "yara_x" && stage.Status != "ok" && stage.Status != "skipped" {
+			r.Complete = false
+		}
 	}
 	for _, ok := range required {
 		if !ok {
@@ -75,9 +80,18 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// change baseline, not a last-known-good security designation.
 	if len(r.Files) > 0 {
 		var previous []byte
-		previousErr := tx.QueryRow(ctx, `SELECT f.body FROM `+s.schema+`.assessment_files f JOIN `+s.schema+`.assessments p ON p.id=f.assessment_id WHERE p.asset_id=$1 AND p.request->'target'->>'ref'=$2 AND p.status='succeeded' AND p.request->'remediation' IS NULL AND p.request->'import' IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT 1`, a.AssetID, a.Request.Target.Ref).Scan(&previous)
+		var priorWalked bool
+		previousErr := tx.QueryRow(ctx, `SELECT f.body,p.stages @> '[{"name":"integrity","status":"ok"}]' FROM `+s.schema+`.assessment_files f JOIN `+s.schema+`.assessments p ON p.id=f.assessment_id WHERE p.asset_id=$1 AND p.request->'target'->>'ref'=$2 AND p.status='succeeded' AND p.request->'remediation' IS NULL AND p.request->'import' IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT 1`, a.AssetID, a.Request.Target.Ref).Scan(&previous, &priorWalked)
 		if previousErr != nil && previousErr != pgx.ErrNoRows {
 			return previousErr
+		}
+		// An interrupted content walk lists only some files. A path missing
+		// from such a list is unknown, not added or deleted.
+		walked := false
+		for _, stage := range r.Stages {
+			if stage.Name == "integrity" {
+				walked = stage.Status == "ok"
+			}
 		}
 		if previousErr == nil {
 			var prior []FileEvidence
@@ -98,12 +112,13 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 			}
 			changes := map[string]string{}
 			for path, digest := range after {
-				if before[path] != digest {
+				// A changed digest is always real; a new path only when the prior walk was whole.
+				if old, known := before[path]; (known && old != digest) || (!known && priorWalked) {
 					changes[path] = "added_or_modified"
 				}
 			}
 			for path := range before {
-				if after[path] == "" {
+				if after[path] == "" && walked {
 					changes[path] = "deleted"
 				}
 			}

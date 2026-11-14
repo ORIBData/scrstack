@@ -49,6 +49,35 @@ For other providers, use the same request shape:
 | Docker Hub | `{"namespace":"myteam","identifier":"myteam"}` | `{"token":"<read-only token>"}` | `docker.io/myteam/*` |
 | GAR | `{"project":"my-project","location":"europe-west2"}` | `{"service_account_json":{...the complete Google key object...}}` | `europe-west2-docker.pkg.dev/my-project/**` |
 
+### GitHub webhook delivery check
+
+GitHub does not retry a failed webhook delivery, so an SCRS restart or outage
+would otherwise lose force-push and other integrity events. Every
+`SCRS_GITHUB_HOOK_CHECK_MINUTES` (default 5) the worker reads the delivery log
+of the webhook that points at SCRS and:
+
+- requests redelivery of failed push, pull request, create, delete,
+  repository, member and organization events (timeouts, 429 and 5xx), backing
+  off 5, 10, 20 and 40 minutes, at most five attempts. GitHub reuses the
+  delivery ID, so SCRS records each event once;
+- reports deliveries SCRS rejected (for example HTTP 401 for a secret mismatch)
+  without redelivering them;
+- reports a missing or inactive webhook, one without push events, a non-JSON
+  content type or disabled TLS verification;
+- abandons events it cannot redeliver within GitHub's three-day log and asks
+  for a rescan.
+
+Problems emit `connection.degraded`; the latest result is at
+`GET /scrs/v1/system/github-webhooks` and `POST /scrs/v1/system/github-webhooks:check`
+runs it immediately. The connection's `webhook_source` chooses the webhook:
+`app` (default for GitHub Apps, uses the app JWT) or `org` (default for tokens).
+`org` needs the organization **Webhooks** permission with read and write access
+(classic tokens: `admin:org_hook`); a GitHub App reading an organization
+webhook needs the same permission on its installation.
+
+To prevent force pushes rather than only detect them, enable "Block force
+pushes" in the organization's branch rulesets for default and release branches.
+
 ## Scope and discovery
 
 For each connection, set `scope.include` to exact locators or globs. An empty

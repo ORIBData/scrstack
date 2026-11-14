@@ -72,6 +72,8 @@ services:
     expose:
       - "7000"
     read_only: true
+    # YARA rule validation compiles in a scratch directory (rules up to 16 MiB).
+    tmpfs: ["/tmp:size=67108864,mode=1777,noexec,nosuid"]
     cap_drop:
       - ALL
     security_opt:
@@ -94,11 +96,15 @@ services:
       SCRS_MAX_IMAGE_BYTES: ${SCRS_MAX_IMAGE_BYTES:-419430400}
       SCRS_SNAPSHOT_ARCHIVES: ${SCRS_SNAPSHOT_ARCHIVES:-false}
       SCRS_RESCAN_INTERVAL_HOURS: ${SCRS_RESCAN_INTERVAL_HOURS:-0}
+      # GitHub webhook delivery check: redeliver missed events (0 disables).
+      SCRS_GITHUB_HOOK_CHECK_MINUTES: ${SCRS_GITHUB_HOOK_CHECK_MINUTES:-5}
+      SCRS_GITHUB_HOOK_URL: ${SCRS_GITHUB_HOOK_URL:-}
       # Git history mirrors (bundles in S3); scheduled for assets labelled mirror=true.
       SCRS_MIRRORS_ENABLED: ${SCRS_MIRRORS_ENABLED:-true}
       SCRS_MIRROR_INTERVAL_HOURS: ${SCRS_MIRROR_INTERVAL_HOURS:-0}
       SCRS_MIRROR_MAX_BYTES: ${SCRS_MIRROR_MAX_BYTES:-2147483648}
       SCRS_MIRROR_KEEP: ${SCRS_MIRROR_KEEP:-7}
+      SCRS_MIRROR_MIN_AGE_DAYS: ${SCRS_MIRROR_MIN_AGE_DAYS:-30}
       SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
       SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set a separate random scanner service token}
       # Outbound webhooks are delivered from the worker (OUT-001/002).
@@ -209,7 +215,7 @@ services:
     restart: unless-stopped
     environment:
       SCRS_FEED_ROOT: /feeds
-      SCRS_OSV_ECOSYSTEMS: ${SCRS_OSV_ECOSYSTEMS:-npm,Go,Maven,PyPI,Alpine,Debian}
+      SCRS_OSV_ECOSYSTEMS: ${SCRS_OSV_ECOSYSTEMS:-npm,Go,Maven,PyPI,Pub,SwiftURL,RubyGems,Alpine,Debian}
     volumes: ["scrs-feeds:/feeds"]
     read_only: true
     cap_drop: [ALL]

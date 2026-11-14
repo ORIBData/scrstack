@@ -43,6 +43,10 @@ type Security struct {
 	DocsPublic     bool
 	TrustedProxies []netip.Prefix
 	Origins        []string
+	// GitHubHooks overrides the GitHub API for the delivery check; tests only.
+	GitHubHooks connections.HookAPI
+	// ValidateRules overrides the YARA-X compiler; tests only.
+	ValidateRules RuleValidator
 }
 
 var tokenWindow = redis.NewScript(`
@@ -71,6 +75,15 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
 	m := newMetrics(security.Assessments, security.Notify)
 	mux.Handle("GET "+BasePath+"/system/metrics", security.protect("read", m.handler()))
+	if checker, ok := store.(hookChecker); ok {
+		api := security.GitHubHooks
+		if api == nil {
+			api = connections.NewNativeAdapters()
+		}
+		hooks := hookHandler{store: checker, api: api}
+		mux.Handle("GET "+BasePath+"/system/github-webhooks", security.protect("read", hooks))
+		mux.Handle("POST "+BasePath+"/system/github-webhooks:check", security.protect("admin", hooks))
+	}
 	if admin, ok := store.(assetAdmin); ok {
 		assetsHandler := assetHandler{admin}
 		mux.Handle("GET "+BasePath+"/owners", security.protect("read|write", assetsHandler))
@@ -105,6 +118,17 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 				direct.ServeHTTP(w, r)
 			}))
 		}
+		validate := security.ValidateRules
+		if validate == nil {
+			validate = yaraValidator()
+		}
+		rules := security.protect("read|write", ruleHandler{store: security.Assessments, validate: validate, compiles: make(chan struct{}, 2)})
+		for _, path := range []string{"/intel/yara-rulesets", "/intel/yara-rulesets:validate", "/intel/yara-rulesets/"} {
+			mux.Handle(BasePath+path, rules)
+		}
+		sources := security.protect("read|write", sourceHandler{store: security.Assessments})
+		mux.Handle(BasePath+"/intel/indicator-sources", sources)
+		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
 		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}", security.protect("ingest:relay", registryIngest{store: security.Assessments, relayEnabled: security.RelayEnabled}))
 		mux.Handle(BasePath+"/feeds/indicators", security.protect("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)

@@ -128,42 +128,14 @@ func (a NativeAdapters) Mirror(ctx context.Context, c Connection, secret json.Ra
 	return MirrorInfo{Refs: len(refs), Head: head}, nil
 }
 
-// githubToken returns an installation token (GitHub App) or the stored token.
+// githubToken returns an installation token (GitHub App) or the stored token
+// for a repository owned by the connection's organization.
 func (a NativeAdapters) githubToken(ctx context.Context, c Connection, secret json.RawMessage, owner string) (string, error) {
-	var cfg struct {
-		Organization   string `json:"organization"`
-		AuthType       string `json:"auth_type"`
-		AppID          string `json:"app_id"`
-		InstallationID int64  `json:"installation_id"`
-	}
-	var cred struct {
-		Token      string `json:"token"`
-		PrivateKey string `json:"private_key_pem"`
-	}
-	if json.Unmarshal(c.Config, &cfg) != nil || json.Unmarshal(secret, &cred) != nil || !strings.EqualFold(owner, cfg.Organization) {
+	cfg, err := parseGitHub(c, secret)
+	if err != nil || !strings.EqualFold(owner, cfg.Organization) {
 		return "", errors.New("invalid GitHub configuration")
 	}
-	if cfg.AuthType != "github_app" && cfg.AuthType != "" {
-		if cred.Token == "" {
-			return "", errors.New("GitHub token unavailable")
-		}
-		return cred.Token, nil
-	}
-	jwt, err := githubJWT(cfg.AppID, []byte(cred.PrivateKey))
-	if err != nil {
-		return "", err
-	}
-	data, err := a.request(ctx, http.MethodPost, strings.TrimSuffix(a.GitHubAPI, "/")+"/app/installations/"+strconv.FormatInt(cfg.InstallationID, 10)+"/access_tokens", jwt, []byte(`{}`))
-	if err != nil {
-		return "", err
-	}
-	var response struct {
-		Token string `json:"token"`
-	}
-	if json.Unmarshal(data, &response) != nil || response.Token == "" {
-		return "", errors.New("installation token response invalid")
-	}
-	return response.Token, nil
+	return a.accessToken(ctx, cfg)
 }
 
 type gitRef struct{ sha, name string }

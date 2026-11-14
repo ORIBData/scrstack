@@ -104,6 +104,34 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /system/github-webhooks:
+    get:
+      tags: [System]
+      operationId: githubWebhookChecks
+      summary: GitHub webhook delivery check state
+      description: |
+        Latest delivery check of each GitHub connection. GitHub never retries a failed webhook delivery, so SCRS reads its own
+        webhook's delivery log every `SCRS_GITHUB_HOOK_CHECK_MINUTES` (default 5), requests redelivery of failed events with
+        5/10/20/40-minute backoff (at most five attempts, within GitHub's three-day log), and reports webhook configuration
+        that would drop force-push and other integrity events. `degraded` and `failed` states also emit `connection.degraded`.
+        Scope `read`.
+      responses:
+        '200': {description: Checks, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/GitHubWebhookCheck'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /system/github-webhooks:check:
+    post:
+      tags: [System]
+      operationId: runGitHubWebhookCheck
+      summary: Run the GitHub webhook delivery check now
+      description: Runs the scheduled delivery check immediately and returns its result. Returns 409 while another replica is checking. Scope `admin`.
+      responses:
+        '200': {description: Checks, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/GitHubWebhookCheck'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /docs:
     get:
       tags: [System]
@@ -209,7 +237,7 @@ paths:
       summary: Create a connection
       description: |
         Stores provider config and an AES-GCM encrypted credential. `config` and `credential` depend on the provider:
-        - `github`: config `{organization, auth_type: github_app|fine_grained_pat|oauth_app_token, app_id?, installation_id?}`, credential `{private_key_pem}` or `{token}`
+        - `github`: config `{organization, auth_type: github_app|fine_grained_pat|oauth_app_token, app_id?, installation_id?, webhook_source?: app|org}`, credential `{private_key_pem}` or `{token}`. `webhook_source` selects the webhook the delivery check reads (default `app` for GitHub Apps, `org` for tokens); `org` needs the organization webhooks permission (read and write).
         - `gitlab`: config `{group, base_url?}` (subgroups allowed, default https://gitlab.com), credential `{token}` (read_api + read_repository)
         - `dockerhub`: config `{namespace, identifier}`, credential `{token}`
         - `gar`: config `{project, location}`, credential `{service_account_json}`
@@ -470,7 +498,7 @@ paths:
       tags: [Mirrors]
       operationId: listMirrors
       summary: List git mirrors of an asset
-      description: The 50 newest mirror jobs and bundles, newest first. Older bundles beyond `SCRS_MIRROR_KEEP` show `pruned`. Scope `read` or `write`.
+      description: The 50 newest mirror jobs and bundles, newest first. Bundles beyond `SCRS_MIRROR_KEEP` and older than `SCRS_MIRROR_MIN_AGE_DAYS` show `pruned`; the newest bundle before an open integrity finding is never pruned. Scope `read` or `write`.
       responses:
         '200': {description: Mirrors, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/Mirror'}}}}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -835,7 +863,7 @@ paths:
         - `sarif`: SARIF 2.1.0 from Semgrep, CodeQL and similar tools, as `code` findings. Severity comes from `security-severity`, else from `level`.
 
         Imported findings are closed only by a later import of the same tool (same SARIF tool name) for the same ref with `replace_previous: true`, which declares the report the tool's full result: findings it no longer lists are marked fixed. Leave it `false` for partial runs such as secrets only. SCRS's own scans never close imported findings, and imports never close SCRS findings or serve as a baseline or last-known-good.
-        Body limit 16 MiB; two imports are processed at a time, others get `429` with `Retry-After`. Scope `write` or `trigger`.
+        Body limit 16 MiB; two imports are processed at a time, others get `429` with `Retry-After`. Scope `write` or `trigger`; `replace_previous: true` closes findings and requires `write`. While another assessment of the asset is running the import returns `409` with `Retry-After`.
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
         required: true
@@ -864,7 +892,7 @@ paths:
         '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
         '400': {description: 'Invalid report, format or missing `target.commit`', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '404': {description: Asset not discovered or out of scope, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
-
+        '409': {description: 'Idempotency-Key reused with a different body, or another assessment of the asset is running (retry after `Retry-After`)', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1248,7 +1276,9 @@ paths:
       tags: [Threat intelligence]
       operationId: activeIndicators
       summary: Active indicator bundle
-      description: The active versioned IOC bundle used by scans and event pattern matching. Scope `admin`.
+      description: |
+        The bundle last activated with PUT. Its indicators form the `bundle` indicator source (mode `block`), which scans
+        and event pattern matching use alongside every other enabled source. Scope `admin`.
       responses:
         '200': {description: Bundle, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}}
         '404': {description: No active bundle (IOC stage reports skipped and verdicts stay incomplete), content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
@@ -1259,7 +1289,10 @@ paths:
       tags: [Threat intelligence]
       operationId: importIndicators
       summary: Import and activate an indicator bundle
-      description: Atomically activates a new immutable version; previous versions are retained. Max 4 MiB, 10000 indicators. Scope `admin`.
+      description: |
+        Atomically activates a new immutable version, which replaces the indicators of the `bundle` source; previous versions
+        are retained. Creates that source in mode `block` if it does not exist, otherwise keeps its mode. Max 4 MiB, 10000
+        indicators. Prefer `/intel/indicator-sources` for new feeds. Scope `admin`.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}
@@ -1269,6 +1302,248 @@ paths:
         '409': {description: Version already exists, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
 
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/yara-rulesets:
+    get:
+      tags: [Threat intelligence]
+      operationId: listYaraRulesets
+      summary: YARA rulesets
+      description: |
+        Team rules written in the Web UI (`custom`) and third-party packs (`external`, for example YARA Forge), without their
+        rule text. Enabled rulesets run with YARA-X (modules `pe`, `elf`, `math`, `hash`, `dotnet` and others) on every
+        repository file and every container image layer file, including files a later layer deletes. Scope `read` or `write`.
+      responses:
+        '200': {description: Rulesets, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/YaraRuleset'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Threat intelligence]
+      operationId: createYaraRuleset
+      summary: Create a YARA ruleset
+      description: |
+        Compiles the rules with YARA-X, then stores them. New rulesets default to mode `hunt`: matches are recorded as
+        `yara_hunt` findings and never change a verdict. Scope `write` for `hunt`; `admin` to create in `alert` (findings gate
+        by severity like vulnerabilities, from rule meta `severity` or the ruleset default) or `block` (any match fails the
+        assessment like malware). `include` directives are rejected. Max 16 MiB per ruleset, 32 MiB and 200 rulesets enabled.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/YaraRulesetInput'}}}
+      responses:
+        '201': {description: Created, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/YaraRulesetResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: Name exists, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: Rules do not compile, or the enabled pack would exceed its limits, content: {application/json: {schema: {$ref: '#/components/schemas/RuleCompileError'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/yara-rulesets:validate:
+    post:
+      tags: [Threat intelligence]
+      operationId: validateYaraRules
+      summary: Compile YARA rules without saving
+      description: For the Web UI rule editor. Returns warnings (for example slow patterns) or, with 422, located compile errors. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, required: [rules], properties: {rules: {type: string}}}}}
+      responses:
+        '200': {description: Rules compile, content: {application/json: {schema: {type: object, properties: {valid: {type: boolean}, rule_count: {type: integer}, warnings: {type: array, items: {$ref: '#/components/schemas/RuleDiagnostic'}}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '422': {description: Rules do not compile, content: {application/json: {schema: {$ref: '#/components/schemas/RuleCompileError'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/yara-rulesets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Threat intelligence]
+      operationId: getYaraRuleset
+      summary: YARA ruleset with its rules
+      description: One ruleset including its rule text, with an ETag for updates. Scope `read` or `write`.
+      responses:
+        '200': {description: Ruleset, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/YaraRuleset'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Threat intelligence]
+      operationId: updateYaraRuleset
+      summary: Change a YARA ruleset
+      description: |
+        Partial update at the If-Match revision; changed rules are compiled first. `write` may change rulesets that are
+        `hunt` before and after the change; promoting to `alert` or `block`, or changing a ruleset in those modes, needs
+        `admin`. Mode changes are audited as `yara_ruleset.mode_changed`.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/YaraRulesetChange'}}}
+      responses:
+        '200': {description: Updated, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/YaraRulesetResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {description: Rules do not compile, content: {application/json: {schema: {$ref: '#/components/schemas/RuleCompileError'}}}}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [Threat intelligence]
+      operationId: deleteYaraRuleset
+      summary: Delete a YARA ruleset
+      description: Removes the ruleset; its findings close on the next complete scan. `write` for `hunt` rulesets, otherwise `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/yara-rulesets/{id}:hunt:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Threat intelligence]
+      operationId: huntYaraRuleset
+      summary: Retro-hunt with a ruleset
+      description: Queues a rescan of the default branch of every in-scope repository so enabled rules run against current code. Rescans already queued in the same window are not repeated. Scope `write`.
+      responses:
+        '202': {description: Rescans queued, content: {application/json: {schema: {type: object, properties: {rescans_queued: {type: integer}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Ruleset disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources:
+    get:
+      tags: [Threat intelligence]
+      operationId: listIndicatorSources
+      summary: Indicator sources
+      description: |
+        Each source holds its own indicators and mode. Scans and GitHub event pattern matching use the unexpired indicators of
+        every enabled source whose confidence is at or above the source's `min_confidence` (indicators without confidence always
+        qualify). Scope `read` or `write`.
+      responses:
+        '200': {description: Sources, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/IndicatorSource'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Threat intelligence]
+      operationId: createIndicatorSource
+      summary: Create an indicator source
+      description: |
+        Creates an empty source; import indicators next. New sources default to mode `hunt`: matches are recorded as `ioc_hunt`
+        findings and never change a verdict. Scope `write` for `hunt`; `admin` to create in `alert` (`ioc_alert` findings gate
+        by the source severity like vulnerabilities) or `block` (`ioc_match`, any match fails the assessment like malware).
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSourceInput'}}}
+      responses:
+        '201': {description: Created, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSource'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: Name exists, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Threat intelligence]
+      operationId: getIndicatorSource
+      summary: Indicator source
+      description: One source with its last import, and an ETag for updates. Scope `read` or `write`.
+      responses:
+        '200': {description: Source, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSource'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Threat intelligence]
+      operationId: updateIndicatorSource
+      summary: Change an indicator source
+      description: |
+        Partial update at the If-Match revision (imports also advance the revision). `write` may change sources that are `hunt`
+        before and after the change; promoting to `alert` or `block`, or changing a source in those modes, needs `admin`. Mode
+        changes are audited as `indicator_source.mode_changed`.
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSourceChange'}}}
+      responses:
+        '200': {description: Updated, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSource'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {description: Enabling the source would exceed the scan bundle limit, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [Threat intelligence]
+      operationId: deleteIndicatorSource
+      summary: Delete an indicator source
+      description: Removes the source and its indicators; its findings close on the next complete scan. `write` for `hunt` sources, otherwise `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}/indicators:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Threat intelligence]
+      operationId: listSourceIndicators
+      summary: A source's indicators
+      description: The source's indicators as a bundle, with values normalized and the version of the last import. Scope `read` or `write`.
+      responses:
+        '200': {description: Indicators, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Threat intelligence]
+      operationId: importSourceIndicators
+      summary: Replace a source's indicators
+      description: |
+        Atomically replaces every indicator of the source with the bundle. Defanged values (`hxxp`, `[.]`) are accepted and
+        normalized. Max 16 MiB and 50000 indicators per import; all enabled sources together may hold 100000 unexpired
+        indicators. `write` for `hunt` sources, otherwise `admin`. Audited as `indicator_source.imported`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorBundle'}}}
+      responses:
+        '200': {description: Imported, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSource'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: Enabled sources would exceed the scan bundle limit, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:hunt:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Threat intelligence]
+      operationId: huntIndicatorSource
+      summary: Retro-hunt with a source
+      description: Queues a rescan of the default branch of every in-scope repository so enabled indicators are checked against current code. Rescans already queued in the same window are not repeated. Scope `write`.
+      responses:
+        '202': {description: Rescans queued, content: {application/json: {schema: {type: object, properties: {rescans_queued: {type: integer}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Source disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1458,6 +1733,134 @@ components:
       type: object
       properties: {status: {type: string, enum: [ok, unavailable]}}
     Scope: {type: string, enum: [read, write, trigger, ingest:relay, admin]}
+    YaraRulesetInput:
+      type: object
+      required: [name, rules]
+      additionalProperties: false
+      properties:
+        name: {type: string, pattern: '^[a-z][a-z0-9_]{0,62}$', description: Namespace in findings (`YARA:<name>:<rule>`); cannot change}
+        kind: {type: string, enum: [custom, external], default: custom}
+        description: {type: string, maxLength: 1000}
+        mode: {type: string, enum: [hunt, alert, block], default: hunt}
+        severity: {type: string, enum: [critical, high, medium, low, info], default: medium, description: Used when a rule has no `severity` meta}
+        enabled: {type: boolean, default: true}
+        rules: {type: string, maxLength: 16777216}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+    YaraRulesetChange:
+      type: object
+      additionalProperties: false
+      properties:
+        description: {type: string, maxLength: 1000}
+        mode: {type: string, enum: [hunt, alert, block]}
+        severity: {type: string, enum: [critical, high, medium, low, info]}
+        enabled: {type: boolean}
+        rules: {type: string, maxLength: 16777216}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+    IndicatorSourceInput:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {type: string, pattern: '^[a-z][a-z0-9_]{0,62}$', description: Prefix of finding advisory IDs (`<name>:<indicator id>`); cannot change}
+        kind: {type: string, enum: [manual], default: manual, description: STIX upload and TAXII polling sources are coming}
+        description: {type: string, maxLength: 1000}
+        mode: {type: string, enum: [hunt, alert, block], default: hunt}
+        severity: {type: string, enum: [critical, high, medium, low, info], default: high, description: Severity of `ioc_alert` and `ioc_hunt` findings}
+        min_confidence: {type: integer, minimum: 0, maximum: 100, default: 0}
+        enabled: {type: boolean, default: true}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+    IndicatorSourceChange:
+      type: object
+      additionalProperties: false
+      properties:
+        description: {type: string, maxLength: 1000}
+        mode: {type: string, enum: [hunt, alert, block]}
+        severity: {type: string, enum: [critical, high, medium, low, info]}
+        min_confidence: {type: integer, minimum: 0, maximum: 100}
+        enabled: {type: boolean}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+    IndicatorSource:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        kind: {type: string, enum: [manual, stix, taxii]}
+        description: {type: string}
+        mode: {type: string, enum: [hunt, alert, block]}
+        severity: {type: string, enum: [critical, high, medium, low, info]}
+        min_confidence: {type: integer}
+        enabled: {type: boolean}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+        version: {type: string, description: Version of the last import}
+        indicator_count: {type: integer}
+        imported_at: {type: [string, 'null'], format: date-time}
+        revision: {type: integer}
+        created_by: {type: [string, 'null'], format: uuid}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    YaraRuleOrigin:
+      type: object
+      additionalProperties: false
+      description: Attribution for third-party packs
+      properties:
+        vendor: {type: string, maxLength: 100}
+        url: {type: string, format: uri, description: https only}
+        version: {type: string, maxLength: 100}
+        license: {type: string, maxLength: 100, description: 'SPDX identifier, for example DRL-1.1'}
+    YaraRuleset:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        kind: {type: string, enum: [custom, external]}
+        description: {type: string}
+        mode: {type: string, enum: [hunt, alert, block]}
+        severity: {type: string, enum: [critical, high, medium, low, info]}
+        enabled: {type: boolean}
+        rules: {type: string, description: Present on single-ruleset reads only}
+        sha256: {type: string}
+        rule_count: {type: integer}
+        origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+        revision: {type: integer}
+        created_by: {type: [string, 'null'], format: uuid}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+    YaraRulesetResult:
+      allOf:
+        - $ref: '#/components/schemas/YaraRuleset'
+        - type: object
+          properties:
+            warnings: {type: array, items: {$ref: '#/components/schemas/RuleDiagnostic'}}
+    RuleDiagnostic:
+      type: object
+      properties:
+        level: {type: string, enum: [error, warning]}
+        code: {type: string, description: 'YARA-X code, for example E025 or slow_pattern'}
+        message: {type: string}
+        line: {type: integer}
+        column: {type: integer}
+    RuleCompileError:
+      type: object
+      properties:
+        error: {type: string}
+        diagnostics: {type: array, items: {$ref: '#/components/schemas/RuleDiagnostic'}}
+    GitHubWebhookCheck:
+      type: object
+      properties:
+        connection_id: {type: string, format: uuid}
+        connection: {type: string}
+        source: {type: string, enum: [app, org], description: 'GitHub App webhook or organization webhook (connection `webhook_source`)'}
+        state: {type: string, enum: [unchecked, ok, degraded, failed]}
+        checked_at: {type: string, format: date-time}
+        last_success_at: {type: string, format: date-time, description: The next check reads deliveries from here (minus 15 minutes), so failed checks lose nothing}
+        window_start: {type: string, format: date-time}
+        hooks: {type: integer, description: Webhooks pointing at SCRS}
+        deliveries_scanned: {type: integer}
+        redelivered: {type: integer}
+        retrying: {type: integer, description: Failed events waiting for their next redelivery attempt}
+        abandoned: {type: integer, description: Events that could not be redelivered; rescan the affected repositories}
+        rejected: {type: integer, description: 'Newly seen deliveries SCRS rejected (for example HTTP 401 for a secret mismatch); not redelivered'}
+        problems: {type: array, items: {type: string}}
     Token:
       type: object
       properties:
@@ -1658,10 +2061,10 @@ components:
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code]}
-        advisory_id: {type: string}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate'}
+        advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
-        severity: {type: string, enum: [critical, high, medium, low, unknown]}
+        severity: {type: string, enum: [critical, high, medium, low, info, unknown]}
         score: {type: integer, minimum: 0, maximum: 100}
         status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}
         component: {$ref: '#/components/schemas/Component'}
@@ -1752,16 +2155,18 @@ components:
         version: {type: string, minLength: 1, maxLength: 128}
         indicators:
           type: array
-          maxItems: 10000
+          maxItems: 50000
+          description: At most 10000 on `PUT /feeds/indicators`
           items:
             type: object
             additionalProperties: false
             required: [id, type, value, valid_until]
             properties:
-              id: {type: string, maxLength: 128}
-              type: {type: string, enum: [sha256, domain, ipv4, purl, workflow_step_name, file_path_regex, file_content_regex, git_branch_regex, commit_message_regex, pr_title_regex]}
-              value: {type: string}
+              id: {type: string, maxLength: 128, description: Unique within the bundle}
+              type: {type: string, enum: [sha256, sha1, md5, domain, ipv4, url, purl, workflow_step_name, file_path_regex, file_content_regex, git_branch_regex, commit_message_regex, pr_title_regex]}
+              value: {type: string, description: 'Defanged domains, addresses and URLs (`[.]`, `hxxp`) are normalized. URLs are http, https or ftp and match exactly after lower-casing the scheme and host and dropping the fragment.'}
               valid_until: {type: string, format: date-time}
+              confidence: {type: integer, minimum: 0, maximum: 100, description: 'As in STIX 2.1; compared with the source''s `min_confidence`'}
     InboundEvent:
       type: object
       properties:

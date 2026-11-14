@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -171,6 +172,11 @@ func (s *Store) enqueue(ctx context.Context, request Request, actor uuid.UUID, n
 	if request.Import != nil {
 		// Imports complete in the caller's request; workers never claim them.
 		_, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessments(id,asset_id,connection_id,connection_revision,request,actor_id,requested_by,request_id,status,attempts,lease,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running',1,$9,clock_timestamp()+interval '5 minutes')`, a.ID, a.AssetID, a.ConnectionID, a.ConnectionRevision, body, actor, name, requestID, uuid.New())
+		// One running assessment per asset: a scan in progress blocks the import.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "assessments_running_asset_uq" {
+			return a, false, ErrBusy
+		}
 	} else {
 		_, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessments(id,asset_id,connection_id,connection_revision,request,actor_id,requested_by,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, a.ID, a.AssetID, a.ConnectionID, a.ConnectionRevision, body, actor, name, requestID)
 	}
@@ -287,6 +293,19 @@ func (s *Store) Fail(ctx context.Context, a Assessment, message string, retry bo
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// Release returns a claimed job to the queue without spending an attempt,
+// for transient back-pressure such as a busy scanner.
+func (s *Store) Release(ctx context.Context, a Assessment, delay time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='queued',attempts=GREATEST(attempts-1,0),lease=NULL,lease_until=NULL,run_after=clock_timestamp()+($3*interval '1 second') WHERE id=$1 AND lease=$2 AND status='running' AND lease_until>clock_timestamp()`, a.ID, a.Lease, int(delay.Seconds()))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLease
+	}
+	return nil
 }
 func (s *Store) Cancel(ctx context.Context, id, actor uuid.UUID) error {
 	tx, err := s.pool.Begin(ctx)

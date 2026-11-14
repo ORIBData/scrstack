@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -229,10 +230,28 @@ func TestPostgresWorkerAssessesImageByDigest(t *testing.T) {
 		t.Fatal(err)
 	}
 	token := strings.Repeat("x", 40)
+	// Enabled rulesets travel ahead of the image, which streams as the last part.
+	if _, err := jobs.CreateRuleSet(ctx, assessments.RuleSetRecord{Name: "team_hunt", Kind: "custom", Mode: "hunt", Severity: "low", Enabled: true, Rules: "rule A { condition: true }"}, uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		if r.URL.Path != "/scan-image" || string(body) != "synthetic image archive" || r.Header.Get("Authorization") != "Bearer "+token {
-			t.Error("image not streamed to the scanner image endpoint")
+		var parts []string
+		image := ""
+		if reader, err := r.MultipartReader(); err == nil {
+			for {
+				part, err := reader.NextPart()
+				if err != nil {
+					break
+				}
+				body, _ := io.ReadAll(part)
+				parts = append(parts, part.FormName())
+				if part.FormName() == "image" {
+					image = string(body)
+				}
+			}
+		}
+		if r.URL.Path != "/scan-image" || image != "synthetic image archive" || strings.Join(parts, ",") != "rules,image" || r.Header.Get("Authorization") != "Bearer "+token {
+			t.Error("image not streamed to the scanner image endpoint after its rules", parts)
 		}
 		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "busybox", Version: "1.36.1-r15", Ecosystem: "Alpine:v3.19", PURL: "pkg:apk/alpine/busybox@1.36.1-r15", Path: "lib/apk/db/installed"}}, SBOM: json.RawMessage(`{"bomFormat":"CycloneDX","specVersion":"1.6"}`), Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "malware", Status: "skipped"}}})
 	}))
@@ -354,5 +373,118 @@ func TestPostgresWorkerMirrors(t *testing.T) {
 		if fail && (m.Status != "failed" || data != nil) {
 			t.Fatal("failed mirror left a partial bundle", m, len(data))
 		}
+	}
+}
+
+func TestFailurePolicy(t *testing.T) {
+	cases := []struct {
+		err   error
+		retry bool
+	}{
+		{errors.New("scanner unavailable"), true},
+		{assessments.ErrScope, false},
+		{fmt.Errorf("%w: archive exceeded 64 MiB download limit", connections.ErrTooLarge), false},
+		{errScannerRejected, false},
+	}
+	for _, c := range cases {
+		if retry, message := failurePolicy(c.err); retry != c.retry || message == "" {
+			t.Error("failure policy", c.err, retry, message)
+		}
+	}
+}
+
+// oversizeSource reports an archive above the download limit.
+type oversizeSource struct{ syntheticSource }
+
+func (oversizeSource) Snapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error) {
+	return nil, "", false, fmt.Errorf("%w: archive exceeded 64 MiB download limit", connections.ErrTooLarge)
+}
+
+// A busy scanner requeues the job without spending an attempt; size-limit
+// rejections surface as non-retryable; the multipart body streams intact.
+func TestPostgresWorkerScannerBackPressureAndLimits(t *testing.T) {
+	db := os.Getenv("SCRS_TEST_DATABASE_URL")
+	if db == "" {
+		t.Skip("requires disposable PostgreSQL")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	schema := "qa_" + uuid.NewString()[:8]
+	if err := storage.BootstrapDatabase(ctx, storage.Config{DatabaseURL: db, DatabaseSchema: schema}); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := pgxpool.New(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	defer func() { _, _ = pool.Exec(context.Background(), "DROP SCHEMA "+schema+" CASCADE") }()
+	providers, err := connections.Open(ctx, db, schema, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer providers.Close()
+	c := connections.Connection{Name: "github", Provider: "github", Config: json.RawMessage(`{"organization":"org","auth_type":"fine_grained_pat"}`), Scope: connections.Scope{Include: []string{"org/*"}}}
+	if _, err := providers.Put(ctx, c, json.RawMessage(`{"token":"synthetic"}`), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := providers.Discover(ctx, c.Name, syntheticSource{}); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := assessments.Open(ctx, db, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jobs.Close()
+	if _, err := jobs.ImportIndicators(ctx, uuid.Nil, []byte(`{"version":"w-v1","indicators":[{"id":"ioc-1","type":"domain","value":"bad.example","valid_until":"2099-01-01T00:00:00Z"}]}`)); err != nil {
+		t.Fatal(err)
+	}
+	req := assessments.Request{Target: assessments.Target{Type: "git", Repository: "org/repo", Ref: "main"}}
+	if _, _, err := jobs.Enqueue(ctx, req, uuid.New(), "tester", "busy"); err != nil {
+		t.Fatal(err)
+	}
+	job, err := jobs.Claim(ctx)
+	if err != nil || job.Attempts != 1 {
+		t.Fatal(job.Attempts, err)
+	}
+	token := strings.Repeat("x", 40)
+	status := http.StatusTooManyRequests
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The streamed multipart body must still carry the archive and bundle.
+		if err := r.ParseMultipartForm(1 << 20); err != nil || r.FormValue("indicators") == "" {
+			t.Error("multipart scan request malformed", err)
+		} else if f, _, err := r.FormFile("archive"); err != nil {
+			t.Error("archive part missing", err)
+		} else if b, _ := io.ReadAll(f); string(b) != "synthetic archive" {
+			t.Error("archive part altered", string(b))
+		}
+		w.WriteHeader(status)
+	}))
+	defer server.Close()
+	w := Worker{Store: jobs, Connections: providers, Source: syntheticSource{}, Artifacts: &artifactSink{}, ScannerURL: server.URL + "/scan", ScannerToken: token, Logger: slog.Default()}
+	if err := w.run(ctx, &job); !errors.Is(err, errScannerBusy) {
+		t.Fatal("429 not reported as back-pressure", err)
+	}
+	if err := jobs.Release(ctx, job, 0); err != nil {
+		t.Fatal(err)
+	}
+	if released, err := jobs.Get(ctx, job.ID); err != nil || released.Status != "queued" || released.Attempts != 0 {
+		t.Fatal("busy scanner spent an attempt", released.Status, released.Attempts, err)
+	}
+	if err := jobs.Release(ctx, job, 0); !errors.Is(err, assessments.ErrLease) {
+		t.Fatal("stale lease released twice", err)
+	}
+	job, err = jobs.Claim(ctx)
+	if err != nil || job.Attempts != 1 {
+		t.Fatal("requeued job not claimable", job.Attempts, err)
+	}
+	status = http.StatusRequestEntityTooLarge
+	if err := w.run(ctx, &job); !errors.Is(err, errScannerRejected) {
+		t.Fatal("413 not reported as a size rejection", err)
+	}
+	oversize := w
+	oversize.Source = oversizeSource{}
+	if err := oversize.run(ctx, &job); !errors.Is(err, connections.ErrTooLarge) {
+		t.Fatal("oversize archive not classified", err)
 	}
 }

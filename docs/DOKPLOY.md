@@ -155,9 +155,16 @@ outages never block scanning; the previous copy is carried forward.
 | `SCRS_RESCAN_INTERVAL_HOURS` | worker | Scheduled default-branch rescans; 0 disables |
 
 **Image assessment** requires the image's OS ecosystems in
-`SCRS_OSV_ECOSYSTEMS`. The default is now `npm,Go,Maven,PyPI,Alpine,Debian`
+`SCRS_OSV_ECOSYSTEMS`. The default is now `npm,Go,Maven,PyPI,Pub,SwiftURL,RubyGems,Alpine,Debian`
 (about 380 MB on the first sync, which the scanner healthcheck allows up to
-15 minutes for). Ubuntu's archive exceeds the 512 MiB per-feed cap.
+15 minutes for). Pub, SwiftURL and RubyGems cover Flutter, Swift Package
+Manager and fastlane lockfiles; without a lockfile's feed the whole package
+stage fails and the verdict is `incomplete`. Ubuntu is not supported offline:
+its archive is 815 MB and expands to 8.1 GiB (2026-11-14), beyond the 512 MiB
+download, 2 GiB expansion and 2 MiB per-record caps. Import a Trivy report for
+Ubuntu-based images instead. OSV publishes no CocoaPods feed and OSV-Scanner
+does not read `Podfile.lock`, so CocoaPods dependencies have no vulnerability
+coverage.
 
 **Monitoring.** Scrape `https://<domain>/scrs/v1/system/metrics` with a
 `read` token (Prometheus `authorization` credentials). Queue depth, oldest
@@ -192,10 +199,14 @@ for n8n Header Auth.
 | Variable | Service | Purpose |
 | --- | --- | --- |
 | `SCRS_GITLAB_WEBHOOK_SECRET` | API | GitLab webhook secret token (32+ characters); also verifies relayed GitLab events |
+| `SCRS_YARA_BINARY` | API, scanner | YARA-X CLI used to validate and run YARA rulesets (default `/usr/local/bin/yr`, shipped in the image) |
+| `SCRS_GITHUB_HOOK_CHECK_MINUTES` | worker | GitHub webhook delivery check interval (default 5; 0 disables). GitHub never retries a failed delivery, so the worker reads SCRS's webhook delivery log, requests redelivery of missed events and reports hook misconfiguration at `GET /system/github-webhooks` |
+| `SCRS_GITHUB_HOOK_URL` | worker | Public URL of the GitHub webhook when it is not an SCRS path (for example an n8n relay); by default any hook ending in `/scrs/v1/webhooks/github` or `/scrs/v1/ingest/github` is checked |
 | `SCRS_MIRRORS_ENABLED` | worker | Run the mirror queue (default `true`) |
 | `SCRS_MIRROR_INTERVAL_HOURS` | worker | Mirror assets labelled `mirror=true` on this interval; 0 = on demand only |
 | `SCRS_MIRROR_MAX_BYTES` | worker | Largest bundle (default 2 GiB) |
-| `SCRS_MIRROR_KEEP` | worker | Bundles kept per asset (default 7); older objects are deleted |
+| `SCRS_MIRROR_KEEP` | worker | Bundles kept per asset (default 7) |
+| `SCRS_MIRROR_MIN_AGE_DAYS` | worker | Bundles younger than this are never pruned (default 30). A bundle is deleted only when beyond `SCRS_MIRROR_KEEP` and older than this; the newest bundle taken before an open integrity finding is always kept |
 
 **Outbound access** from `scrs-worker` now also includes your GitLab origin,
 `github.com` (git smart HTTP for mirrors) and every connected registry.

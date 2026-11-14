@@ -5,8 +5,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
+	"github.com/ORIBData/scrstack/internal/assessments"
 	"io"
 	"net"
 	"os"
@@ -145,7 +149,7 @@ func TestLiveClamdYARARules(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("clean"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	_, _, stages := Engine{ClamdAddress: address}.inspectContent(ctx, root)
+	_, _, stages := Engine{ClamdAddress: address}.inspectContent(ctx, ctx, root)
 	for _, s := range stages {
 		if s.Name == "yara" && s.Status != "ok" {
 			t.Fatal("YARA stage not proven by canary", s)
@@ -168,5 +172,46 @@ func TestInstallRulesIsAtomicAndComplete(t *testing.T) {
 	}
 	if InstallRules(filepath.Join(dir, "missing")) == nil {
 		t.Fatal("missing database directory accepted")
+	}
+}
+
+func TestIndicatorSourcesModesHashesAndURLs(t *testing.T) {
+	body := "fetch https://Evil.example/drop.sh, then run it\n"
+	md5sum, sha1sum := md5.Sum([]byte(body)), sha1.Sum([]byte(body))
+	later := time.Now().Add(time.Hour)
+	confidence := 90
+	bundle := IndicatorBundle{Version: "merged", Indicators: []Indicator{
+		{ID: "m", Type: "md5", Value: hex.EncodeToString(md5sum[:]), ValidUntil: later, Source: "feed_a", Mode: "block", Severity: "critical", Confidence: &confidence},
+		{ID: "s", Type: "sha1", Value: hex.EncodeToString(sha1sum[:]), ValidUntil: later, Source: "feed_b", Mode: "hunt", Severity: "high"},
+		{ID: "u", Type: "url", Value: "https://evil.example/drop.sh", ValidUntil: later, Source: "feed_c", Mode: "alert", Severity: "medium"},
+		{ID: "other", Type: "url", Value: "https://evil.example/other", ValidUntil: later, Source: "feed_c", Mode: "alert", Severity: "medium"},
+	}}
+	root := t.TempDir()
+	e := Engine{WorkRoot: root, Database: filepath.Join(root, "missing"), Indicators: &bundle}
+	result, err := e.Run(context.Background(), archiveFor(t, "root/README.md", tar.TypeReg, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]assessments.Finding{}
+	for _, f := range result.Findings {
+		got[f.AdvisoryID] = f
+	}
+	if len(got) != 3 || got["feed_a:m"].Type != "ioc_match" || got["feed_b:s"].Type != "ioc_hunt" || got["feed_c:u"].Type != "ioc_alert" || got["feed_c:u"].Severity != "medium" {
+		t.Fatalf("modes map to finding types: %+v", got)
+	}
+	if !bytes.Contains(got["feed_a:m"].Evidence, []byte(`"confidence":90`)) || !bytes.Contains(got["feed_a:m"].Evidence, []byte(`"source":"feed_a"`)) {
+		t.Fatal("evidence names the source", string(got["feed_a:m"].Evidence))
+	}
+
+	// Files above the in-memory limit are hashed while streaming.
+	large := strings.Repeat("x", 26<<20)
+	md5sum = md5.Sum([]byte(large))
+	bundle.Indicators = []Indicator{{ID: "big", Type: "md5", Value: hex.EncodeToString(md5sum[:]), ValidUntil: later, Source: "feed_a", Mode: "block"}}
+	result, err = e.Run(context.Background(), archiveFor(t, "root/blob.bin", tar.TypeReg, large))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Findings) != 1 || result.Findings[0].AdvisoryID != "feed_a:big" {
+		t.Fatalf("streamed MD5 not matched: %+v", result.Findings)
 	}
 }

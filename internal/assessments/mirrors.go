@@ -126,9 +126,9 @@ func (s *Store) ClaimMirror(ctx context.Context) (Mirror, error) {
 }
 
 // FinishMirror records the outcome under the claim's lease. On success it
-// returns the object keys of bundles beyond the newest keep, now marked
-// pruned, for the caller to delete from S3.
-func (s *Store) FinishMirror(ctx context.Context, m Mirror, result *Mirror, failure string, keep int) ([]string, error) {
+// returns the object keys of bundles it marked pruned (beyond the newest
+// keep and older than minAgeDays), for the caller to delete from S3.
+func (s *Store) FinishMirror(ctx context.Context, m Mirror, result *Mirror, failure string, keep, minAgeDays int) ([]string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -148,7 +148,11 @@ func (s *Store) FinishMirror(ctx context.Context, m Mirror, result *Mirror, fail
 	}
 	var pruned []string
 	if result != nil && keep > 0 {
-		rows, err := tx.Query(ctx, `UPDATE `+s.schema+`.asset_mirrors SET status='pruned' WHERE id IN (SELECT id FROM `+s.schema+`.asset_mirrors WHERE asset_id=$1 AND status='succeeded' ORDER BY created_at DESC OFFSET $2) RETURNING object_key`, m.AssetID, keep)
+		// A bundle is pruned only when it is beyond the newest keep AND older
+		// than minAgeDays, so mirroring a compromised repository repeatedly
+		// cannot push every clean backup out. The newest bundle taken before
+		// the asset's earliest open integrity entry is never pruned.
+		rows, err := tx.Query(ctx, `UPDATE `+s.schema+`.asset_mirrors SET status='pruned' WHERE id IN (SELECT m.id FROM `+s.schema+`.asset_mirrors m WHERE m.asset_id=$1 AND m.status='succeeded' AND m.created_at<clock_timestamp()-($3*interval '1 day') AND m.id NOT IN (SELECT n.id FROM `+s.schema+`.asset_mirrors n WHERE n.asset_id=$1 AND n.status='succeeded' ORDER BY n.created_at DESC LIMIT $2) AND m.id IS DISTINCT FROM (SELECT g.id FROM `+s.schema+`.asset_mirrors g WHERE g.asset_id=$1 AND g.status='succeeded' AND g.created_at<(SELECT min(f.first_seen) FROM `+s.schema+`.findings f WHERE f.asset_id=$1 AND f.type='integrity' AND f.status IN ('open','triaged','in_progress')) ORDER BY g.created_at DESC LIMIT 1)) RETURNING object_key`, m.AssetID, keep, minAgeDays)
 		if err != nil {
 			return nil, err
 		}

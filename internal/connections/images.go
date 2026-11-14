@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"strings"
@@ -148,7 +149,7 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 		total += size
 	}
 	if total > limit {
-		return "", errors.New("image exceeds SCRS_MAX_IMAGE_BYTES")
+		return "", fmt.Errorf("%w: image exceeds SCRS_MAX_IMAGE_BYTES", ErrTooLarge)
 	}
 	tagged, err := name.NewTag(locator+":scrs", options...)
 	if err != nil {

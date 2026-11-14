@@ -21,6 +21,8 @@ var (
 	ErrCapacity  = errors.New("queue capacity exceeded")
 	ErrNotFound  = errors.New("not found")
 	ErrLease     = errors.New("assessment lease no longer valid")
+	// ErrBusy means the asset has a running assessment; retry shortly.
+	ErrBusy = errors.New("asset has a running assessment")
 )
 
 // A git repository is owner/name on GitHub, or group[/subgroup...]/name on GitLab.
@@ -252,7 +254,10 @@ func fingerprint(a Assessment, f Finding) string {
 // baseline still warns (stricter than "pass otherwise"), an existing high does
 // not gate.
 // Waived findings (keyed by fingerprint) do not gate, except that malicious
-// content never drops below warn.
+// content never drops below warn. Threat-intelligence findings carry their
+// source's mode in the type: yara_match and ioc_match block like malware,
+// yara_alert and ioc_alert gate by severity like a vulnerability, and
+// yara_hunt and ioc_hunt never gate.
 func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 	failing, warning := false, false
 	counts := map[string]int{"total": len(r.Findings)}
@@ -261,7 +266,11 @@ func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 		if f.Change == "new" {
 			counts["new"]++
 		}
-		malicious := f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "ioc_match"
+		if huntOnly(f.Type) {
+			counts["hunt"]++
+			continue
+		}
+		malicious := maliciousType(f.Type)
 		if waived[f.Fingerprint] {
 			counts["waived"]++
 			warning = warning || malicious
@@ -293,6 +302,14 @@ func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 	return "pass", counts
 }
 
+// maliciousType reports finding types that fail the gate whether new or existing.
+func maliciousType(t string) bool {
+	return t == "malware" || t == "malicious_dependency" || t == "ioc_match" || t == "yara_match"
+}
+
+// huntOnly reports findings recorded for threat hunting that never gate.
+func huntOnly(t string) bool { return t == "yara_hunt" || t == "ioc_hunt" }
+
 // closableTypes lists finding types whose producing stages all completed, so
 // their absence from this scan is evidence of a fix rather than lost coverage.
 func closableTypes(stages []Stage) []string {
@@ -306,7 +323,12 @@ func closableTypes(stages []Stage) []string {
 		"malware":              {"malware"},
 		"posture":              {"malware"},
 		"ioc_match":            {"ioc"},
+		"ioc_alert":            {"ioc"},
+		"ioc_hunt":             {"ioc"},
 		"integrity":            {"integrity"},
+		"yara_match":           {"yara_x"},
+		"yara_alert":           {"yara_x"},
+		"yara_hunt":            {"yara_x"},
 	}
 	types := []string{}
 	for kind, needed := range producers {

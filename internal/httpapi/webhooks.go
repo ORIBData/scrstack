@@ -413,7 +413,9 @@ func (g *githubIngest) pushSignals(ctx context.Context, p githubPayload, bundle 
 
 // matchPatterns applies INT-008 operator patterns to event fields. Generic
 // commit-message patterns alone are medium; branch, title and path matches
-// are critical, per the campaign guidance in PRD Appendix E.
+// are critical, per the campaign guidance in PRD Appendix E. Alert sources
+// use their own severity. Hunt sources are not applied: every integrity event
+// raises an alert.
 func matchPatterns(bundle *intelligence.Bundle, fields map[string][]string, repo, ref, commit, claimed string) []assessments.IntegrityEvent {
 	if bundle == nil {
 		return nil
@@ -422,6 +424,9 @@ func matchPatterns(bundle *intelligence.Bundle, fields map[string][]string, repo
 	now := time.Now()
 	for kind, values := range fields {
 		for _, pattern := range bundle.Patterns(kind, now) {
+			if pattern.Mode == "hunt" {
+				continue
+			}
 			for _, value := range values {
 				if value == "" || !pattern.MatchString(value) {
 					continue
@@ -430,7 +435,14 @@ func matchPatterns(bundle *intelligence.Bundle, fields map[string][]string, repo
 				if kind == "commit_message_regex" {
 					severity = "medium"
 				}
-				out = append(out, assessments.IntegrityEvent{Kind: "pattern_" + pattern.ID, Severity: severity, Title: "Event matches campaign indicator " + pattern.ID, Repository: repo, Ref: ref, Commit: commit, Actor: claimed, Details: map[string]any{"indicator_id": pattern.ID, "indicator_type": kind, "bundle_version": bundle.Version, "matched_value": truncate(value, 256)}})
+				if pattern.Mode == "alert" {
+					severity = pattern.Severity
+					if severity == "info" {
+						severity = "low"
+					}
+				}
+				key := pattern.Key()
+				out = append(out, assessments.IntegrityEvent{Kind: pattern.EventKind(), Severity: severity, Title: "Event matches campaign indicator " + key, Repository: repo, Ref: ref, Commit: commit, Actor: claimed, Details: map[string]any{"indicator_id": key, "indicator_type": kind, "source": pattern.Source, "mode": pattern.Mode, "bundle_version": bundle.Version, "matched_value": truncate(value, 256)}})
 				break
 			}
 		}
