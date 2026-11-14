@@ -3,6 +3,7 @@ package storage
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -52,6 +53,32 @@ func TestS3ArtifactsRoundTripAndTamper(t *testing.T) {
 	}
 	if _, err := a.GetSBOM(ctx, key); err == nil {
 		t.Fatal("artifact corruption not detected")
+	}
+	// Mirrors stream in multipart chunks larger than one part.
+	bundle := bytes.Repeat([]byte("git-bundle-"), 2<<20)
+	id := "00000000-0000-4000-8000-000000000001"
+	mirrorKey, size, err := a.PutMirror(ctx, id, bytes.NewReader(bundle))
+	if err != nil || size != int64(len(bundle)) {
+		t.Fatal("mirror upload failed", err, size)
+	}
+	body, n, err := a.OpenMirror(ctx, mirrorKey)
+	if err != nil || n != size {
+		t.Fatal("mirror open failed", err)
+	}
+	got, _ := io.ReadAll(body)
+	body.Close()
+	if !bytes.Equal(got, bundle) {
+		t.Fatal("mirror roundtrip failed")
+	}
+	if _, _, err := a.PutMirror(ctx, "../escape", bytes.NewReader(nil)); err == nil {
+		t.Fatal("arbitrary mirror key accepted")
+	}
+	if err := a.DeleteMirror(ctx, mirrorKey); err != nil {
+		t.Fatal(err)
+	}
+	if body, _, err := a.OpenMirror(ctx, mirrorKey); err == nil {
+		body.Close()
+		t.Fatal("deleted mirror still readable")
 	}
 	archive := []byte("\x1f\x8bsynthetic-archive")
 	snapKey, err := a.PutSnapshot(ctx, archive)

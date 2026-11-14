@@ -14,6 +14,7 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/intelligence"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -183,6 +184,74 @@ func TestPostgresDurableAssessmentAndFencing(t *testing.T) {
 	}
 	if raw, err := s.ActiveIndicators(ctx); err != nil || !strings.Contains(string(raw), "test-v1") {
 		t.Fatal("active bundle lost", err)
+	}
+	// The legacy bundle feeds the block-mode "bundle" source with plain IDs.
+	scan, err := s.ScanIndicators(ctx)
+	if err != nil || !strings.Contains(string(scan), `"id":"ioc-1"`) || !strings.Contains(string(scan), `"source":"bundle","mode":"block"`) {
+		t.Fatal("legacy bundle missing from the scan bundle", string(scan), err)
+	}
+	// Sources: below-confidence, expired and disabled indicators stay out.
+	feed, err := s.CreateIndicatorSource(ctx, assessments.IndicatorSource{Name: "partner_feed", Kind: "manual", Mode: "hunt", Severity: "high", MinConfidence: 50, Enabled: true}, actor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateIndicatorSource(ctx, assessments.IndicatorSource{Name: "partner_feed", Kind: "manual", Mode: "hunt", Severity: "high", Enabled: true}, actor); !errors.Is(err, assessments.ErrConflict) {
+		t.Fatal("duplicate source name accepted", err)
+	}
+	parsed, err := intelligence.Parse([]byte(`{"version":"p1","indicators":[
+{"id":"keep","type":"url","value":"https://evil.example/x","confidence":70,"valid_until":"2099-01-01T00:00:00Z"},
+{"id":"weak","type":"md5","value":"d41d8cd98f00b204e9800998ecf8427e","confidence":10,"valid_until":"2099-01-01T00:00:00Z"},
+{"id":"old","type":"domain","value":"old.example","valid_until":"2000-01-01T00:00:00Z"},
+{"id":"ioc-1","type":"domain","value":"other.example","valid_until":"2099-01-01T00:00:00Z"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	allow := func(assessments.IndicatorSource) error { return nil }
+	if feed, err = s.ImportSourceIndicators(ctx, feed.ID, parsed, actor, allow); err != nil || feed.IndicatorCount != 4 || feed.Version != "p1" || feed.ImportedAt == nil {
+		t.Fatalf("import not recorded: %+v %v", feed, err)
+	}
+	scan, _ = s.ScanIndicators(ctx)
+	if !strings.Contains(string(scan), `"id":"keep"`) || strings.Contains(string(scan), `"id":"weak"`) || strings.Contains(string(scan), `"id":"old"`) || strings.Count(string(scan), `"id":"ioc-1"`) != 2 {
+		t.Fatal("scan bundle filters by confidence and expiry and keeps per-source IDs", string(scan))
+	}
+	if _, err := intelligence.ParseScan(scan); err != nil {
+		t.Fatal("the scan bundle must parse in the scanner", err)
+	}
+	disabled := false
+	if _, err := s.UpdateIndicatorSource(ctx, feed.ID, feed.Revision, assessments.IndicatorSourceChange{Enabled: &disabled}, actor, func(_, _ assessments.IndicatorSource) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if scan, _ = s.ScanIndicators(ctx); strings.Contains(string(scan), `"id":"keep"`) {
+		t.Fatal("disabled source still scanned")
+	}
+	if events, err := s.ActiveBundle(ctx); err != nil || events != nil {
+		t.Fatal("event bundle holds only patterns", events, err)
+	}
+	if err := s.DeleteIndicatorSource(ctx, feed.ID, actor, allow); err != nil {
+		t.Fatal(err)
+	}
+	var orphans int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.indicators WHERE source_id=$1`, feed.ID).Scan(&orphans); err != nil || orphans != 0 {
+		t.Fatal("indicators outlive their source", orphans, err)
+	}
+	// A deployment upgraded with an active legacy bundle and no sources gets
+	// the "bundle" source once, on the next migration.
+	if _, err := pool.Exec(ctx, `DELETE FROM `+schema+`.indicator_sources`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		for _, ddl := range assessments.Schema(schema) {
+			if _, err := pool.Exec(ctx, ddl); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var migrated, carried int
+	if err := pool.QueryRow(ctx, `SELECT count(*),COALESCE(max(indicator_count),0) FROM `+schema+`.indicator_sources WHERE name='bundle' AND mode='block' AND version='test-v1'`).Scan(&migrated, &carried); err != nil || migrated != 1 || carried != 1 {
+		t.Fatal("legacy bundle not migrated once", migrated, carried, err)
+	}
+	if scan, _ = s.ScanIndicators(ctx); !strings.Contains(string(scan), `"id":"ioc-1"`) {
+		t.Fatal("migrated indicators not scanned", string(scan))
 	}
 	// Completion durably schedules automatic remediation; repeated dispatch creates one child.
 	autoRequest := request

@@ -155,9 +155,16 @@ outages never block scanning; the previous copy is carried forward.
 | `SCRS_RESCAN_INTERVAL_HOURS` | worker | Scheduled default-branch rescans; 0 disables |
 
 **Image assessment** requires the image's OS ecosystems in
-`SCRS_OSV_ECOSYSTEMS`, for example `npm,Go,Maven,Alpine,Debian`. Each adds to
-the first feed download, which the scanner healthcheck now allows up to
-15 minutes for.
+`SCRS_OSV_ECOSYSTEMS`. The default is now `npm,Go,Maven,PyPI,Pub,SwiftURL,RubyGems,Alpine,Debian`
+(about 380 MB on the first sync, which the scanner healthcheck allows up to
+15 minutes for). Pub, SwiftURL and RubyGems cover Flutter, Swift Package
+Manager and fastlane lockfiles; without a lockfile's feed the whole package
+stage fails and the verdict is `incomplete`. Ubuntu is not supported offline:
+its archive is 815 MB and expands to 8.1 GiB (2026-11-14), beyond the 512 MiB
+download, 2 GiB expansion and 2 MiB per-record caps. Import a Trivy report for
+Ubuntu-based images instead. OSV publishes no CocoaPods feed and OSV-Scanner
+does not read `Podfile.lock`, so CocoaPods dependencies have no vulnerability
+coverage.
 
 **Monitoring.** Scrape `https://<domain>/scrs/v1/system/metrics` with a
 `read` token (Prometheus `authorization` credentials). Queue depth, oldest
@@ -176,3 +183,42 @@ end to end with disposable PostgreSQL, Redis and MinIO:
 - the worker's dispatcher attempted outbound delivery and scheduled a retry.
 
 Live Traefik/TLS on the VPS remains to be accepted with `make deployment-acceptance`.
+
+## 2026-11-14 release additions
+
+Migration `2026111401` runs through `scrs-storage-init`: it widens the
+connection provider check and adds the `asset_mirrors` table. It is additive.
+
+**New capabilities:** GitLab, Harbor and generic OCI connections; GitLab
+webhooks (`/scrs/v1/ingest/gitlab`); registry push events
+(`/scrs/v1/ingest/registry/{harbor,dockerhub,gar,oci}`); Trivy and SARIF import
+(`/scrs/v1/assessments:import`); ClamAV, YARA and IOC inspection of every image
+layer; git-history mirrors; and an `X-SCRS-Auth` header on outbound webhooks
+for n8n Header Auth.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_GITLAB_WEBHOOK_SECRET` | API | GitLab webhook secret token (32+ characters); also verifies relayed GitLab events |
+| `SCRS_YARA_BINARY` | API, scanner | YARA-X CLI used to validate and run YARA rulesets (default `/usr/local/bin/yr`, shipped in the image) |
+| `SCRS_GITHUB_HOOK_CHECK_MINUTES` | worker | GitHub webhook delivery check interval (default 5; 0 disables). GitHub never retries a failed delivery, so the worker reads SCRS's webhook delivery log, requests redelivery of missed events and reports hook misconfiguration at `GET /system/github-webhooks` |
+| `SCRS_GITHUB_HOOK_URL` | worker | Public URL of the GitHub webhook when it is not an SCRS path (for example an n8n relay); by default any hook ending in `/scrs/v1/webhooks/github` or `/scrs/v1/ingest/github` is checked |
+| `SCRS_MIRRORS_ENABLED` | worker | Run the mirror queue (default `true`) |
+| `SCRS_MIRROR_INTERVAL_HOURS` | worker | Mirror assets labelled `mirror=true` on this interval; 0 = on demand only |
+| `SCRS_MIRROR_MAX_BYTES` | worker | Largest bundle (default 2 GiB) |
+| `SCRS_MIRROR_KEEP` | worker | Bundles kept per asset (default 7) |
+| `SCRS_MIRROR_MIN_AGE_DAYS` | worker | Bundles younger than this are never pruned (default 30). A bundle is deleted only when beyond `SCRS_MIRROR_KEEP` and older than this; the newest bundle taken before an open integrity finding is always kept |
+
+**Outbound access** from `scrs-worker` now also includes your GitLab origin,
+`github.com` (git smart HTTP for mirrors) and every connected registry.
+
+**Large transfers.** Imports may upload 16 MiB within 60 seconds and bundle
+downloads stream for up to 30 minutes. If Traefik's entrypoint read or write
+timeouts are lower, raise them for the SCRS router.
+
+**Verified locally on 2026-11-13.** This Compose file was rebuilt and run from
+the `deploy/Dockerfile.scrs` image. The migration applied, and the GitLab,
+Harbor and GitHub connections were accepted. A GitLab push queued an
+assessment. A Harbor push queued a digest-pinned image assessment. A Trivy
+import completed with its verdict. A mirror request reached github.com and was
+recorded as failed with a clear `HTTP 401`, because the test used a synthetic
+token.

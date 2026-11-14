@@ -1,0 +1,80 @@
+{
+  "name": "SCRS - registry push relay",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "registry-scrs",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "9d4a3f97-4a5b-4f6e-8d34-000000000001",
+      "name": "Inbound webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "9d4a3f97-4a5b-4f6e-8d34-0000000000a1"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $vars.SCRS_BASE_URL }}/scrs/v1/ingest/registry/{{ $vars.SCRS_REGISTRY_PROVIDER || 'dockerhub' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "9d4a3f97-4a5b-4f6e-8d34-000000000002",
+      "name": "Relay unchanged body to SCRS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        260,
+        0
+      ],
+      "notes": "Docker Hub webhooks and GAR Pub/Sub push subscriptions cannot send an Authorization header; this relay adds the ingest:relay token. Set the n8n variable SCRS_REGISTRY_PROVIDER to dockerhub, gar or oci (Harbor can call SCRS directly). Retries replay the same assessments.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Inbound webhook": {
+      "main": [
+        [
+          {
+            "node": "Relay unchanged body to SCRS",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

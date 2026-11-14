@@ -24,4 +24,4 @@ if [[ "$s3_ready" != true ]]; then echo 'Disposable MinIO failed to become ready
 test_s3_address=$("$DOCKER" port "$test_s3" 9000/tcp)
 test_address=$("$DOCKER" port "$test_container" 5432/tcp)
 test_redis_address=$("$DOCKER" port "$test_redis" 6379/tcp)
-SCRS_TEST_S3_ENDPOINT="http://${test_s3_address}" SCRS_TEST_PG_CONTAINER="$test_container" SCRS_TEST_REDIS_URL="redis://${test_redis_address}/0" SCRS_TEST_DATABASE_URL="postgres://postgres:synthetic-test-password@${test_address}/postgres?sslmode=disable" "$GO" test -race ./internal/connections ./internal/httpapi ./internal/assessments ./internal/worker ./internal/storage -run 'TestPostgres|TestS3Artifacts' -count=1
+SCRS_TEST_MBOM_OUT="${SCRS_TEST_MBOM_OUT:-}" SCRS_TEST_S3_ENDPOINT="http://${test_s3_address}" SCRS_TEST_PG_CONTAINER="$test_container" SCRS_TEST_REDIS_URL="redis://${test_redis_address}/0" SCRS_TEST_DATABASE_URL="postgres://postgres:synthetic-test-password@${test_address}/postgres?sslmode=disable" "$GO" test -race ./internal/connections ./internal/httpapi ./internal/assessments ./internal/worker ./internal/storage -run 'TestPostgres|TestS3Artifacts' -count=1

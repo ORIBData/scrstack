@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -128,8 +129,11 @@ func (a NativeAdapters) GitHubSnapshot(ctx context.Context, c Connection, secret
 		return nil, "", false, errors.New("archive download rejected")
 	}
 	data, err := io.ReadAll(io.LimitReader(archive.Body, (64<<20)+1))
-	if err != nil || len(data) > 64<<20 {
-		return nil, "", false, errors.New("archive exceeded download limit")
+	if err != nil {
+		return nil, "", false, errors.New("archive download failed")
+	}
+	if len(data) > 64<<20 {
+		return nil, "", false, fmt.Errorf("%w: archive exceeded 64 MiB download limit", ErrTooLarge)
 	}
 	return data, resolved, moved, nil
 }

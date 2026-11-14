@@ -18,14 +18,26 @@ ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/osv-scanner github.com/google/osv-scanner/v2/cmd/osv-scanner
 
+# YARA-X CLI for team and third-party YARA rules (pe, elf, math, hash, dotnet
+# modules). Built from source for the target platform: Rust's musl target links
+# statically, so the binary runs in the scratch image.
+FROM rust:1.99.0-alpine3.22 AS yara-build
+ARG YARA_X_VERSION=1.22.0
+RUN apk add --no-cache musl-dev \
+ && cargo install yara-x-cli --version ${YARA_X_VERSION} --locked --root /out \
+ && /out/bin/yr --version
+
 FROM alpine:3.24 AS certificates
 RUN apk add --no-cache ca-certificates
 
 FROM scratch
-LABEL io.scrs.project="scrstack"
+LABEL io.scrs.project="scrstack" \
+      org.opencontainers.image.title="SCRS: Software Supply Chain Risk Stack" \
+      org.opencontainers.image.description="Software supply-chain assessments with SBOM and MBOM, malware scanning and a risk register"
 COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/scrs /usr/local/bin/scrs
 COPY --from=scanner-build /out/osv-scanner /usr/local/bin/osv-scanner
+COPY --from=yara-build /out/bin/yr /usr/local/bin/yr
 USER 65532:65532
 EXPOSE 7000
 ENTRYPOINT ["/usr/local/bin/scrs"]

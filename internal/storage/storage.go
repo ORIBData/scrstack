@@ -102,7 +102,7 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			config jsonb NOT NULL, scope jsonb NOT NULL, credential_ciphertext bytea NOT NULL,
 			secret_key_id text NOT NULL, status jsonb NOT NULL DEFAULT '{}',
 			created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-			CHECK (provider IN ('github','dockerhub','gar'))
+			CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.assets (
 			id uuid PRIMARY KEY, type text NOT NULL, locator text NOT NULL,
@@ -118,6 +118,9 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 		`CREATE UNIQUE INDEX IF NOT EXISTS assets_connection_locator_uq ON ` + schema + `.assets(connection_id,type,locator)`,
 		`CREATE INDEX IF NOT EXISTS assets_connection_idx ON ` + schema + `.assets(connection_id)`,
 		`CREATE INDEX IF NOT EXISTS assets_locator_id_idx ON ` + schema + `.assets(locator,id)`,
+		// 2026111401: GitLab, Harbor and generic OCI providers.
+		`ALTER TABLE ` + schema + `.connections DROP CONSTRAINT IF EXISTS connections_provider_check`,
+		`ALTER TABLE ` + schema + `.connections ADD CONSTRAINT connections_provider_check CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci'))`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.api_tokens (
    id uuid PRIMARY KEY, name text NOT NULL UNIQUE, prefix text NOT NULL,
    secret_hash bytea NOT NULL UNIQUE CHECK(octet_length(secret_hash)=32),
@@ -125,6 +128,10 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
    expires_at timestamptz, created_at timestamptz NOT NULL DEFAULT now(),
    last_used_at timestamptz, revoked_at timestamptz
   )`,
+		// 2026111402: GitHub webhook delivery check (state and redelivery retries).
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS webhook_check jsonb NOT NULL DEFAULT '{}'`,
+		`CREATE TABLE IF NOT EXISTS ` + schema + `.github_redeliveries(connection_id uuid NOT NULL REFERENCES ` + schema + `.connections(id),guid text NOT NULL,hook_source text NOT NULL,hook_id bigint NOT NULL,delivery_id bigint NOT NULL,event text NOT NULL,status text NOT NULL CHECK(status IN ('retrying','delivered','abandoned','rejected')),status_code integer NOT NULL,attempts integer NOT NULL DEFAULT 0,first_failed_at timestamptz NOT NULL,last_attempt_at timestamptz,updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),PRIMARY KEY(connection_id,guid))`,
+		`CREATE INDEX IF NOT EXISTS github_redeliveries_retrying_idx ON ` + schema + `.github_redeliveries(connection_id) WHERE status='retrying'`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.audit_log (
 			id bigserial PRIMARY KEY, occurred_at timestamptz NOT NULL DEFAULT now(),
 			action text NOT NULL, target_id uuid, details jsonb NOT NULL DEFAULT '{}'
@@ -144,7 +151,7 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			return errors.New("notification schema migration failed")
 		}
 	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111301) ON CONFLICT DO NOTHING`); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111301),(2026111401),(2026111402) ON CONFLICT DO NOTHING`); err != nil {
 		return errors.New("PostgreSQL migration version record failed")
 	}
 	if err := tx.Commit(ctx); err != nil {

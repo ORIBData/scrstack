@@ -19,9 +19,19 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		return ErrInput
 	}
 	required := map[string]bool{"resolve": false, "fetch": false, "inventory": false, "sbom": false, "match_vuln": false, "match_malicious": false, "malware": false, "yara": false, "ioc": false, "integrity": false}
+	imported := a.Request.Import != nil
+	if imported {
+		// An import is complete for what its tool reports; it carries no SBOM.
+		required = map[string]bool{"import": false}
+	}
 	for _, stage := range r.Stages {
 		if _, ok := required[stage.Name]; ok {
 			required[stage.Name] = stage.Status == "ok"
+		}
+		// YARA-X runs only when rulesets are enabled; when it runs, partial
+		// coverage is incomplete like any other content stage.
+		if stage.Name == "yara_x" && stage.Status != "ok" && stage.Status != "skipped" {
+			r.Complete = false
 		}
 	}
 	for _, ok := range required {
@@ -30,7 +40,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		}
 	}
 	if r.SBOMKey == "" {
-		r.Complete = false
+		if !imported {
+			r.Complete = false
+		}
 		if r.SBOMSHA256 != "" {
 			return ErrInput
 		}
@@ -68,9 +80,18 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// change baseline, not a last-known-good security designation.
 	if len(r.Files) > 0 {
 		var previous []byte
-		previousErr := tx.QueryRow(ctx, `SELECT f.body FROM `+s.schema+`.assessment_files f JOIN `+s.schema+`.assessments p ON p.id=f.assessment_id WHERE p.asset_id=$1 AND p.request->'target'->>'ref'=$2 AND p.status='succeeded' AND p.request->'remediation' IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT 1`, a.AssetID, a.Request.Target.Ref).Scan(&previous)
+		var priorWalked bool
+		previousErr := tx.QueryRow(ctx, `SELECT f.body,p.stages @> '[{"name":"integrity","status":"ok"}]' FROM `+s.schema+`.assessment_files f JOIN `+s.schema+`.assessments p ON p.id=f.assessment_id WHERE p.asset_id=$1 AND p.request->'target'->>'ref'=$2 AND p.status='succeeded' AND p.request->'remediation' IS NULL AND p.request->'import' IS NULL ORDER BY p.created_at DESC,p.id DESC LIMIT 1`, a.AssetID, a.Request.Target.Ref).Scan(&previous, &priorWalked)
 		if previousErr != nil && previousErr != pgx.ErrNoRows {
 			return previousErr
+		}
+		// An interrupted content walk lists only some files. A path missing
+		// from such a list is unknown, not added or deleted.
+		walked := false
+		for _, stage := range r.Stages {
+			if stage.Name == "integrity" {
+				walked = stage.Status == "ok"
+			}
 		}
 		if previousErr == nil {
 			var prior []FileEvidence
@@ -91,12 +112,13 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 			}
 			changes := map[string]string{}
 			for path, digest := range after {
-				if before[path] != digest {
+				// A changed digest is always real; a new path only when the prior walk was whole.
+				if old, known := before[path]; (known && old != digest) || (!known && priorWalked) {
 					changes[path] = "added_or_modified"
 				}
 			}
 			for path := range before {
-				if after[path] == "" {
+				if after[path] == "" && walked {
 					changes[path] = "deleted"
 				}
 			}
@@ -124,7 +146,7 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		baseRef = pr.BaseRef
 	}
 	var baseline uuid.UUID
-	err = tx.QueryRow(ctx, `SELECT id FROM `+s.schema+`.assessments WHERE asset_id=$1 AND request->'target'->>'ref'=$2 AND status='succeeded' AND request->'remediation' IS NULL AND id<>$3 ORDER BY created_at DESC,id DESC LIMIT 1`, a.AssetID, baseRef, a.ID).Scan(&baseline)
+	err = tx.QueryRow(ctx, `SELECT id FROM `+s.schema+`.assessments WHERE asset_id=$1 AND request->'target'->>'ref'=$2 AND status='succeeded' AND request->'remediation' IS NULL AND request->'import' IS NULL AND id<>$3 ORDER BY created_at DESC,id DESC LIMIT 1`, a.AssetID, baseRef, a.ID).Scan(&baseline)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err
 	}
@@ -205,7 +227,22 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// Change records (workflow changes, provider events) need human review and
 	// are never closed by absence.
 	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		if err != nil {
+			return err
+		}
+	}
+	// Imported findings are closed only by a later import of the same tool
+	// whose caller declares it the tool's full result for this ref
+	// (replace_previous). A partial run, such as secrets only, must not mark
+	// the tool's other findings fixed. SCRS's own scans never close them:
+	// tools name the same issue differently (CVE versus GHSA ids).
+	if imp := a.Request.Import; imp != nil && imp.Replace && a.Request.Target.Ref != "" {
+		tool := ""
+		if imp.Format == "sarif" {
+			tool = imp.Tool
+		}
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND evidence->>'source'=$4 AND ($5='' OR lower(evidence->>'tool')=$5) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_import',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, imp.Format, tool)
 		if err != nil {
 			return err
 		}

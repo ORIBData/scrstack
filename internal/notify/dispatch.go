@@ -32,6 +32,19 @@ func Sign(secret string, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
+// AuthHeader is a static per-subscription credential derived from the signing
+// secret. Receivers that can only compare a header value (n8n Header Auth,
+// API gateways) check it instead of computing the HMAC. It authenticates the
+// sender but, unlike X-SCRS-Signature, does not bind the body.
+const AuthHeader = "X-SCRS-Auth"
+
+// AuthToken returns the X-SCRS-Auth value for a subscription secret.
+func AuthToken(secret string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	_, _ = mac.Write([]byte("scrs-webhook-header-auth-v1"))
+	return "scrs_" + hex.EncodeToString(mac.Sum(nil))
+}
+
 // Verify checks a signature header in constant time (for receivers and tests).
 func Verify(secret string, body []byte, header string) bool {
 	return hmac.Equal([]byte(Sign(secret, body)), []byte(header))
@@ -236,6 +249,7 @@ func (d *Dispatcher) send(ctx context.Context, c claimed) (int, string) {
 	req.Header.Set("X-SCRS-Delivery", c.id.String())
 	req.Header.Set("Idempotency-Key", c.event.String())
 	req.Header.Set("X-SCRS-Signature", Sign(secret, body))
+	req.Header.Set(AuthHeader, AuthToken(secret))
 	resp, err := d.client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {

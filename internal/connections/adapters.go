@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +28,7 @@ type NativeAdapters struct {
 	GitHubAPI string // overridden only by tests
 	DockerAPI string // overridden only by tests
 	GoogleAPI string // overridden only by tests
+	GitHubGit string // git smart-HTTP origin; overridden only by tests
 	// RegistryHost pins image pulls to one plain-HTTP registry; tests only.
 	RegistryHost string
 }
@@ -48,12 +48,32 @@ func (a NativeAdapters) List(ctx context.Context, c Connection, secret json.RawM
 		return a.dockerHub(ctx, c, secret)
 	case "gar":
 		return a.gar(ctx, c, secret)
+	case "gitlab":
+		return a.gitLab(ctx, c, secret)
+	case "harbor":
+		return a.harbor(ctx, c, secret)
+	case "oci":
+		return a.oci(ctx, c, secret)
 	default:
 		return nil, errors.New("no native adapter for provider")
 	}
 }
 
 func (a NativeAdapters) request(ctx context.Context, method, target, token string, body []byte) ([]byte, error) {
+	return a.do(ctx, method, target, func(r *http.Request) {
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+	}, body)
+}
+
+// do sends one bounded provider API request with the given authentication.
+func (a NativeAdapters) do(ctx context.Context, method, target string, auth func(*http.Request), body []byte) ([]byte, error) {
+	return a.send(ctx, method, target, auth, body, nil)
+}
+
+// send is do with an optional look at the successful response's headers.
+func (a NativeAdapters) send(ctx context.Context, method, target string, auth func(*http.Request), body []byte, inspect func(*http.Response)) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, method, target, bytes.NewReader(body))
 	if err != nil {
 		return nil, errors.New("provider request invalid")
@@ -62,9 +82,7 @@ func (a NativeAdapters) request(ctx context.Context, method, target, token strin
 	if strings.HasPrefix(target, strings.TrimSuffix(a.GitHubAPI, "/")+"/") {
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
+	auth(req)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -84,54 +102,35 @@ func (a NativeAdapters) request(ctx context.Context, method, target, token strin
 	if err != nil || len(data) > 4<<20 {
 		return nil, errors.New("provider response failed or exceeded 4 MiB")
 	}
+	if inspect != nil {
+		inspect(resp)
+	}
 	return data, nil
 }
 
 func (a NativeAdapters) github(ctx context.Context, c Connection, secret json.RawMessage) ([]Resource, error) {
-	var cfg struct {
-		Organization   string `json:"organization"`
-		AuthType       string `json:"auth_type"`
-		AppID          string `json:"app_id"`
-		InstallationID int64  `json:"installation_id"`
-	}
-	var cred struct {
-		PrivateKeyPEM string `json:"private_key_pem"`
-		Token         string `json:"token"`
-	}
-	if json.Unmarshal(c.Config, &cfg) != nil || json.Unmarshal(secret, &cred) != nil || !providerSegment.MatchString(cfg.Organization) {
-		return nil, errors.New("GitHub connection configuration invalid")
-	}
-	if cfg.AuthType == "" { // Existing app connections seeded before auth_type was recorded.
-		cfg.AuthType = "github_app"
+	cfg, err := parseGitHub(c, secret)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.AuthType == "fine_grained_pat" || cfg.AuthType == "oauth_app_token" {
-		if strings.TrimSpace(cred.Token) == "" {
+		if strings.TrimSpace(cfg.token) == "" {
 			return nil, errors.New("GitHub token is required for selected auth type")
 		}
-		return a.githubUserRepositories(ctx, cfg.Organization, cred.Token)
+		return a.githubUserRepositories(ctx, cfg.Organization, cfg.token)
 	}
-	if cfg.AuthType != "github_app" || cfg.AppID == "" || cfg.InstallationID <= 0 || cred.PrivateKeyPEM == "" {
+	if cfg.AuthType != "github_app" {
 		return nil, errors.New("GitHub App connection configuration invalid")
 	}
-	jwt, err := githubJWT(cfg.AppID, []byte(cred.PrivateKeyPEM))
+	token, err := a.accessToken(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	base := strings.TrimSuffix(a.GitHubAPI, "/")
-	data, err := a.request(ctx, http.MethodPost, base+"/app/installations/"+strconv.FormatInt(cfg.InstallationID, 10)+"/access_tokens", jwt, []byte(`{}`))
-	if err != nil {
-		return nil, err
-	}
-	var token struct {
-		Token string `json:"token"`
-	}
-	if json.Unmarshal(data, &token) != nil || token.Token == "" {
-		return nil, errors.New("GitHub installation token response invalid")
-	}
 	var resources []Resource
 	for page := 1; page <= 100; page++ {
 		url := fmt.Sprintf("%s/installation/repositories?per_page=100&page=%d", base, page)
-		data, err := a.request(ctx, http.MethodGet, url, token.Token, nil)
+		data, err := a.request(ctx, http.MethodGet, url, token, nil)
 		if err != nil {
 			return nil, err
 		}

@@ -13,6 +13,10 @@ import (
 )
 
 var ErrNotFound = errors.New("not found")
+
+// ErrTooLarge marks content over a configured size limit. Retrying cannot
+// succeed, so workers fail such assessments without further attempts.
+var ErrTooLarge = errors.New("content exceeds SCRS size limit")
 var labelKey = regexp.MustCompile(`^[a-z0-9][a-z0-9._/-]{0,62}$`)
 
 // Owner is the accountable contact for assets (AST-002). Contact fields are

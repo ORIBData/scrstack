@@ -39,6 +39,10 @@
               "value": "={{ $json.headers['x-github-delivery'] }}"
             },
             {
+              "name": "X-Hub-Signature-256",
+              "value": "={{ $json.headers['x-hub-signature-256'] }}"
+            },
+            {
               "name": "Content-Type",
               "value": "application/json"
             }
@@ -63,7 +67,7 @@
         260,
         0
       ],
-      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. Retries are safe: the delivery GUID is the idempotency key.",
+      "notes": "Header Auth credential: Authorization = Bearer <SCRS ingest:relay token>. The forwarded X-Hub-Signature-256 is verified by SCRS against SCRS_GITHUB_WEBHOOK_SECRET, so the relay cannot alter events. Retries are safe: the delivery GUID is the idempotency key.",
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000

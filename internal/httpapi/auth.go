@@ -34,6 +34,8 @@ type Security struct {
 	Artifacts           interface {
 		GetSBOM(context.Context, string) ([]byte, error)
 	}
+	// Mirrors opens stored git bundles; nil disables bundle download.
+	Mirrors        MirrorReader
 	Notify         *notify.Store
 	Logger         *slog.Logger
 	Store          TokenStore
@@ -41,6 +43,10 @@ type Security struct {
 	DocsPublic     bool
 	TrustedProxies []netip.Prefix
 	Origins        []string
+	// GitHubHooks overrides the GitHub API for the delivery check; tests only.
+	GitHubHooks connections.HookAPI
+	// ValidateRules overrides the YARA-X compiler; tests only.
+	ValidateRules RuleValidator
 }
 
 var tokenWindow = redis.NewScript(`
@@ -69,6 +75,15 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
 	m := newMetrics(security.Assessments, security.Notify)
 	mux.Handle("GET "+BasePath+"/system/metrics", security.protect("read", m.handler()))
+	if checker, ok := store.(hookChecker); ok {
+		api := security.GitHubHooks
+		if api == nil {
+			api = connections.NewNativeAdapters()
+		}
+		hooks := hookHandler{store: checker, api: api}
+		mux.Handle("GET "+BasePath+"/system/github-webhooks", security.protect("read", hooks))
+		mux.Handle("POST "+BasePath+"/system/github-webhooks:check", security.protect("admin", hooks))
+	}
 	if admin, ok := store.(assetAdmin); ok {
 		assetsHandler := assetHandler{admin}
 		mux.Handle("GET "+BasePath+"/owners", security.protect("read|write", assetsHandler))
@@ -89,17 +104,32 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 			mux.Handle(BasePath+path, security.protect("admin", retentionHandler(security.Assessments)))
 		}
 		ingest := newGitHubIngest(security.Assessments, security.GitHubWebhookSecret, security.RemediationEnabled, security.RelayEnabled)
-		direct, relay := ingest.direct(), security.protect("ingest:relay", ingest.relay())
-		mux.Handle("POST "+BasePath+"/webhooks/github", direct)
-		// ING-001/TRG-002: one provider endpoint, two entry modes. A provider
-		// signature selects direct mode; a bearer token selects relay mode.
-		mux.Handle("POST "+BasePath+"/ingest/github", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("X-Hub-Signature-256") == "" && r.Header.Get("Authorization") != "" {
-				relay.ServeHTTP(w, r)
-				return
-			}
-			direct.ServeHTTP(w, r)
-		}))
+		mux.Handle("POST "+BasePath+"/webhooks/github", ingest.direct("github"))
+		// ING-001/TRG-002: one provider endpoint, two entry modes. A bearer
+		// token selects relay mode (which also verifies a forwarded provider
+		// signature); otherwise the provider's own authentication applies.
+		for _, provider := range []string{"github", "gitlab"} {
+			direct, relay := ingest.direct(provider), security.protect("ingest:relay", ingest.relay(provider))
+			mux.Handle("POST "+BasePath+"/ingest/"+provider, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "" {
+					relay.ServeHTTP(w, r)
+					return
+				}
+				direct.ServeHTTP(w, r)
+			}))
+		}
+		validate := security.ValidateRules
+		if validate == nil {
+			validate = yaraValidator()
+		}
+		rules := security.protect("read|write", ruleHandler{store: security.Assessments, validate: validate, compiles: make(chan struct{}, 2)})
+		for _, path := range []string{"/intel/yara-rulesets", "/intel/yara-rulesets:validate", "/intel/yara-rulesets/"} {
+			mux.Handle(BasePath+path, rules)
+		}
+		sources := security.protect("read|write", sourceHandler{store: security.Assessments})
+		mux.Handle(BasePath+"/intel/indicator-sources", sources)
+		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
+		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}", security.protect("ingest:relay", registryIngest{store: security.Assessments, relayEnabled: security.RelayEnabled}))
 		mux.Handle(BasePath+"/feeds/indicators", security.protect("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			defer cancel()
@@ -140,11 +170,16 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		h := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts, remediationEnabled: security.RemediationEnabled}
 		mux.Handle("POST "+BasePath+"/assessments", security.protect("write|trigger", h))
 		mux.Handle("POST "+BasePath+"/assessments:batch", security.protect("write|trigger", h))
+		mux.Handle("POST "+BasePath+"/assessments:import", security.protect("write|trigger", h))
 		mux.Handle("GET "+BasePath+"/assets/{id}/last-known-good", security.protect("read|write", h))
 		mux.Handle("GET "+BasePath+"/assessments", security.protect("read|write|trigger", h))
 		mux.Handle(BasePath+"/assessments/", security.protect("read|write|trigger", h))
 		mux.Handle("GET "+BasePath+"/remediation/capabilities", security.protect("read|write", h))
 		mux.Handle("POST "+BasePath+"/assets/{id}/remediations", security.protect("write", h))
+		mirrors := mirrorHandler{store: security.Assessments, bundles: security.Mirrors}
+		mux.Handle("POST "+BasePath+"/assets/{id}/mirrors", security.protect("write", mirrors))
+		mux.Handle("GET "+BasePath+"/assets/{id}/mirrors", security.protect("read|write", mirrors))
+		mux.Handle("GET "+BasePath+"/assets/{id}/mirrors/{mirror}/bundle", security.protect("admin", mirrors))
 		mux.Handle(BasePath+"/register", security.protect("read|write", h))
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
 	}

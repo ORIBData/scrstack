@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,9 @@ func assessmentError(w http.ResponseWriter, err error) {
 		writeError(w, 404, "asset or assessment unavailable")
 	case errors.Is(err, assessments.ErrConflict):
 		writeError(w, 409, "request conflicts with existing state")
+	case errors.Is(err, assessments.ErrBusy):
+		w.Header().Set("Retry-After", "30")
+		writeError(w, 409, "asset has a running assessment; retry shortly")
 	case errors.Is(err, assessments.ErrCapacity):
 		w.Header().Set("Retry-After", "30")
 		writeError(w, 429, "assessment queue full")
@@ -63,6 +67,10 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	if r.URL.Path == BasePath+"/assessments:batch" {
 		h.batch(ctx, w, r, principal)
+		return
+	}
+	if r.URL.Path == BasePath+"/assessments:import" {
+		h.importReport(w, r, principal)
 		return
 	}
 	if strings.HasSuffix(r.URL.Path, "/last-known-good") {
@@ -142,6 +150,10 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if input.Remediation != nil {
 				writeError(w, 400, "use the scoped remediation endpoint")
+				return
+			}
+			if reservedOrigin.MatchString(input.Trigger.Origin) {
+				writeError(w, 400, "trigger.origin is reserved; use your own system name")
 				return
 			}
 			input.AutoRemediation = h.remediationEnabled
@@ -348,6 +360,18 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(data)
+	case "mbom":
+		doc, err := h.store.MBOM(ctx, id)
+		if err != nil {
+			if errors.Is(err, assessments.ErrConflict) {
+				writeError(w, 409, "MBOM available only for succeeded assessments")
+				return
+			}
+			assessmentError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.cyclonedx+json")
+		_, _ = w.Write(doc)
 	case "vex":
 		doc, err := h.store.VEX(ctx, id)
 		if err != nil {
@@ -504,6 +528,10 @@ func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *
 			results = append(results, map[string]any{"index": i, "status": 400, "error": "use the scoped remediation endpoint"})
 			continue
 		}
+		if reservedOrigin.MatchString(item.Request.Trigger.Origin) {
+			results = append(results, map[string]any{"index": i, "status": 400, "error": "trigger.origin is reserved; use your own system name"})
+			continue
+		}
 		item.Request.AutoRemediation = h.remediationEnabled
 		a, replayed, err := h.store.Enqueue(batchCtx, item.Request, principal.ID, principal.Name, item.IdempotencyKey)
 		if err != nil {
@@ -519,6 +547,66 @@ func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *
 		results = append(results, map[string]any{"index": i, "status": status, "assessment_id": a.ID, "location": BasePath + "/assessments/" + a.ID.String()})
 	}
 	writeJSON(w, 207, map[string]any{"items": results})
+}
+
+var importSlots = make(chan struct{}, 2)
+
+// reservedOrigin matches trigger origins SCRS assigns itself. API callers may
+// not claim them, so the audit trail can tell a provider event from a request.
+var reservedOrigin = regexp.MustCompile(`^(github|gitlab|registry|import)_|^(replay|scheduler)$`)
+
+// importReport records a Trivy or SARIF report as a completed assessment.
+func (h assessmentHandler) importReport(w http.ResponseWriter, r *http.Request, principal connections.Token) {
+	var input struct {
+		Target     assessments.Target `json:"target"`
+		Connection string             `json:"connection"`
+		Format     string             `json:"format"`
+		Notify     []string           `json:"notify"`
+		Replace    bool               `json:"replace_previous"`
+		Report     json.RawMessage    `json:"report"`
+	}
+	// Each import holds its report (up to 16 MiB) several times in memory.
+	select {
+	case importSlots <- struct{}{}:
+		defer func() { <-importSlots }()
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, 429, "import capacity exceeded; retry shortly")
+		return
+	}
+	// Reports up to 16 MiB need longer than the server's default read timeout.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(60 * time.Second))
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); err != nil || decoder.Decode(new(any)) != io.EOF || len(input.Report) == 0 {
+		writeError(w, 400, "import requires target, format and report (max 16 MiB)")
+		return
+	}
+	// replace_previous marks register entries fixed, which is triage: a
+	// trigger-only token may add findings but not close them.
+	if input.Replace && !principal.Allows("write") {
+		writeError(w, 403, "replace_previous requires write scope")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	request := assessments.Request{Target: input.Target, Connection: input.Connection, Notify: input.Notify}
+	a, replayed, err := h.store.Import(ctx, request, principal.ID, principal.Name, r.Header.Get("Idempotency-Key"), input.Format, input.Replace, input.Report)
+	if err != nil {
+		if errors.Is(err, assessments.ErrInput) && err != assessments.ErrInput {
+			writeError(w, 400, err.Error())
+			return
+		}
+		assessmentError(w, err)
+		return
+	}
+	status := 201
+	if replayed {
+		status = 200
+		w.Header().Set("Idempotent-Replayed", "true")
+	}
+	w.Header().Set("Location", BasePath+"/assessments/"+a.ID.String())
+	writeJSON(w, status, a)
 }
 
 // statusRecorder captures assessmentError output for per-item batch results.

@@ -152,10 +152,14 @@ func TestPostgresIngestRelayIntegrityAndOutboundWebhooks(t *testing.T) {
 	must(call(handler, "POST", "/webhooks", admin, `{"name":"bad","url":"`+sink.URL+`","events":["assessment.completed"],"profile":"agent"}`, nil), 400)
 	w := must(call(handler, "POST", "/webhooks", admin, `{"name":"n8n","url":"`+sink.URL+`","events":["assessment.completed","assessment.failed","finding.created","integrity.alert","finding.status_changed"],"profile":"agent","egress_ack":true}`, nil), 201)
 	var created struct {
-		Secret       string              `json:"secret"`
+		Secret     string `json:"secret"`
+		AuthHeader struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		} `json:"auth_header"`
 		Subscription notify.Subscription `json:"subscription"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.Secret, "whsec_") {
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || !strings.HasPrefix(created.Secret, "whsec_") || created.AuthHeader.Name != "X-SCRS-Auth" || !strings.HasPrefix(created.AuthHeader.Value, "scrs_") {
 		t.Fatal("subscription secret not issued", err, w.Body)
 	}
 	subPath := "/webhooks/" + created.Subscription.ID.String()
@@ -429,7 +433,7 @@ func TestPostgresIngestRelayIntegrityAndOutboundWebhooks(t *testing.T) {
 	}
 	rc.mu.Lock()
 	for i, body := range rc.bodies {
-		if !notify.Verify(created.Secret, body, rc.headers[i].Get("X-SCRS-Signature")) || rc.headers[i].Get("Idempotency-Key") == "" {
+		if !notify.Verify(created.Secret, body, rc.headers[i].Get("X-SCRS-Signature")) || rc.headers[i].Get("Idempotency-Key") == "" || rc.headers[i].Get("X-SCRS-Auth") != created.AuthHeader.Value {
 			rc.mu.Unlock()
 			t.Fatal("delivery signature or idempotency key invalid")
 		}

@@ -187,7 +187,9 @@ func gateRule(f Finding, status string) string {
 		return ""
 	}
 	switch {
-	case f.Type == "malware" || f.Type == "malicious_dependency" || f.Type == "ioc_match":
+	case huntOnly(f.Type):
+		return ""
+	case maliciousType(f.Type):
 		return "malicious_content"
 	case f.Type == "integrity":
 		return "integrity"

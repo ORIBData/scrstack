@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -61,6 +62,7 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID) (Assessment, error) {
 	return scan(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, id))
 }
 func (s *Store) Enqueue(ctx context.Context, request Request, actor uuid.UUID, name, key string) (Assessment, bool, error) {
+	request.Import = nil // only Store.Import records imports
 	return s.enqueue(ctx, request, actor, name, key, nil)
 }
 
@@ -69,6 +71,7 @@ func (s *Store) EnqueueEvent(ctx context.Context, request Request, actor uuid.UU
 	if !json.Valid(raw) || len(raw) > 1<<20 {
 		return Assessment{}, false, ErrInput
 	}
+	request.Import = nil
 	return s.enqueue(withInbound(ctx, mode, eventType), request, actor, name, key, raw)
 }
 
@@ -121,11 +124,7 @@ func (s *Store) enqueue(ctx context.Context, request Request, actor uuid.UUID, n
 			return Assessment{}, false, err
 		}
 	}
-	assetType := "github_repo"
-	if request.Target.Type == "image" {
-		assetType = "container_image"
-	}
-	rows, err := tx.Query(ctx, `SELECT a.id,c.id,c.configuration_revision FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type=$3 AND lower(a.locator)=$1 AND c.enabled AND a.flags->>'in_scope'='true' AND a.flags->>'accessible'='true' AND ($2='' OR c.name=$2 OR c.id::text=$2)`, request.Target.Repository, request.Connection, assetType)
+	rows, err := tx.Query(ctx, `SELECT a.id,c.id,c.configuration_revision FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type=ANY($3) AND lower(a.locator)=$1 AND c.enabled AND a.flags->>'in_scope'='true' AND a.flags->>'accessible'='true' AND ($2='' OR c.name=$2 OR c.id::text=$2)`, request.Target.Repository, request.Connection, request.Target.assetTypes())
 	if err != nil {
 		return Assessment{}, false, err
 	}
@@ -170,7 +169,17 @@ func (s *Store) enqueue(ctx context.Context, request Request, actor uuid.UUID, n
 		return a, false, ErrCapacity
 	}
 	requestID, _ := ctx.Value(requestIDKey{}).(string)
-	_, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessments(id,asset_id,connection_id,connection_revision,request,actor_id,requested_by,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, a.ID, a.AssetID, a.ConnectionID, a.ConnectionRevision, body, actor, name, requestID)
+	if request.Import != nil {
+		// Imports complete in the caller's request; workers never claim them.
+		_, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessments(id,asset_id,connection_id,connection_revision,request,actor_id,requested_by,request_id,status,attempts,lease,lease_until) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'running',1,$9,clock_timestamp()+interval '5 minutes')`, a.ID, a.AssetID, a.ConnectionID, a.ConnectionRevision, body, actor, name, requestID, uuid.New())
+		// One running assessment per asset: a scan in progress blocks the import.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "assessments_running_asset_uq" {
+			return a, false, ErrBusy
+		}
+	} else {
+		_, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.assessments(id,asset_id,connection_id,connection_revision,request,actor_id,requested_by,request_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, a.ID, a.AssetID, a.ConnectionID, a.ConnectionRevision, body, actor, name, requestID)
+	}
 	if err != nil {
 		return a, false, err
 	}
@@ -285,6 +294,19 @@ func (s *Store) Fail(ctx context.Context, a Assessment, message string, retry bo
 	}
 	return tx.Commit(ctx)
 }
+
+// Release returns a claimed job to the queue without spending an attempt,
+// for transient back-pressure such as a busy scanner.
+func (s *Store) Release(ctx context.Context, a Assessment, delay time.Duration) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='queued',attempts=GREATEST(attempts-1,0),lease=NULL,lease_until=NULL,run_after=clock_timestamp()+($3*interval '1 second') WHERE id=$1 AND lease=$2 AND status='running' AND lease_until>clock_timestamp()`, a.ID, a.Lease, int(delay.Seconds()))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLease
+	}
+	return nil
+}
 func (s *Store) Cancel(ctx context.Context, id, actor uuid.UUID) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -348,7 +370,7 @@ func (s *Store) LastKnownGood(ctx context.Context, asset uuid.UUID, ref string) 
 	if ref == "" || len(ref) > 255 {
 		return Assessment{}, ErrInput
 	}
-	return scan(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments a WHERE a.asset_id=$1 AND a.request->'target'->>'ref'=$2 AND a.status='succeeded' AND a.verdict='pass' AND a.request->'remediation' IS NULL AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.findings f WHERE f.asset_id=a.asset_id AND f.type='integrity' AND f.status IN ('open','triaged','in_progress') AND (f.last_assessment_id=a.id OR f.evidence->>'commit'=a.resolved_commit)) ORDER BY a.created_at DESC,a.id DESC LIMIT 1`, asset, ref))
+	return scan(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments a WHERE a.asset_id=$1 AND a.request->'target'->>'ref'=$2 AND a.status='succeeded' AND a.verdict='pass' AND a.request->'remediation' IS NULL AND a.request->'import' IS NULL AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.findings f WHERE f.asset_id=a.asset_id AND f.type='integrity' AND f.status IN ('open','triaged','in_progress') AND (f.last_assessment_id=a.id OR f.evidence->>'commit'=a.resolved_commit)) ORDER BY a.created_at DESC,a.id DESC LIMIT 1`, asset, ref))
 }
 
 func (s *Store) BindRevision(ctx context.Context, a Assessment, commit string, moved bool) error {

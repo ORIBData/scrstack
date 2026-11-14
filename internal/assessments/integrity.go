@@ -6,7 +6,6 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/ORIBData/scrstack/internal/intelligence"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -61,7 +60,7 @@ func (s *Store) RecordIntegrity(ctx context.Context, delivery string, actor uuid
 		repository := strings.ToLower(e.Repository)
 		var asset *uuid.UUID
 		var found uuid.UUID
-		err := tx.QueryRow(ctx, `SELECT a.id FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type='github_repo' AND lower(a.locator)=$1 ORDER BY (a.flags->>'in_scope'='true') DESC,c.enabled DESC,a.id LIMIT 1`, repository).Scan(&found)
+		err := tx.QueryRow(ctx, `SELECT a.id FROM `+s.schema+`.assets a JOIN `+s.schema+`.connections c ON c.id=a.connection_id WHERE a.type IN ('github_repo','gitlab_repo') AND lower(a.locator)=$1 ORDER BY (a.flags->>'in_scope'='true') DESC,c.enabled DESC,a.id LIMIT 1`, repository).Scan(&found)
 		if err == nil {
 			asset = &found
 		} else if !errors.Is(err, pgx.ErrNoRows) {
@@ -119,19 +118,8 @@ func (s *Store) RecordIntegrity(ctx context.Context, delivery string, actor uuid
 // churn window (INT-011): a branch created and deleted quickly is suspicious.
 func (s *Store) RecentBranchCreation(ctx context.Context, repository, ref string, minutes int) (bool, error) {
 	var exists bool
-	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.inbound_events WHERE event_type='push' AND lower(body->'repository'->>'full_name')=$1 AND body->>'ref'=$2 AND body->>'created'='true' AND created_at>clock_timestamp()-($3*interval '1 minute'))`, strings.ToLower(repository), ref, minutes).Scan(&exists)
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.inbound_events WHERE event_type='push' AND lower(body->'repository'->>'full_name')=$1 AND body->>'ref'=$2 AND body->>'created'='true' AND created_at>clock_timestamp()-($3*interval '1 minute') UNION ALL SELECT 1 FROM `+s.schema+`.inbound_events WHERE event_type='gitlab:push' AND lower(body->'project'->>'path_with_namespace')=$1 AND body->>'ref'=$2 AND body->>'before'='`+zeroSHA+`' AND created_at>clock_timestamp()-($3*interval '1 minute'))`, strings.ToLower(repository), ref, minutes).Scan(&exists)
 	return exists, err
 }
 
-// ActiveBundle returns the parsed active indicator bundle, if any.
-func (s *Store) ActiveBundle(ctx context.Context) (*intelligence.Bundle, error) {
-	raw, err := s.ActiveIndicators(ctx)
-	if err != nil || len(raw) == 0 {
-		return nil, err
-	}
-	b, err := intelligence.Parse(raw)
-	if err != nil {
-		return nil, err
-	}
-	return &b, nil
-}
+const zeroSHA = "0000000000000000000000000000000000000000"

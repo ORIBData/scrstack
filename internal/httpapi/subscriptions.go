@@ -66,7 +66,7 @@ func (h subscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Location", BasePath+"/webhooks/"+sub.ID.String())
 			w.Header().Set("ETag", fmt.Sprintf(`"%d"`, sub.Revision))
-			writeJSON(w, 201, map[string]any{"secret": secret, "subscription": sub})
+			writeJSON(w, 201, map[string]any{"secret": secret, "auth_header": map[string]string{"name": notify.AuthHeader, "value": notify.AuthToken(secret)}, "subscription": sub})
 		default:
 			w.Header().Set("Allow", "GET, POST")
 			writeError(w, 405, "method not allowed")
@@ -116,7 +116,7 @@ func (h subscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			notifyError(w, err)
 			return
 		}
-		writeJSON(w, 200, map[string]string{"secret": secret})
+		writeJSON(w, 200, map[string]any{"secret": secret, "auth_header": map[string]string{"name": notify.AuthHeader, "value": notify.AuthToken(secret)}})
 	case len(parts) == 1 && action == "test" && r.Method == http.MethodPost:
 		event, err := h.store.Ping(ctx, id)
 		if err != nil {

@@ -79,7 +79,8 @@ func matchPattern(pattern, locator string) bool {
 }
 
 func (s Scope) matchesResource(resource Resource) bool {
-	if resource.Type != "github_repo" {
+	// Git hosts treat repository paths case-insensitively; registries do not.
+	if resource.Type != "github_repo" && resource.Type != "gitlab_repo" {
 		return s.Matches(resource.Locator)
 	}
 	lower := Scope{Include: make([]string, len(s.Include)), Exclude: make([]string, len(s.Exclude))}
@@ -137,7 +138,7 @@ func (s *Store) Close() { s.pool.Close() }
 // Put writes nonsecret config and scope as JSONB, and the credential as AES-GCM.
 // An existing named connection is preserved unless replace is explicitly true.
 func (s *Store) Put(ctx context.Context, c Connection, credential json.RawMessage, replace bool) (bool, error) {
-	if c.Provider != "github" && c.Provider != "dockerhub" && c.Provider != "gar" {
+	if !knownProvider(c.Provider) {
 		return false, errors.New("unsupported provider")
 	}
 	if c.Name == "" || !json.Valid(c.Config) || !json.Valid(credential) || len(credential) == 0 {
@@ -426,7 +427,7 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 		return DiscoveryResult{}, errors.New("asset reconciliation failed")
 	}
 	for _, resource := range resources {
-		if resource.Locator == "" || (resource.Type != "github_repo" && resource.Type != "container_image") {
+		if resource.Locator == "" || (resource.Type != "github_repo" && resource.Type != "gitlab_repo" && resource.Type != "container_image") {
 			return DiscoveryResult{}, errors.New("provider returned invalid resource")
 		}
 		inScope := c.Scope.matchesResource(resource)

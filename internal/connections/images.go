@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"regexp"
 	"strings"
@@ -61,6 +62,15 @@ func (a NativeAdapters) registryAuth(ctx context.Context, c Connection, secret j
 			return nil, errors.New("GAR OAuth token request failed")
 		}
 		return &authn.Basic{Username: "oauth2accesstoken", Password: token.AccessToken}, nil
+	case "harbor":
+		cfg, _, token, err := parseHarbor(c, secret)
+		if err != nil {
+			return nil, err
+		}
+		return &authn.Basic{Username: cfg.Username, Password: token}, nil
+	case "oci":
+		_, auth, err := parseOCI(c, secret)
+		return auth, err
 	}
 	return nil, errors.New("provider has no image registry")
 }
@@ -80,7 +90,10 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 			return "", errors.New("image registry does not match connection")
 		}
 	case c.Provider == "dockerhub" && host != "docker.io",
-		c.Provider == "gar" && !strings.HasSuffix(host, "-docker.pkg.dev"):
+		c.Provider == "gar" && !strings.HasSuffix(host, "-docker.pkg.dev"),
+		c.Provider == "harbor" && host != a.harborHost(c, secret),
+		c.Provider == "oci" && host != a.ociHost(c, secret),
+		!knownImageProvider(c.Provider):
 		return "", errors.New("image registry does not match connection")
 	}
 	reference := locator + ":" + tag
@@ -136,7 +149,7 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 		total += size
 	}
 	if total > limit {
-		return "", errors.New("image exceeds SCRS_MAX_IMAGE_BYTES")
+		return "", fmt.Errorf("%w: image exceeds SCRS_MAX_IMAGE_BYTES", ErrTooLarge)
 	}
 	tagged, err := name.NewTag(locator+":scrs", options...)
 	if err != nil {
@@ -148,4 +161,24 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 		return "", errors.New("image archive stream failed")
 	}
 	return resolved.String(), nil
+}
+
+func knownImageProvider(p string) bool {
+	return p == "dockerhub" || p == "gar" || p == "harbor" || p == "oci"
+}
+
+func (NativeAdapters) harborHost(c Connection, secret json.RawMessage) string {
+	_, host, _, err := parseHarbor(c, secret)
+	if err != nil {
+		return "\x00"
+	}
+	return host
+}
+
+func (NativeAdapters) ociHost(c Connection, secret json.RawMessage) string {
+	cfg, _, err := parseOCI(c, secret)
+	if err != nil {
+		return "\x00"
+	}
+	return cfg.Registry
 }
