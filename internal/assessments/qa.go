@@ -654,7 +654,8 @@ func (s *Store) emitQA(ctx context.Context, tx pgx.Tx, r QARun, created []Findin
 	if r.Status == qa.StateCancelled {
 		return nil
 	}
-	if _, err := notify.Emit(ctx, tx, s.schema, event, QASummary(r), nil); err != nil {
+	scope := notify.Scope{Asset: r.AssetID}
+	if _, err := notify.EmitScoped(ctx, tx, s.schema, event, QASummary(r), nil, scope); err != nil {
 		return err
 	}
 	if len(created) == 0 {
@@ -666,7 +667,7 @@ func (s *Store) emitQA(ctx context.Context, tx pgx.Tx, r QARun, created []Findin
 			briefs = append(briefs, findingBrief(f))
 		}
 	}
-	_, err := notify.Emit(ctx, tx, s.schema, "finding.created", map[string]any{"qa_run_id": r.ID, "assessment_id": r.AssessmentID, "asset_id": r.AssetID, "ref": r.Ref, "commit": r.Commit, "total": len(created), "truncated": len(created) > len(briefs), "findings": briefs}, nil)
+	_, err := notify.EmitScoped(ctx, tx, s.schema, "finding.created", map[string]any{"qa_run_id": r.ID, "assessment_id": r.AssessmentID, "asset_id": r.AssetID, "ref": r.Ref, "commit": r.Commit, "total": len(created), "truncated": len(created) > len(briefs), "findings": briefs}, nil, scope)
 	return err
 }
 

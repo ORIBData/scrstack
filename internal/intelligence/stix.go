@@ -739,7 +739,7 @@ func (e *expr) matches() ([]match, string, string) {
 var stixHashes = map[string]string{"md5": "md5", "sha-1": "sha1", "sha1": "sha1", "sha-256": "sha256", "sha256": "sha256"}
 
 // checkableObjects are STIX object types matched against files at rest.
-var checkableObjects = map[string]bool{"file": true, "domain-name": true, "ipv4-addr": true, "url": true}
+var checkableObjects = map[string]bool{"file": true, "domain-name": true, "ipv4-addr": true, "ipv6-addr": true, "url": true}
 
 func (c *comparison) matches() ([]match, string, string) {
 	object, property, _ := strings.Cut(c.path, ":")
@@ -763,7 +763,7 @@ func (c *comparison) matches() ([]match, string, string) {
 	case object == "file" && property == "name":
 		kind = "file_path_regex"
 	case object != "file" && property == "value":
-		kind = map[string]string{"domain-name": "domain", "ipv4-addr": "ipv4", "url": "url"}[object]
+		kind = map[string]string{"domain-name": "domain", "ipv4-addr": "ipv4", "ipv6-addr": "ipv6", "url": "url"}[object]
 	default:
 		return nil, SkipObject, c.path + " is not matched"
 	}
@@ -787,9 +787,9 @@ func (c *comparison) matches() ([]match, string, string) {
 			}
 			// File names match the last path element exactly.
 			value = `(?:^|/)` + regexp.QuoteMeta(value) + `$`
-		case "ipv4":
+		case "ipv4", "ipv6":
 			if base, bits, ok := strings.Cut(value, "/"); ok {
-				if bits != "32" {
+				if (kind == "ipv4" && bits != "32") || (kind == "ipv6" && bits != "128") {
 					return nil, SkipValue, "address ranges are not matched: " + clip(value, 64)
 				}
 				value = base

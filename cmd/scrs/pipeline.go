@@ -173,6 +173,7 @@ func pipelineCommand() error {
 			return err
 		}
 		defer events.Close()
+		store.UseObjects(artifacts)
 		w := worker.Worker{AutoRemediation: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger, Notify: events}
 		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
 			w.MaxImageBytes = limit
@@ -243,6 +244,15 @@ func pipelineCommand() error {
 		}
 		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
 			go w.RunGenerations(ctx)
+		}
+		// NVD and CVE Program records for the CVEs the register references.
+		advisorySync := time.Minute
+		if seconds, err := strconv.Atoi(os.Getenv("SCRS_ADVISORY_SYNC_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {
+			advisorySync = time.Duration(seconds) * time.Second
+		}
+		if advisorySync > 0 {
+			w.NVDAPIKey, w.NVDURL, w.CVEURL = os.Getenv("SCRS_NVD_API_KEY"), os.Getenv("SCRS_NVD_API_URL"), os.Getenv("SCRS_CVE_API_URL")
+			go w.RunAdvisorySources(ctx, advisorySync)
 		}
 		go w.Maintain(ctx, time.Hour, rescan, mirror)
 		return w.Run(ctx)

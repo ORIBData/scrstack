@@ -195,8 +195,15 @@ SHA-256 object-format repositories are not supported.
 
 ## Remaining product gates
 
-- Licensing/SPDX/compliance policy, built-in SAST and reachability analysis (SARIF import covers external SAST tools).
-- The built-in starter rules run inside ClamAV, which supports a subset of YARA (no modules). Rules needing modules belong in a YARA-X ruleset (`/intel/yara-rulesets`).
+The full list, by PRD milestone, is in the README roadmap. For this pipeline:
+
+- Licensing/SPDX/compliance policy (M8), built-in SAST and reachability analysis
+  (M9). SARIF import covers external SAST tools meanwhile.
+- NVD, CVE Program and VEX/CSAF advisory sources, and the source registry with per-source health (M4).
+- Retention classes beyond raw inbound events and the webhook delivery log, and the
+  reset/rebuild/sensor-update maintenance actions (M5).
+- The built-in starter rules run inside ClamAV, which supports a subset of YARA
+  (no modules). Rules needing modules belong in a YARA-X ruleset (`/intel/yara-rulesets`).
 - Real private-repository and registry acceptance on the target VPS; hosted backup/restore drills.
 
 Consequently, successful execution can still return `incomplete`, for example
@@ -259,12 +266,28 @@ This is a change baseline, not a last-known-good declaration.
 requires a delivery UUID and only admits pushes for discovered in-scope repositories.
 Raw JSON, job and replay record commit atomically. Delivery replay is protected for
 24 hours; unsupported events are explicit 422 responses. Deleted branches are ignored.
-Set `SCRS_GITHUB_WEBHOOK_SECRET` to the same random 32+ character value in GitHub;
-blank disables ingress. Body and concurrent-handler limits apply before parsing.
+Each connection has its own receiver, `/ingest/github/<connection>`, verified with
+that connection's webhook secret (`POST /connections/{id}:webhook`). The shared
+`/webhooks/github` receiver uses the legacy `SCRS_GITHUB_WEBHOOK_SECRET`; blank
+disables it. Body and concurrent-handler limits apply before parsing.
 
-Raw ingress retention is managed by admin-only `/settings/retention`, `:preview` and
-`:purge`. Set `inbound_event_days` (zero keeps forever), using the policy ETag in
-`If-Match` on updates and purge. Preview counts eligible rows and stored JSON bytes.
-Purge removes at most 1000 old events and excludes queued/running assessment events.
-It never deletes assessments, findings, audit history or S3 artifacts. Scheduled purge,
-per-class PRD retention defaults and artifact garbage collection remain open.
+Retention is set per data class with admin-only `/settings/retention`, `:preview`
+and `:purge` (RET-001 to RET-007), using the policy ETag in `If-Match`.
+
+| Class | Removes | Never removes |
+| --- | --- | --- |
+| `inbound_events` | Raw webhook and registry events | Events of queued or running assessments |
+| `webhook_deliveries` | Delivered and dead outbound deliveries | Pending and retrying deliveries |
+| `closed_findings` | Fixed, false-positive and suppressed entries with their history | Open, triaged, in-progress and accepted entries |
+| `scan_artifacts` | File inventories and component lists of superseded assessments | The newest successful assessment of each asset and ref; assessments that open entries point to |
+| `sbom_documents`, `source_snapshots` | S3 objects of superseded assessments | Objects another retained assessment still uses |
+| `remediation_plans` | Stored plans | — |
+| `qa_reports` | Older QA report archives and scenario lists | The newest finished run per asset and kind |
+| `expired_indicators` | Indicators past `valid_until` | Unexpired indicators |
+| `audit_log` | Audit records | The last 365 days (floor) |
+
+How the policy applies:
+- **Defaults.** A class left "not set" uses `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS`. Unset or `0` keeps forever, which is the default for every class.
+- **Legal hold.** Assets on legal hold (`PATCH /assets/{id}` with `legal_hold`, admin) are excluded from every class and from `asset_findings` resets.
+- **When it runs.** Hourly maintenance purges in batches of 1000 (up to 20 per class per pass). S3 objects are deleted explicitly after their rows, and each pass is audited with per-class counts and duration (`retention.purged`).
+- **Preview and purge.** `:preview` with `classes` counts what would go now. `:purge` applies the policy immediately.

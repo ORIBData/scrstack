@@ -130,6 +130,11 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
   )`,
 		// 2026111402: GitHub webhook delivery check (state and redelivery retries).
 		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS webhook_check jsonb NOT NULL DEFAULT '{}'`,
+		// Per-connection inbound webhooks: sealed secret, rotation time and,
+		// for GitHub relays, the hook URL the delivery check matches.
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS webhook_secret_ciphertext bytea`,
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS webhook_rotated_at timestamptz`,
+		`ALTER TABLE ` + schema + `.connections ADD COLUMN IF NOT EXISTS webhook_url text NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.github_redeliveries(connection_id uuid NOT NULL REFERENCES ` + schema + `.connections(id),guid text NOT NULL,hook_source text NOT NULL,hook_id bigint NOT NULL,delivery_id bigint NOT NULL,event text NOT NULL,status text NOT NULL CHECK(status IN ('retrying','delivered','abandoned','rejected')),status_code integer NOT NULL,attempts integer NOT NULL DEFAULT 0,first_failed_at timestamptz NOT NULL,last_attempt_at timestamptz,updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),PRIMARY KEY(connection_id,guid))`,
 		`CREATE INDEX IF NOT EXISTS github_redeliveries_retrying_idx ON ` + schema + `.github_redeliveries(connection_id) WHERE status='retrying'`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.audit_log (

@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
@@ -121,7 +122,9 @@ func TestContractMatchesRouter(t *testing.T) {
 			r := httptest.NewRequest(strings.ToUpper(method), BasePath+concrete, strings.NewReader("{}"))
 			r.Header.Set("Authorization", "Bearer contract-token-contract-token-1234")
 			w := httptest.NewRecorder()
-			handler.ServeHTTP(w, r)
+			if reached := serveReached(handler, w, r); reached {
+				continue // the handler ran and needed the database the test omits
+			}
 			body := w.Body.String()
 			if body == "404 page not found\n" || strings.HasPrefix(body, "Method Not Allowed") || (w.Code == 405 && strings.Contains(body, "method not allowed")) {
 				t.Errorf("%s %s is documented but not routed (%d %q)", strings.ToUpper(method), path, w.Code, body)
@@ -143,4 +146,16 @@ func TestContractMatchesRouter(t *testing.T) {
 			t.Errorf("router registers %s %s but the contract does not document it", m[1], path)
 		}
 	}
+}
+
+// serveReached serves r and reports whether a handler panicked on the
+// test's empty stores, which proves the route reached it.
+func serveReached(h http.Handler, w http.ResponseWriter, r *http.Request) (reached bool) {
+	defer func() {
+		if recover() != nil {
+			reached = true
+		}
+	}()
+	h.ServeHTTP(w, r)
+	return false
 }

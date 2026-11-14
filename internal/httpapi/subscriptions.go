@@ -48,17 +48,18 @@ func (h subscriptionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			var in notify.Subscription
 			var body struct {
-				Name            string   `json:"name"`
-				URL             string   `json:"url"`
-				Events          []string `json:"events"`
-				Profile         string   `json:"profile"`
-				EgressAck       bool     `json:"egress_ack"`
-				IncludeContacts bool     `json:"include_contacts"`
+				Name            string      `json:"name"`
+				URL             string      `json:"url"`
+				Events          []string    `json:"events"`
+				Profile         string      `json:"profile"`
+				EgressAck       bool        `json:"egress_ack"`
+				IncludeContacts bool        `json:"include_contacts"`
+				Connections     []uuid.UUID `json:"connections"`
 			}
 			if !readBody(w, r, &body) {
 				return
 			}
-			in = notify.Subscription{Name: body.Name, URL: body.URL, Events: body.Events, Profile: body.Profile, EgressAck: body.EgressAck, IncludeContacts: body.IncludeContacts}
+			in = notify.Subscription{Name: body.Name, URL: body.URL, Events: body.Events, Profile: body.Profile, EgressAck: body.EgressAck, IncludeContacts: body.IncludeContacts, Connections: body.Connections}
 			sub, secret, err := h.store.Create(ctx, in, actor.ID)
 			if err != nil {
 				notifyError(w, err)

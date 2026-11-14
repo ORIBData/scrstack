@@ -22,11 +22,15 @@ type MaintenanceReport struct {
 	IdempotencyKeys   int64 `json:"idempotency_keys_expired"`
 	Rescans           int   `json:"rescans_queued"`
 	Skipped           bool  `json:"skipped_concurrent_run"`
+	// Purged counts rows removed per retention class.
+	Purged         map[string]int64 `json:"purged"`
+	ObjectsDeleted int              `json:"objects_deleted"`
+	ObjectErrors   int              `json:"object_errors"`
 }
 
-// Maintain applies the retention policy and expires idempotency keys (M13,
-// M14). Assessments, findings, audit history and object storage are never
-// deleted. A transaction advisory lock lets one replica run at a time.
+// Maintain applies the retention policy of every data class and expires
+// idempotency keys (M13, M14). Classes left at "keep forever" (the default)
+// delete nothing. A transaction advisory lock lets one replica run at a time.
 func (s *Store) Maintain(ctx context.Context, actor uuid.UUID, trigger string) (MaintenanceReport, error) {
 	var report MaintenanceReport
 	tx, err := s.pool.Begin(ctx)
@@ -42,36 +46,22 @@ func (s *Store) Maintain(ctx context.Context, actor uuid.UUID, trigger string) (
 		report.Skipped = true
 		return report, nil
 	}
-	var p struct{ events, deliveries int }
-	if err := tx.QueryRow(ctx, `SELECT inbound_event_days,webhook_delivery_days FROM `+s.schema+`.retention_policy WHERE singleton`).Scan(&p.events, &p.deliveries); err != nil {
+	purged, freed, err := s.purgeAll(ctx, tx, actor, trigger)
+	if err != nil {
 		return report, err
 	}
-	if p.events > 0 {
-		// Bounded batches keep each statement short; queued and running jobs keep their events.
-		for {
-			tag, err := tx.Exec(ctx, `DELETE FROM `+s.schema+`.inbound_events WHERE id IN (SELECT e.id FROM `+s.schema+`.inbound_events e WHERE e.created_at<clock_timestamp()-($1*interval '1 day') AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.assessments a WHERE a.id=e.assessment_id AND a.status IN ('queued','running')) ORDER BY e.created_at LIMIT 1000 FOR UPDATE OF e SKIP LOCKED)`, p.events)
-			if err != nil {
-				return report, err
-			}
-			report.InboundEvents += tag.RowsAffected()
-			if tag.RowsAffected() < 1000 || report.InboundEvents >= 100000 {
-				break
-			}
-		}
-	}
-	if p.deliveries > 0 {
-		tag, err := tx.Exec(ctx, `DELETE FROM `+s.schema+`.webhook_deliveries WHERE id IN (SELECT id FROM `+s.schema+`.webhook_deliveries WHERE status IN ('delivered','dead') AND created_at<clock_timestamp()-($1*interval '1 day') LIMIT 50000)`, p.deliveries)
-		if err != nil {
-			return report, err
-		}
-		report.WebhookDeliveries = tag.RowsAffected()
-	}
+	report.Purged = purged
+	report.InboundEvents, report.WebhookDeliveries = purged["inbound_events"], purged["webhook_deliveries"]
 	tag, err := tx.Exec(ctx, `DELETE FROM `+s.schema+`.assessment_idempotency WHERE expires_at<clock_timestamp()`)
 	if err != nil {
 		return report, err
 	}
 	report.IdempotencyKeys = tag.RowsAffected()
-	if report.InboundEvents+report.WebhookDeliveries > 0 || trigger == "manual" {
+	var total int64
+	for _, n := range purged {
+		total += n
+	}
+	if total > 0 || trigger == "manual" {
 		details, _ := json.Marshal(map[string]any{"actor_id": actor, "trigger": trigger, "report": report})
 		if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('maintenance.completed',$1)`, details); err != nil {
 			return report, err
@@ -80,7 +70,112 @@ func (s *Store) Maintain(ctx context.Context, actor uuid.UUID, trigger string) (
 			return report, err
 		}
 	}
-	return report, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return report, err
+	}
+	report.ObjectsDeleted, report.ObjectErrors = s.deleteObjects(context.WithoutCancel(ctx), freed)
+	return report, nil
+}
+
+// purgeAll applies every class's effective retention in bounded batches,
+// records each class's last purge and audits the counts (RET-005, RET-007).
+// It returns the rows removed per class and the object keys to delete
+// once the transaction commits.
+func (s *Store) purgeAll(ctx context.Context, tx pgx.Tx, actor uuid.UUID, trigger string) (map[string]int64, []string, error) {
+	classes, err := s.retentionClasses(ctx, tx)
+	if err != nil {
+		return nil, nil, err
+	}
+	objects := map[string]bool{}
+	for _, d := range retentionDefs {
+		objects[d.key] = d.objects
+	}
+	started := time.Now()
+	purged := map[string]int64{}
+	var freed []string
+	for _, c := range classes {
+		if c.EffectiveDays == 0 || (objects[c.Class] && s.objects == nil) {
+			continue
+		}
+		var total int64
+		for round := 0; round < purgeRounds; round++ {
+			n, keys, err := s.purgeClass(ctx, tx, c.Class, c.EffectiveDays)
+			if err != nil {
+				return nil, nil, err
+			}
+			total += n
+			freed = append(freed, keys...)
+			if n < purgeBatch {
+				break
+			}
+		}
+		if total == 0 {
+			continue
+		}
+		purged[c.Class] = total
+		if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.retention_classes(class,last_purged_at,last_purged_count) VALUES($1,clock_timestamp(),$2) ON CONFLICT(class) DO UPDATE SET last_purged_at=EXCLUDED.last_purged_at,last_purged_count=EXCLUDED.last_purged_count`, c.Class, total); err != nil {
+			return nil, nil, err
+		}
+	}
+	if len(purged) > 0 {
+		details, _ := json.Marshal(map[string]any{"actor_id": actor, "trigger": trigger, "purged": purged, "objects": len(freed), "duration_ms": time.Since(started).Milliseconds()})
+		if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('retention.purged',$1)`, details); err != nil {
+			return nil, nil, err
+		}
+	}
+	return purged, freed, nil
+}
+
+// deleteObjects removes purged objects; failures are counted, and the rows
+// that pointed at them are already gone, so a retry cannot double-count.
+func (s *Store) deleteObjects(ctx context.Context, keys []string) (int, int) {
+	deleted, failed := 0, 0
+	for _, k := range keys {
+		if s.objects == nil {
+			break
+		}
+		objectCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if err := s.objects.DeleteObject(objectCtx, k); err != nil {
+			failed++
+		} else {
+			deleted++
+		}
+		cancel()
+	}
+	return deleted, failed
+}
+
+// PurgeRetention applies the policy now at the expected revision (the
+// :purge endpoint) and returns the rows removed per class.
+func (s *Store) PurgeRetention(ctx context.Context, actor uuid.UUID, expected int64) (map[string]int64, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var revision int64
+	if err := tx.QueryRow(ctx, `SELECT revision FROM `+s.schema+`.retention_policy WHERE singleton FOR SHARE`).Scan(&revision); err != nil {
+		return nil, err
+	}
+	if revision != expected {
+		return nil, ErrConflict
+	}
+	var locked bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext($1))`, s.schema+".maintenance").Scan(&locked); err != nil {
+		return nil, err
+	}
+	if !locked {
+		return nil, ErrBusy
+	}
+	purged, freed, err := s.purgeAll(ctx, tx, actor, "manual")
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	s.deleteObjects(context.WithoutCancel(ctx), freed)
+	return purged, nil
 }
 
 // EnqueueRescans queues the default branch of in-scope repositories whose

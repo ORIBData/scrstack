@@ -15,6 +15,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,6 +112,10 @@ func loadIndicators(filename string) (IndicatorBundle, error) {
 var contentDomain = regexp.MustCompile(`(?i)\b[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?\.[a-z]{2,63}\b`)
 var contentURL = regexp.MustCompile(`(?i)\b(?:https?|hxxps?|ftp)://[^\s"'<>\x60(){}\[\]\\|^]+`)
 var contentIPv4 = regexp.MustCompile(`\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b`)
+
+// contentIPv6 finds IPv6 address candidates (hex groups and colons, at least
+// two colons); each is confirmed by parsing and compared in canonical form.
+var contentIPv6 = regexp.MustCompile(`(?i)(?:[0-9a-f]{1,4}|:)?(?::[0-9a-f]{0,4}){2,7}`)
 var secretsPattern = regexp.MustCompile(`(?i)tojson\s*\(\s*secrets\s*\)`)
 
 // INT-010: fetch-and-execute in build files that developers run locally.
@@ -187,7 +192,7 @@ func newIndicatorSet(b IndicatorBundle, now time.Time) indicatorSet {
 			set.urls[i.Value] = append(set.urls[i.Value], i)
 		case "domain":
 			set.domains[i.Value] = append(set.domains[i.Value], i)
-		case "ipv4":
+		case "ipv4", "ipv6":
 			set.ips[i.Value] = append(set.ips[i.Value], i)
 		case "workflow_step_name":
 			set.steps = append(set.steps, i)
@@ -342,7 +347,7 @@ func (e Engine) newContentScan(ctx, rulesCtx context.Context, image bool, scanDi
 		} else {
 			c.set = newIndicatorSet(bundle, time.Now())
 			c.ioc.Status = "ok"
-			c.ioc.Detail = "Hash (SHA-256, SHA-1, MD5), domain, IPv4, URL, path, content and workflow-step matching; bundle " + bundle.Version
+			c.ioc.Detail = "Hash (SHA-256, SHA-1, MD5), domain, IPv4, IPv6, URL, path, content and workflow-step matching; bundle " + bundle.Version
 			if c.set.active == 0 {
 				c.ioc.Status, c.ioc.Detail = "skipped", "No unexpired indicators"
 			}
@@ -548,6 +553,20 @@ func matchText(record FileEvidence, text string, set indicatorSet) []assessments
 			seen[ip] = true
 			for _, i := range set.ips[ip] {
 				out = append(out, iocFinding(i, "Text IPv4 address matches active indicator", record.Path, record.SHA256))
+			}
+		}
+		for _, candidate := range contentIPv6.FindAllString(text, -1) {
+			addr, err := netip.ParseAddr(candidate)
+			if err != nil || !addr.Is6() || addr.Is4In6() {
+				continue
+			}
+			ip := addr.String()
+			if seen[ip] {
+				continue
+			}
+			seen[ip] = true
+			for _, i := range set.ips[ip] {
+				out = append(out, iocFinding(i, "Text IPv6 address matches active indicator", record.Path, record.SHA256))
 			}
 		}
 	}

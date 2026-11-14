@@ -75,21 +75,21 @@ was added on top. The full product specification is in
 | **E2E QA testing (Karate)** | After each successful assessment, a repository's Karate suites (API, integration, headless-Chromium UI, mocks) run against its deployed staging or preview environment on a runner you host, with optional karate-gatling load runs and thresholds. SCRS records scenarios, OpenAPI coverage and report-only findings (failing scenarios, untested operations, breached thresholds, setup gaps), and can draft Karate features and unit tests with your own LLM key (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible endpoint), for human approval. Commits that fail the security gate never reach the runner. See [docs/QA_TESTING.md](docs/QA_TESTING.md). |
 | **Guided remediation** | npm `package-lock.json` (in-place) and Maven `pom.xml` (override) plans generated in an isolated sandbox. Advice only: SCRS never writes to repositories. OpenVEX export reflects register triage. |
 | **Automation API** | Token-scoped REST API (`admin`, `read`, `write`, `trigger`, `ingest:relay`). Inbound: idempotent and batch triggers carrying caller context, provider and registry webhooks. Outbound: signed event webhooks. Plus long-poll, latest-by-commit lookup, last-known-good revisions, Swagger UI and an OpenAPI contract. |
-| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`, `qa.completed`, `qa.failed`. `summary`, `full` and AI-`agent` payload profiles. |
-| **Operations** | Owners and asset attributes, Prometheus metrics, request IDs and access logs, hourly maintenance (retention, key expiry, optional default-branch rescans), inbound-event log with replay, opt-in source snapshots for restore. |
-| **Retention** | Policy-driven, previewable and audited purging of raw inbound events and the webhook delivery log. Findings, assessments and audit history are never purged. |
+| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `finding.rescored`, `malicious_dependency.reported`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`, `qa.completed`, `qa.failed`, each with a published JSON Schema (`/schemas/events`). `summary`, `full` and AI-`agent` payload profiles; subscriptions can be scoped to connections. |
+| **Operations** | Owners and asset attributes, Prometheus metrics, request IDs and access logs, a queryable audit log (`/audit`), hourly maintenance (retention, key expiry, optional default-branch rescans), scoped resets, rebuilds, sensor updates, a schedule and versions view, inbound-event log with replay, opt-in source snapshots for restore. |
+| **Retention** | Per data class (raw events, delivery log, closed findings, superseded scan artifacts, SBOMs and snapshots, remediation plans, QA reports, expired indicators, audit log), previewable, audited, with environment defaults. Keeps forever unless set. Open register entries, current revisions and assets on legal hold are never purged; the audit log keeps at least 365 days. |
 
 ## What changed from the base project
 
 | Area | Base project (clamav-rest) | This fork |
 | --- | --- | --- |
 | Purpose | Scan uploaded files for viruses | Assess whole repository revisions for supply-chain risk |
-| Engines | ClamAV | ClamAV, OSV-Scanner (vulnerabilities and malicious packages), IOC matching, workflow-integrity checks |
+| Engines | ClamAV | ClamAV, OSV-Scanner (vulnerabilities and malicious packages), YARA-X, IOC matching (STIX/TAXII), workflow-integrity checks, Karate E2E QA |
 | Results | Per-request HTTP response | Durable assessments, SBOMs, a deduplicated risk register and an audit log |
-| Inputs | File uploads, host paths | GitHub commits via connections, signed webhooks or the trigger API |
+| Inputs | File uploads, host paths | GitHub and GitLab commits and registry images via connections, per-connection signed webhooks or the trigger API |
 | Auth | None (open CORS) | Hashed, scoped, expiring and revocable API tokens; Redis rate limits; exact CORS origins |
 | Storage | None | PostgreSQL (state), Redis (admission control), S3-compatible storage (SBOMs and plans) |
-| Deployment | Single container | Dokploy Compose stack behind Traefik with isolated scanner networking |
+| Deployment | Single container | Dokploy Compose stack behind Traefik with isolated scanner networking, plus a separate Karate runner image |
 | ClamAV REST service | Public, unauthenticated, host-path scanning | Internal only, bearer token required, loopback ports, host-path routes return `410` |
 
 ## Architecture
@@ -112,10 +112,15 @@ flowchart LR
   end
   FS[scrs-feed-sync] -- OSV archives --> V[(feeds volume)]
   V -- read-only --> SC
+  W -- QA jobs, private qa network --> QR[scrs-qa-runner]
+  QR -- Karate tests --> STG[staging / preview URLs]
+  W -. LLM test drafts .-> LLM[LLM providers]
+  T -. optional, allow-listed .-> QR
 ```
 
 All services run from one image (`deploy/Dockerfile.scrs`, a non-root `scratch`
-image) except ClamAV, which uses the official image.
+image) except ClamAV, which uses the official image, and the Karate runner, which
+has its own image (`deploy/karate-runner/Dockerfile`).
 
 | Service | Role | Network exposure |
 | --- | --- | --- |
@@ -127,6 +132,7 @@ image) except ClamAV, which uses the official image.
 | `scrs-yara-rules` | One-shot: installs the embedded YARA ruleset into ClamAV's volume and reloads clamd | Internal |
 | `scrs-feed-sync` | Downloads and validates OSV archives, CISA KEV and EPSS every 6 h | Outbound to the OSV bucket, cisa.gov and the EPSS host |
 | `scrs-egress-proxy` | Allow-listed proxy for remediation (npm registry, deps.dev) | Internal |
+| `scrs-qa-runner` | Karate runner: runs repository test suites against staging URLs (API, UI, load) | Internal `qa` network to SCRS; Traefik at `SCRS_QA_DOMAIN` behind an IP allowlist; outbound to systems under test |
 
 PostgreSQL, Redis and S3 are external services you provide. The pipeline itself
 is described in [docs/ASSESSMENT_PIPELINE.md](docs/ASSESSMENT_PIPELINE.md).
@@ -135,11 +141,12 @@ is described in [docs/ASSESSMENT_PIPELINE.md](docs/ASSESSMENT_PIPELINE.md).
 
 The full contract is in [docs/DOKPLOY.md](docs/DOKPLOY.md). In short:
 
-1. Build and push the image, then record the concrete tag:
+1. Build and push both images, then record the concrete tags:
 
    ```bash
    make image-reference
    make release PLATFORMS=linux/amd64,linux/arm64
+   make release-qa-runner SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}
    ```
 
 2. In Dokploy, create a Compose service from
@@ -150,10 +157,10 @@ The full contract is in [docs/DOKPLOY.md](docs/DOKPLOY.md). In short:
    openssl rand -base64 32   # SCRS_MASTER_KEY: back it up outside the VPS
    openssl rand -hex 32      # SCRS_BOOTSTRAP_API_TOKEN
    openssl rand -hex 32      # SCRS_SCANNER_API_TOKEN (must differ)
-   openssl rand -hex 32      # SCRS_GITHUB_WEBHOOK_SECRET (optional)
+   openssl rand -hex 32      # SCRS_QA_RUNNER_TOKEN (Karate runner)
    ```
 
-3. Set `SCRS_DOMAIN`, `SCRS_ROUTER_NAME`, `SCRS_TRAEFIK_NETWORK`, the entrypoints
+3. Set `SCRS_DOMAIN`, `SCRS_QA_DOMAIN`, `SCRS_ROUTER_NAME`, `SCRS_TRAEFIK_NETWORK`, the entrypoints
    and `SCRS_CERT_RESOLVER` to match your Traefik. The Compose labels do the
    routing, so do not also add a domain in Dokploy's Domains UI.
 4. Deploy. The first start can take several minutes while the OSV feeds
@@ -239,9 +246,9 @@ on day one (PRD section 15.1).
 | --- | --- |
 | **Inbound trigger (automation webhook):** an n8n HTTP Request node posts the event to `POST /scrs/v1/assessments` with a `trigger` token restricted to n8n's IP: `target` names a discovered, in-scope asset, and `trigger.context` carries correlation data (ticket, change request, execution id) that comes back in `assessment.completed`. Use the source event id as `Idempotency-Key` so retries never double-scan. | Available |
 | **Polling for results:** the response carries `Location` and `Retry-After`. Poll `GET /assessments/{id}` until `status` is `succeeded` or `failed`, then branch on `verdict` (Slack/Telegram message, ticket, or a GitHub commit status written with n8n's own credential). | Available |
-| **Direct GitHub webhook** (no n8n in the path): point an organization webhook at `/scrs/v1/webhooks/github` with `SCRS_GITHUB_WEBHOOK_SECRET`. | Available |
-| **Relay mode:** n8n forwards GitHub's or GitLab's unchanged body to `/scrs/v1/ingest/github` or `/ingest/gitlab` with an `ingest:relay` token (`SCRS_RELAY_ENABLED=true`); a forwarded provider signature is verified too when SCRS holds the provider secret. | Available |
-| **Registry push events:** Harbor calls `/ingest/registry/harbor` directly; Docker Hub and GAR Pub/Sub go through the registry relay workflow. | Available |
+| **Direct provider and registry webhooks** (no n8n in the path): `POST /scrs/v1/connections/{id}:webhook` gives each GitHub, GitLab, Harbor, Docker Hub, GAR or OCI connection its own secret and receiver URL (`/scrs/v1/ingest/<provider>/<connection>`). Outbound subscriptions can be scoped to connections. See [docs/PROVIDERS.md](docs/PROVIDERS.md#inbound-webhooks-per-connection). | Available |
+| **Relay mode:** n8n forwards GitHub's or GitLab's unchanged body to the connection's receiver (`/scrs/v1/ingest/github/<connection>` or `/ingest/gitlab/<connection>`) with an `ingest:relay` token (`SCRS_RELAY_ENABLED=true`). A forwarded provider signature is verified against the connection's webhook secret. | Available |
+| **Registry push events:** Harbor and OCI registries call `/ingest/registry/<provider>/<connection>` with the connection's secret as a bearer header. Docker Hub and GAR Pub/Sub, which cannot send headers, put it in the URL (`?token=`) or go through the registry relay workflow. | Available |
 | **Outbound webhooks:** signed `assessment.completed`, `finding.created`, `integrity.alert` and more, with retries, dead-letter, redelivery and an AI-triage `agent` profile. | Available |
 | **Batch trigger and nightly reconcile** (`/assessments:batch`, `/maintenance/rescan`) | Available |
 | **Reference workflows** ([docs/integrations](docs/integrations/N8N.md)): GitHub relay, GitLab relay, registry relay, completion to commit status (Header Auth, no Code node), nightly reconcile; import-tested on n8n 1.97.1 | Available |
@@ -270,9 +277,9 @@ SCRS never writes back to GitHub. Commit statuses and PR comments come from n8n.
 
 Context is correlation data only: at most 20 keys matching
 `^[a-z0-9][a-z0-9._-]{0,62}$`, values up to 256 printable characters, never used
-to choose what is scanned. Provider events take the dedicated inbound
-endpoints (`/ingest/github`, `/ingest/gitlab`, `/ingest/registry/*`), which
-verify each provider's signature or token.
+to choose what is scanned. Provider events take the dedicated per-connection
+inbound endpoints (`/ingest/<provider>/<connection>`, `/ingest/registry/<provider>/<connection>`),
+which verify that connection's signature or token.
 
 ### Trivy
 
@@ -299,7 +306,7 @@ version. A native SBOM export from SCRS is a planned P2 feature.
 All routes live under `/scrs/v1`. An `admin` token satisfies every scope.
 `trigger` tokens see only the assessments they created.
 
-**Backoffice integration.** Swagger UI (`/scrs/v1/docs`) documents all 74
+**Backoffice integration.** Swagger UI (`/scrs/v1/docs`) documents all 147
 operations by tag, with request and response schemas, scopes and error codes.
 Generate a typed client from `/scrs/v1/docs/openapi.yaml` (for example
 `npx openapi-typescript https://scrs.example.com/scrs/v1/docs/openapi.yaml -o scrs.d.ts`).
@@ -317,6 +324,7 @@ fail the build if a route is added without documentation.
 | `GET /docs`, `GET /docs/openapi.yaml` | Public (configurable) | Swagger UI and contract |
 | `/tokens`, `DELETE /tokens/{id}` | admin | Create, list and revoke API tokens |
 | `/connections`, `/connections/{id}`, `:test`, `:discover`, `:rotate-credential` | admin | Provider accounts, scope and credentials |
+| `POST /connections/{id}:webhook` | admin | Set or rotate a connection's inbound webhook secret (and GitHub hook URL) |
 | `GET /assets` | read | Discovered assets and scope flags |
 | `GET/POST /assets/{id}/mirrors`, `GET /assets/{id}/mirrors/{mirror}/bundle` | read, write / admin | Git history mirrors and bundle download |
 | `POST /assessments:import` | write, trigger | Trivy JSON or SARIF import |
@@ -325,10 +333,11 @@ fail the build if a route is added without documentation.
 | `GET /assessments`, `/assessments/latest`, `/assessments/{id}` and `/findings`, `/components`, `/files`, `/sbom`, `/mbom`, `/report`, `/context`, `/vex`, `/remediations`, `/remediation` | read, write, trigger | Results, SBOM and MBOM, context documents and OpenVEX |
 | `GET /assessments/{id}/snapshot` | admin | Stored source archive |
 | `GET/PATCH /assets/{id}`, `GET /assets/{id}/last-known-good`, `GET/POST /owners`, `PATCH /owners/{id}` | read / write | Ownership and asset attributes |
-| `/webhooks`, `/webhooks/{id}`, `:test`, `:rotate-secret`, `/deliveries`, `:redeliver` | admin | Outbound webhook subscriptions and delivery log |
-| `POST /ingest/github`, `POST /ingest/gitlab` | Provider secret or `ingest:relay` | Direct or relayed GitHub and GitLab events |
-| `POST /ingest/registry/{harbor,dockerhub,gar,oci}` | ingest:relay | Registry push events |
-| `/maintenance/run`, `/maintenance/rescan`, `/maintenance/redeliver-dead`, `/events/inbound`, `:replay` | admin | Maintenance and inbound-event log |
+| `/webhooks`, `/webhooks/{id}`, `:test`, `:rotate-secret`, `/deliveries`, `:redeliver` | admin | Outbound webhook subscriptions (optionally scoped to connections) and delivery log |
+| `POST /ingest/github/{connection}`, `POST /ingest/gitlab/{connection}` | Connection webhook secret or `ingest:relay` | Direct or relayed GitHub and GitLab events for one connection |
+| `POST /ingest/registry/{provider}/{connection}` | Connection webhook secret | Registry push events for one connection |
+| `POST /ingest/github`, `POST /ingest/gitlab`, `POST /ingest/registry/{provider}` | Legacy shared secret or `ingest:relay` | Shared receivers kept for existing hooks |
+| `/maintenance/run`, `/rescan`, `/redeliver-dead`, `/reset`, `/rebuild`, `/update-sensors`, `/schedule`, `/versions`, `/events/inbound`, `:replay` | admin | Maintenance and inbound-event log |
 | `GET /system/metrics` | read | Prometheus metrics |
 | `GET /system/github-webhooks`, `POST /system/github-webhooks:check` | read, admin | GitHub webhook delivery check: redelivers missed events, reports hook misconfiguration |
 | `DELETE /assessments/{id}` | write (or owning trigger) | Cancel |
@@ -339,8 +348,18 @@ fail the build if a route is added without documentation.
 | `/intel/indicator-sources` (list, create, get, patch, delete, `/indicators` get and put, `:import-stix`, `:hunt`) | read, write (hunt), admin (alert, block) | Indicator sources |
 | `/intel/indicator-sources/{id}/taxii` (get, patch), `:poll`, `:test` | read; admin | TAXII 2.1 feeds |
 | `/intel/yara-rulesets` (list, create, `:validate`, get, patch, delete, `:hunt`) | read, write (hunt), admin (alert, block) | YARA rulesets |
-| `/settings/retention`, `:preview`, `:purge` | admin | Raw-event retention |
-| `POST /webhooks/github` | GitHub HMAC | Signed push events |
+| `/settings/retention`, `:preview`, `:purge` | admin | Retention by data class |
+| `GET /audit` | admin | Audit log query |
+| `GET /schemas/events`, `GET /schemas/events/{type}/{version}` | read | Outbound event JSON Schemas |
+| `POST /intel/indicator-sources/{id}:import-csv` | write (hunt), admin (alert, block) | CSV indicator import |
+| `/intel/vulnerability-sources`, `/{key}`, `:sync`; `GET /intel/vulnerabilities/{id}` | read / admin | Advisory sources, NVD and CVE Program records |
+| `/intel/vex-documents`, `/intel/vex-documents/{id}`, `GET /intel/vex-statements` | read, write / admin (delete) | Vendor statements (VEX, CSAF) |
+| `POST /webhooks/github` | Legacy GitHub HMAC | Signed push events (shared secret) |
+| `GET/PUT/DELETE /assets/{id}/qa/profile` | read / admin | E2E QA profile: target URL, suites, secrets, load profile, LLM provider |
+| `GET/POST /assets/{id}/qa/runs`, `GET /assets/{id}/qa/coverage`, `GET /assessments/{id}/qa` | read / write, trigger | QA runs and API-coverage history |
+| `/qa/runs/{id}`, `/scenarios`, `/coverage`, `/report`, `:cancel`; `GET /qa/runner` | read / write, trigger | Run results, report archive, runner status |
+| `/assets/{id}/qa/generations`, `/assets/{id}/qa/suites`, `/qa/generations/{id}`, `/files`, `/qa/suites/{id}`, `:approve`, `:reject` | read / write / admin (approve) | LLM-drafted Karate features and unit tests |
+| `/llm/presets`, `/llm/providers`, `/llm/providers/{id}`, `:test` | read / admin | LLM providers for test generation |
 
 ## Security model
 
@@ -348,15 +367,22 @@ fail the build if a route is added without documentation.
   can be restricted to IP ranges and are revocable. Revocation is checked in
   PostgreSQL on every request. Redis limits each token to 120 requests per
   minute and fails closed.
-- **Credentials:** provider secrets are AES-256-GCM encrypted under
-  `SCRS_MASTER_KEY`. Scanner subprocesses inherit no credentials.
+- **Credentials:** provider credentials, per-connection webhook secrets, TAXII
+  credentials, LLM provider keys and QA profile variables are AES-256-GCM
+  encrypted under `SCRS_MASTER_KEY`, each bound to its owner. None is ever
+  returned by the API. Scanner subprocesses inherit no credentials.
 - **Untrusted code:** archives are unpacked with traversal, link, special-file
-  and size limits. Nothing in a repository is built or executed. The scanner
-  network has no internet access. Remediation egress is allow-listed to public
-  npm and deps.dev addresses.
+  and size limits. The scanner never builds or executes repository content, and
+  its network has no internet access. Remediation egress is allow-listed to
+  public npm and deps.dev addresses. The only place repository code runs is the
+  Karate runner (QA test suites). It holds no SCRS secrets, runs tests as a
+  separate user with dropped capabilities, and never receives commits that
+  failed the security gate. LLM-generated tests run only after admin approval.
 - **Data safety:** there is no hard-delete API. Deleting a connection disables
-  it and keeps its history. Retention only touches raw inbound events.
-  Findings, assessments and the audit log are kept.
+  it and keeps its history. Retention deletes only what an admin's policy (or
+  an environment default) names, class by class. It never touches open
+  register entries, the current revision of a tracked ref, or assets on legal
+  hold, and it keeps at least 365 days of audit log.
 - **Edge:** Traefik terminates TLS. Forwarded client IPs are trusted only from
   `SCRS_TRUSTED_PROXY_CIDRS`. CORS accepts exact origins only.
 
@@ -366,17 +392,19 @@ Milestones follow PRD section 15.2.
 
 | Milestone | Status |
 | --- | --- |
-| M1 Platform core | Done: tokens, audit, owners and asset attributes, metrics, request IDs, access logs |
+| M0 Foundations and spikes | Done: ADR-001 to ADR-024 in [docs/ADR.md](docs/ADR.md); spike outcomes and evidence in [docs/SPIKES.md](docs/SPIKES.md). Open: throughput measurements (S1, S4), the mobile sample-repo table (S3), NVD volumes (S9), and S10–S12 (part of M9) |
+| M1 Platform core | Done: tokens, audit log with `GET /audit` (OBS-002), owners and asset attributes with `legal_hold`, metrics, request IDs, access logs |
 | M2 Repository scanning | Done: trigger, batch, latest, long-poll, direct and relay GitHub ingestion, PR assessments, diffs and new-versus-existing gating, integrity events |
 | M3 Malware and malicious dependencies | Done: ClamAV, YARA via ClamAV with canary, `MAL-` matching, campaign IOC types, KEV and EPSS |
-| M4 Threat-intelligence feeds | Done: indicator bundles, KEV/EPSS, Trivy and SARIF import, YARA-X rulesets (team and third-party), indicator sources with modes and confidence, STIX 2.1 upload, TAXII 2.1 polling (OpenCTI, MISP, vendors, CISA AIS). CSV, VEX import and NVD outstanding |
-| M5 Retention, maintenance, outbound | Done: signed outbound webhooks with profiles and header auth, scheduler, maintenance actions, event log and replay, n8n workflows, source snapshots, git-bundle mirrors |
-| M6 Images and registries | Done: Docker Hub, GAR, Harbor and OCI images by digest with layer malware/YARA/IOC scanning; registry push events; GitLab repositories and webhooks |
+| M4 Threat-intelligence feeds | Done: indicator bundles and sources with modes and confidence, CSV import, IPv6 indicators, YARA-X rulesets, STIX 2.1 upload, TAXII 2.1 polling, KEV/EPSS, Trivy and SARIF import, NVD and CVE Program records, OpenVEX/CycloneDX VEX/CSAF import, vulnerability-source registry with licences and health |
+| M5 Retention, maintenance, outbound | Done: retention classes with legal hold, reset, rebuild, sensor update, schedule and versions actions, signed outbound webhooks with profiles, header auth, connection scope and published event schemas, `finding.rescored` and `malicious_dependency.reported`, per-connection inbound webhooks, event log and replay, n8n workflows, snapshots, git mirrors. Open: server-sent events (OUT-004, P2) |
+| M6 Images and registries | Done: Docker Hub, GAR, Harbor and OCI images by digest with layer scanning, registry push events, GitLab repositories and webhooks; Trivy parity recorded on Alpine, Debian 12 and Debian 13 images ([TRIVY_PARITY.md](docs/TRIVY_PARITY.md)) |
 | M7 Remediation and hardening | Done: npm and Maven plans, OpenVEX export, load and crash-recovery test |
-| E2E QA (Karate) | Done: Karate runner service and image, per-repository QA profiles, automatic runs after assessments, API coverage, report-only QA findings, load runs, LLM-drafted Karate features and unit tests with approval |
-| M8 Licences, SPDX, compliance reports | Not started |
-| M9 SAST and reachability | SARIF import of external SAST done; built-in SAST and reachability not started |
-| Dependency-Track SBOM export (P2) | Not started (forward SBOMs through n8n until then) |
+| E2E QA (Karate) | Done: runner service and image (in the Dokploy stack or on a separate VM), QA profiles, automatic runs after assessments, OpenAPI coverage, report-only QA findings, load runs, LLM-drafted Karate features and unit tests with approval. Open: acceptance with real LLM keys and on the VPS |
+| M8 Licences, SPDX, compliance reports | Not started: licences (LIC-001 to LIC-009), SPDX export (SBM-010, SBM-011), OWASP/CWE/PCI evidence reports (CMP-001 to CMP-006), safe versions (VUL-008) |
+| M9 SAST and reachability | SARIF import of external SAST done; analyzer framework (gosec, Bandit, Bearer), Go reachability and taint traces not started |
+| P2 items | Not started: Dependency-Track SBOM export (forward SBOMs through n8n until then), CPE matching (VUL-007), STIG reports |
+| Release acceptance | Outstanding: live Dokploy deployment and TLS checks, real GitHub/GitLab/registry accounts, hosted backup and restore drills, signed release manifests, review of the ClamAV image's open CVEs |
 
 ## Development and QA
 
@@ -406,6 +434,8 @@ To run locally, copy `.env.example` to `.env`, fill in the placeholders, then
 | [docs/DOKPLOY.md](docs/DOKPLOY.md) | Deployment contract, tokens, backup and recovery |
 | [docs/ASSESSMENT_PIPELINE.md](docs/ASSESSMENT_PIPELINE.md) | Pipeline design, limits and finding lifecycle |
 | [docs/PROVIDERS.md](docs/PROVIDERS.md) | GitHub, Docker Hub and GAR connections |
+| [docs/ADR.md](docs/ADR.md), [docs/SPIKES.md](docs/SPIKES.md) | Architecture decisions and spike outcomes |
+| [docs/TRIVY_PARITY.md](docs/TRIVY_PARITY.md) | Image scanning compared with Trivy on sample images |
 | [docs/QA_TESTING.md](docs/QA_TESTING.md) | E2E QA with Karate: runner host, profiles, coverage, findings, LLM test generation |
 | [docs/FOUNDATION.md](docs/FOUNDATION.md) | URL contract and local work |
 | [docs/RELEASING.md](docs/RELEASING.md) | Image tags and releases |

@@ -163,3 +163,53 @@ func pinnedFeed(root string) (string, error) {
 	}
 	return directory, nil
 }
+
+// FeedFile is one downloaded enrichment file.
+type FeedFile struct {
+	Present  bool       `json:"present"`
+	Modified *time.Time `json:"modified,omitempty"`
+	Bytes    int64      `json:"bytes"`
+}
+
+// FeedStatus is what /feeds reports about the current snapshot.
+type FeedStatus struct {
+	OSV struct {
+		FetchedAt  *time.Time `json:"fetched_at,omitempty"`
+		Ecosystems []string   `json:"ecosystems"`
+		Error      string     `json:"error,omitempty"`
+	} `json:"osv"`
+	KEV  FeedFile `json:"kev"`
+	EPSS FeedFile `json:"epss"`
+}
+
+// CurrentFeedStatus reads the current snapshot's manifest and file times.
+func CurrentFeedStatus(root string) FeedStatus {
+	var status FeedStatus
+	status.OSV.Ecosystems = []string{}
+	directory, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		status.OSV.Error = "offline feeds not initialized"
+		return status
+	}
+	var manifest FeedManifest
+	if data, err := os.ReadFile(filepath.Join(directory, "manifest.json")); err != nil || json.Unmarshal(data, &manifest) != nil {
+		status.OSV.Error = "feed freshness manifest missing"
+	} else {
+		status.OSV.FetchedAt, status.OSV.Ecosystems = &manifest.FetchedAt, manifest.Ecosystems
+	}
+	file := func(name string) FeedFile {
+		info, err := os.Stat(filepath.Join(directory, name))
+		if err != nil {
+			return FeedFile{}
+		}
+		modified := info.ModTime().UTC()
+		return FeedFile{Present: true, Modified: &modified, Bytes: info.Size()}
+	}
+	status.KEV, status.EPSS = file("kev.json"), file("epss.csv.gz")
+	return status
+}
+
+func writeFeedStatus(w http.ResponseWriter, root string) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(CurrentFeedStatus(root))
+}

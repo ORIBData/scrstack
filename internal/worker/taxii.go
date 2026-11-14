@@ -21,15 +21,20 @@ const taxiiFailureAlert = 3
 // PollTAXII polls due TAXII feeds every interval until ctx ends.
 func (w Worker) PollTAXII(ctx context.Context, every time.Duration) {
 	for {
+		started, polls := time.Now(), 0
+		var passErr error
 		for ctx.Err() == nil {
 			polled, err := w.PollTAXIIOnce(ctx)
 			if err != nil {
 				w.Logger.Warn("TAXII poll bookkeeping failed", "error", err)
+				passErr = err
 			}
 			if !polled || err != nil {
 				break
 			}
+			polls++
 		}
+		_ = w.Store.RecordJob(context.WithoutCancel(ctx), "taxii_poll", every, started, passErr, map[string]int{"feeds_polled": polls})
 		select {
 		case <-ctx.Done():
 			return

@@ -6,17 +6,22 @@ import (
 	"github.com/google/uuid"
 )
 
-// Raw ingress retention is independent of assessment, finding and audit evidence.
-// Zero retains forever; no purge of assessed artifacts or risk history is exposed.
+// Retention is the policy: the original raw-event fields (zero keeps
+// forever) and every data class with its effective setting (RET-001).
 type Retention struct {
-	Revision            int64 `json:"revision"`
-	InboundEventDays    int   `json:"inbound_event_days"`
-	WebhookDeliveryDays int   `json:"webhook_delivery_days"`
+	Revision            int64            `json:"revision"`
+	InboundEventDays    int              `json:"inbound_event_days"`
+	WebhookDeliveryDays int              `json:"webhook_delivery_days"`
+	Classes             []RetentionClass `json:"classes"`
 }
 
 func (s *Store) Retention(ctx context.Context) (Retention, error) {
 	var p Retention
-	err := s.pool.QueryRow(ctx, `SELECT revision,inbound_event_days,webhook_delivery_days FROM `+s.schema+`.retention_policy WHERE singleton`).Scan(&p.Revision, &p.InboundEventDays, &p.WebhookDeliveryDays)
+	if err := s.pool.QueryRow(ctx, `SELECT revision,inbound_event_days,webhook_delivery_days FROM `+s.schema+`.retention_policy WHERE singleton`).Scan(&p.Revision, &p.InboundEventDays, &p.WebhookDeliveryDays); err != nil {
+		return p, err
+	}
+	classes, err := s.RetentionClasses(ctx)
+	p.Classes = classes
 	return p, err
 }
 
@@ -46,7 +51,10 @@ func (s *Store) SetRetention(ctx context.Context, actor uuid.UUID, expected int6
 	if _, err = tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('retention.policy_changed',$1)`, details); err != nil {
 		return Retention{}, err
 	}
-	return Retention{Revision: expected + 1, InboundEventDays: days, WebhookDeliveryDays: deliveryDays}, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return Retention{}, err
+	}
+	return s.Retention(ctx)
 }
 func (s *Store) PreviewRetention(ctx context.Context, days int) (map[string]int64, error) {
 	if days < 0 || days > 36500 {

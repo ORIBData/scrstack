@@ -101,7 +101,11 @@ func (s *Store) RecordIntegrity(ctx context.Context, delivery string, actor uuid
 			alert["finding_id"] = findingID
 			alert["link"] = notify.Link("/register/" + findingID.String() + "/events")
 		}
-		if _, err := notify.Emit(ctx, tx, s.schema, "integrity.alert", alert, nil); err != nil {
+		scope := notify.Scope{}
+		if asset != nil {
+			scope.Asset = *asset
+		}
+		if _, err := notify.EmitScoped(ctx, tx, s.schema, "integrity.alert", alert, nil, scope); err != nil {
 			return 0, err
 		}
 	}

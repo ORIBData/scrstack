@@ -253,7 +253,10 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 
 // OSV-Scanner progress lines echo repository paths, which are attacker-chosen
 // text: a lockfile under "packages/error-pages/" must not mark coverage partial.
-var progressLine = regexp.MustCompile(`^(Scanning dir .+|Scanned .+ file and found \d+ packages?)$`)
+// The CycloneDX writer also notes OS source packages it cannot give a purl
+// (for example "libgpg-error@1.46-1 (Debian:12)"); the package names are
+// image content, and the JSON inventory already carries those packages.
+var progressLine = regexp.MustCompile(`^(Scanning dir .+|Scanned .+ file and found \d+ packages?|Failed to parse package URL: unable to determine purl type of [^ ]+ \([A-Za-z]+(:[0-9.]+)?\))$`)
 
 func reportsProblem(stderr string) bool {
 	for _, line := range strings.Split(stderr, "\n") {
@@ -279,6 +282,12 @@ func (e Engine) Handler(token string) http.Handler {
 				return
 			}
 			images.ServeHTTP(w, r)
+			return
+		}
+		if r.Method == "GET" && r.URL.Path == "/feeds" {
+			// Freshness only (timestamps and sizes); the worker records it in
+			// the vulnerability-source registry (VUL-010).
+			writeFeedStatus(w, e.Database)
 			return
 		}
 		if r.Method == "GET" && r.URL.Path == "/healthz" {

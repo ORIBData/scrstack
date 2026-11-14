@@ -215,3 +215,17 @@ func TestIndicatorSourcesModesHashesAndURLs(t *testing.T) {
 		t.Fatalf("streamed MD5 not matched: %+v", result.Findings)
 	}
 }
+
+func TestIPv6TextMatching(t *testing.T) {
+	future := time.Now().Add(time.Hour)
+	set := newIndicatorSet(IndicatorBundle{Version: "v", Indicators: []Indicator{{ID: "c2", Type: "ipv6", Value: "2001:db8::dead:beef", ValidUntil: future}, {ID: "v4", Type: "ipv4", Value: "198.51.100.7", ValidUntil: future}}}, time.Now())
+	text := "connect to 2001:0DB8:0000:0000:0000:0000:DEAD:BEEF and 198.51.100.7; ignore ::1 and 10:30:45 and [2001:db8::1]"
+	found := matchText(FileEvidence{Path: "cfg.yaml", SHA256: "x"}, text, set)
+	ids := map[string]bool{}
+	for _, f := range found {
+		ids[f.AdvisoryID] = true
+	}
+	if len(found) != 2 || !ids["c2"] || !ids["v4"] {
+		t.Fatalf("matches %+v", found)
+	}
+}

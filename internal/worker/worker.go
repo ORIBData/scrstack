@@ -78,6 +78,10 @@ type Worker struct {
 	QAReports   QAReports
 	// LLMPrivateHosts may resolve to internal addresses (SCRS_LLM_PRIVATE_HOSTS).
 	LLMPrivateHosts map[string]bool
+	// NVDAPIKey raises the NVD rate limit; NVDURL and CVEURL override the
+	// sources' API URLs (tests, mirrors); AdvisoryPace overrides pacing.
+	NVDAPIKey, NVDURL, CVEURL string
+	AdvisoryPace              time.Duration
 }
 
 // RunMirrors processes queued mirror requests one at a time. A bundle streams
@@ -176,6 +180,12 @@ func (w Worker) MonitorFeeds(ctx context.Context, every time.Duration) {
 	client := &http.Client{Timeout: 5 * time.Second}
 	healthy := true
 	for {
+		started := time.Now()
+		healthErr := w.recordFeedHealth(ctx, client)
+		if healthErr != nil && ctx.Err() == nil {
+			w.Logger.Warn("feed health not recorded", "error", healthErr)
+		}
+		_ = w.Store.RecordJob(context.WithoutCancel(ctx), "feed_monitor", every, started, healthErr, nil)
 		stale := false
 		if resp, err := client.Get(endpoint.String()); err == nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -423,8 +433,12 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 // rescans on a schedule (M13, M14, ING-007). One replica wins each pass.
 func (w Worker) Maintain(ctx context.Context, every, rescan, mirror time.Duration) {
 	for {
+		started := time.Now()
 		passCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		report, err := w.Store.Maintain(passCtx, assessments.SchedulerActor, "scheduled")
+		if !report.Skipped {
+			_ = w.Store.RecordJob(context.WithoutCancel(ctx), "maintenance", every, started, err, report)
+		}
 		if err != nil {
 			w.Logger.Warn("scheduled maintenance failed", "error", err)
 		} else if !report.Skipped {
@@ -458,9 +472,13 @@ func (w Worker) Maintain(ctx context.Context, every, rescan, mirror time.Duratio
 func (w Worker) CheckGitHubHooks(ctx context.Context, every time.Duration, hookURL string) {
 	api := connections.NewNativeAdapters()
 	for {
+		started := time.Now()
 		passCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		checks, ran, err := w.Connections.CheckGitHubHooks(passCtx, api, hookURL, time.Now())
 		cancel()
+		if ran || err != nil {
+			_ = w.Store.RecordJob(context.WithoutCancel(ctx), "github_hook_check", every, started, err, map[string]int{"connections": len(checks)})
+		}
 		if err != nil {
 			w.Logger.Warn("GitHub webhook check failed", "error", err)
 		} else if ran {

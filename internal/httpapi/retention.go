@@ -29,9 +29,19 @@ func retentionHandler(store *assessments.Store) http.Handler {
 		}
 		if path == "/settings/retention:preview" && r.Method == "POST" {
 			var input struct {
-				Days int `json:"inbound_event_days"`
+				Days    int             `json:"inbound_event_days"`
+				Classes map[string]*int `json:"classes"`
 			}
 			if !readBody(w, r, &input) {
+				return
+			}
+			if input.Classes != nil {
+				counts, err := store.PreviewRetentionClasses(ctx, input.Classes)
+				if err != nil {
+					assessmentError(w, err)
+					return
+				}
+				writeJSON(w, 200, map[string]any{"classes": counts})
 				return
 			}
 			result, err := store.PreviewRetention(ctx, input.Days)
@@ -53,22 +63,34 @@ func retentionHandler(store *assessments.Store) http.Handler {
 			return
 		}
 		if path == "/settings/retention:purge" {
-			count, err := store.PurgeEvents(ctx, actor.ID, revision)
+			purged, err := store.PurgeRetention(ctx, actor.ID, revision)
 			if err != nil {
 				assessmentError(w, err)
 				return
 			}
-			writeJSON(w, 200, map[string]int64{"deleted_events": count})
+			writeJSON(w, 200, map[string]any{"deleted_events": purged["inbound_events"], "purged": purged})
 			return
 		}
 		var input struct {
-			Days         int `json:"inbound_event_days"`
-			DeliveryDays int `json:"webhook_delivery_days"`
+			Days         *int            `json:"inbound_event_days"`
+			DeliveryDays *int            `json:"webhook_delivery_days"`
+			Classes      map[string]*int `json:"classes"`
 		}
 		if !readBody(w, r, &input) {
 			return
 		}
-		p, err := store.SetRetention(ctx, actor.ID, revision, assessments.Retention{InboundEventDays: input.Days, WebhookDeliveryDays: input.DeliveryDays})
+		// The original fields are shorthand for their classes; classes wins.
+		classes := map[string]*int{}
+		if input.Days != nil {
+			classes["inbound_events"] = input.Days
+		}
+		if input.DeliveryDays != nil {
+			classes["webhook_deliveries"] = input.DeliveryDays
+		}
+		for k, v := range input.Classes {
+			classes[k] = v
+		}
+		p, err := store.SetRetentionClasses(ctx, actor.ID, revision, classes)
 		if err != nil {
 			assessmentError(w, err)
 			return

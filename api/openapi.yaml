@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Software Supply Chain Risk Stack (SCRS) API
-  version: 0.4.0
+  version: 0.5.0
   license:
     name: MIT
     url: https://opensource.org/license/mit
@@ -9,14 +9,22 @@ info:
   description: |
     SCRS (Software Supply Chain Risk Stack) assesses GitHub/GitLab repositories and container
     images (Docker Hub, Google Artifact Registry, Harbor, any OCI registry) with offline OSV
-    matching, ClamAV + YARA malware scanning, IOC matching, integrity rules and KEV/EPSS enrichment,
-    and keeps a persistent risk register. Each assessed revision has a CycloneDX **SBOM** (what the
-    software contains) and a CycloneDX **MBOM** (how it is built: build definitions and pinned
-    inputs).
+    matching, ClamAV + YARA malware scanning, YARA-X rulesets, IOC matching (manual, STIX 2.1 and
+    TAXII 2.1 sources), integrity rules and KEV/EPSS enrichment, and keeps a persistent risk
+    register. Each assessed revision has a CycloneDX **SBOM** (what the software contains) and a
+    CycloneDX **MBOM** (how it is built: build definitions and pinned inputs).
+
+    **E2E QA.** Repositories with a QA profile get Karate API, UI and load runs against their
+    deployed environment after each successful assessment, on a runner the operator hosts. Results,
+    OpenAPI coverage and report-only `qa_*` findings are stored with the assessment; LLM providers
+    (OpenAI, Anthropic, Gemini, Azure OpenAI and compatible APIs) draft tests for approval.
 
     **Automation.** External services such as n8n trigger assessments with `POST /assessments`
     (inbound) and receive results through signed outbound webhooks. Put correlation data in
-    `trigger.context`; it is echoed in `assessment.completed`.
+    `trigger.context`; it is echoed in `assessment.completed`. Provider and registry webhooks are
+    per connection: `POST /connections/{id}:webhook` sets a connection's secret, and its receiver is
+    `/ingest/<provider>/<connection>` (registries: `/ingest/registry/<provider>/<connection>`).
+    Outbound subscriptions can be scoped to connections.
 
     **Authentication.** Send `Authorization: Bearer <token>`. Token scopes:
     `read` (view), `write` (trigger, triage, edit assets), `trigger` (trigger and view own
@@ -333,6 +341,42 @@ paths:
                 credential: {type: object, description: 'Provider credential, as in createConnection'}
       responses:
         '200': {description: Rotated, content: {application/json: {schema: {$ref: '#/components/schemas/Connection'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /connections/{id}:webhook:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Connections]
+      operationId: setConnectionWebhook
+      summary: Set or rotate a connection's webhook secret
+      description: |
+        Each GitHub, GitLab, Harbor, Docker Hub, GAR and OCI connection has its own inbound webhook secret and receiver URL. The secret is sealed with `SCRS_MASTER_KEY`, separately from the provider credential, so rotating it re-scopes no assets and invalidates no assessments.
+        By default SCRS generates a 64-character secret and returns it once with `receiver_url` and provider-specific `setup` instructions. You can supply `secret` instead (32–256 printable characters). `hook_url` (GitHub only) names the public URL GitHub calls when it is a relay, so the delivery check finds the hook; `""` clears it. Send only `hook_url` with `rotate_secret: false` to keep the current secret. Scope `admin`.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                rotate_secret: {type: boolean, description: 'Default true, except when only hook_url changes on a connection that already has a secret'}
+                secret: {type: string, minLength: 32, maxLength: 256}
+                hook_url: {type: string}
+      responses:
+        '200':
+          description: Webhook updated; store `webhook_secret` now
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection: {$ref: '#/components/schemas/Connection'}
+                  receiver_url: {type: string}
+                  webhook_secret: {type: string, description: Present only when the secret was set or rotated}
+                  setup: {type: string}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -1030,7 +1074,7 @@ paths:
       operationId: ingestGitHub
       summary: GitHub events (direct or relay)
       description: |
-        Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified when `SCRS_GITHUB_WEBHOOK_SECRET` is configured; otherwise the relay token alone is trusted.
+        Shared receiver for deployments that set `SCRS_GITHUB_WEBHOOK_SECRET`; prefer each connection's own receiver, `/ingest/github/{connection}`. Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified when `SCRS_GITHUB_WEBHOOK_SECRET` is configured; otherwise the relay token alone is trusted.
         `push` and `pull_request` (opened, synchronize, reopened) queue assessments. `push`, `delete`, `create`, `repository`, `member` and `organization` raise integrity alerts (force push, deletions, branch churn, mass deletion, visibility and membership changes, campaign patterns). Other events return `200`.
       security: [{}, {bearerAuth: []}]
       parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
@@ -1049,7 +1093,7 @@ paths:
       operationId: ingestGitLab
       summary: GitLab events (direct or relay)
       description: |
-        Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified when the secret is configured, otherwise the relay token alone is trusted.
+        Shared receiver for deployments that set `SCRS_GITLAB_WEBHOOK_SECRET`; prefer each connection's own receiver, `/ingest/gitlab/{connection}`. Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified when the secret is configured, otherwise the relay token alone is trusted.
         GitLab's `Idempotency-Key` header (stable across retries of one delivery) is the idempotency key; `X-Gitlab-Event-UUID`, which recursive hooks share, is the fallback. One of the two is required. Push Hook and Merge Request Hook (open, reopen, update with new commits) queue assessments. Pushes raise ref-deletion, branch-churn, mass-deletion and pattern alerts. Tag pushes raise alerts only. Other hooks return `200`.
       security: [{}, {bearerAuth: []}]
       parameters:
@@ -1065,6 +1109,69 @@ paths:
         '401': {description: Invalid token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '503': {description: GitLab secret not configured or relay disabled, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /ingest/github/{connection}:
+    parameters: [{name: connection, in: path, required: true, schema: {type: string}, description: Connection name}]
+    post:
+      tags: [Ingest]
+      operationId: ingestGitHubConnection
+      summary: GitHub events for one connection
+      description: |
+        A GitHub connection's own receiver. Direct deliveries are verified with that connection's webhook secret (`X-Hub-Signature-256`), set with `POST /connections/{id}:webhook`. An unknown, disabled or unconfigured connection answers `401` like a bad signature. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded signature is checked against the connection's secret.
+        Events behave as on `/ingest/github`, but only reach that connection's repositories: an event for a repository outside it is acknowledged as out of scope.
+      security: [{}, {bearerAuth: []}]
+      parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '202': {description: Assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: 'Replay, ping, ignored event, out of scope, or integrity signals only', content: {application/json: {schema: {$ref: '#/components/schemas/IngestOutcome'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {description: Invalid signature or unknown connection, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {description: Ingest concurrency limit, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Relay disabled or secret store unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /ingest/gitlab/{connection}:
+    parameters: [{name: connection, in: path, required: true, schema: {type: string}, description: Connection name}]
+    post:
+      tags: [Ingest]
+      operationId: ingestGitLabConnection
+      summary: GitLab events for one connection
+      description: |
+        A GitLab connection's own receiver: `X-Gitlab-Token` must equal that connection's webhook secret. Relays use a bearer token (scope `ingest:relay`); a forwarded `X-Gitlab-Token` is checked against the connection's secret. Events behave as on `/ingest/gitlab` but only reach that connection's projects. Unknown, disabled or unconfigured connections answer `401`.
+      security: [{}, {bearerAuth: []}]
+      parameters:
+        - {name: X-Gitlab-Event, in: header, required: true, schema: {type: string, enum: [Push Hook, Tag Push Hook, Merge Request Hook]}}
+        - {name: Idempotency-Key, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}}
+        - {name: X-Gitlab-Event-UUID, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}}
+        - {name: X-Gitlab-Token, in: header, schema: {type: string}, description: The connection's webhook secret (direct mode)}
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '202': {description: Assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/Assessment'}}}}
+        '200': {description: 'Replay, ignored event, out of scope, or integrity signals only', content: {application/json: {schema: {$ref: '#/components/schemas/IngestOutcome'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {description: Invalid token or unknown connection, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Relay disabled or secret store unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /ingest/registry/{provider}/{connection}:
+    parameters:
+      - {name: provider, in: path, required: true, schema: {type: string, enum: [harbor, dockerhub, gar, oci]}}
+      - {name: connection, in: path, required: true, schema: {type: string}, description: Connection name}
+    post:
+      tags: [Ingest]
+      operationId: ingestRegistryConnection
+      summary: Registry push events for one connection
+      description: |
+        A registry connection's own receiver, authenticated by that connection's webhook secret rather than an API token. Send it as `Authorization: Bearer <secret>` (Harbor Auth Header, OCI Distribution notification headers), as `X-SCRS-Webhook-Token`, or as `?token=<secret>` for Docker Hub and Pub/Sub push, which cannot send headers (keep proxy access logs from recording query strings). Pushes queue image assessments as on `/ingest/registry/{provider}`, only for that connection's images. Does not need `SCRS_RELAY_ENABLED`.
+      security: [{}]
+      parameters:
+        - {name: token, in: query, schema: {type: string}, description: The connection's webhook secret, for senders that cannot set headers}
+        - {name: X-SCRS-Webhook-Token, in: header, schema: {type: string}}
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '202': {description: At least one assessment queued, content: {application/json: {schema: {$ref: '#/components/schemas/RegistryIngestResult'}}}}
+        '200': {description: Nothing new queued (replay, out of scope, or not a push), content: {application/json: {schema: {$ref: '#/components/schemas/RegistryIngestResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {description: Invalid token or unknown connection, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '404': {description: Unknown registry provider, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Secret store unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /ingest/registry/{provider}:
     parameters:
       - {name: provider, in: path, required: true, schema: {type: string, enum: [harbor, dockerhub, gar, oci]}}
@@ -1079,7 +1186,7 @@ paths:
         - `gar`: Artifact Registry Pub/Sub message (push envelope or decoded data) with `action: INSERT`
         - `oci`: CNCF Distribution notifications (registry:2, Zot, Nexus)
 
-        Docker Hub and Pub/Sub cannot send headers, so relay them through n8n. Retries of the same body replay the same assessments. Scope `ingest:relay` with `SCRS_RELAY_ENABLED=true`.
+        This shared relay receiver needs an API token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`). Registries can instead call their connection's own receiver, `/ingest/registry/{provider}/{connection}`, with the connection's webhook secret. Retries of the same body replay the same assessments.
       requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
         '202':
@@ -1129,6 +1236,7 @@ paths:
                 profile: {type: string, enum: [summary, full, agent], default: summary}
                 egress_ack: {type: boolean, description: Acknowledge that full/agent payloads leave SCRS}
                 include_contacts: {type: boolean, description: Include owner contact fields}
+                connections: {type: array, maxItems: 50, items: {type: string, format: uuid}, description: 'Deliver only events about these connections (their assessments, findings, QA runs, integrity alerts and health). Platform events without a connection, such as feed.stale and maintenance.completed, still arrive. Empty or omitted means every connection'}
       responses:
         '201':
           description: Created; store `secret` and `auth_header` now
@@ -1159,7 +1267,7 @@ paths:
       tags: [Webhook subscriptions]
       operationId: updateSubscription
       summary: Update a subscription
-      description: Change URL, events, profile or enabled state. Requires `If-Match`. Scope `admin`.
+      description: Change URL, events, profile, connection scope or enabled state. Requires `If-Match`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
       requestBody:
         required: true
@@ -1175,6 +1283,7 @@ paths:
                 egress_ack: {type: boolean}
                 include_contacts: {type: boolean}
                 enabled: {type: boolean}
+                connections: {type: array, maxItems: 50, items: {type: string, format: uuid}, description: Replaces the connection scope; an empty list removes it}
       responses:
         '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/Subscription'}}}}
         '409': {$ref: '#/components/responses/Conflict'}
@@ -1547,7 +1656,7 @@ paths:
       summary: Upload a STIX 2.1 bundle
       description: |
         For sources of kind `stix`. Indicator objects whose patterns can be checked against files at rest become indicators:
-        `file:hashes` (MD5, SHA-1, SHA-256), `file:name`, `domain-name:value`, `ipv4-addr:value` (single addresses) and
+        `file:hashes` (MD5, SHA-1, SHA-256), `file:name`, `domain-name:value`, `ipv4-addr:value` and `ipv6-addr:value` (single addresses) and
         `url:value`, compared with `=` or `IN`. Alternatives joined by OR are imported separately; in an AND with a file hash,
         the hash is used. `pattern_type: yara` patterns are compiled into the ruleset `stix_<source>`, which follows the
         source's mode, severity and enabled flag and is rebuilt on every upload. Everything else (patterns that join
@@ -1571,6 +1680,176 @@ paths:
         '409': {description: The source is not of kind stix, or another ruleset has the name stix_<source>, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '422': {description: The combined YARA patterns do not compile, or a scan limit would be exceeded, content: {application/json: {schema: {$ref: '#/components/schemas/RuleCompileError'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:import-csv:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Threat intelligence]
+      operationId: importIndicatorCSV
+      summary: Import indicators from CSV
+      description: |
+        Loads a CSV export into a manual source (TIF-005). The header row names columns; map them with `value_column` (default `value`), `type_column`, `first_seen_column`, `confidence_column`, `label_column` and `valid_until_column`. Without a type, `type` sets one for every row, otherwise each value's type is detected (MD5, SHA-1, SHA-256, IPv4, IPv6, URL, purl, domain). Defanged values are accepted. `valid_days` (default 180) sets the expiry from the first-seen date when a row has none. The label becomes part of the indicator ID, and so of the finding's advisory ID.
+        Rows that do not parse are skipped and reported (first 50). `merge=true` keeps the source's other indicators; otherwise the CSV replaces them. Scope `write` for hunt sources, `admin` for alert and block.
+      parameters:
+        - {name: merge, in: query, schema: {type: boolean, default: false}}
+        - {name: type, in: query, schema: {type: string, enum: [sha256, sha1, md5, domain, ipv4, ipv6, url, purl, workflow_step_name, file_path_regex, file_content_regex]}}
+        - {name: valid_days, in: query, schema: {type: integer, minimum: 1, maximum: 3650, default: 180}}
+        - {name: delimiter, in: query, schema: {type: string, enum: [comma, tab, semicolon], default: comma}}
+        - {name: value_column, in: query, schema: {type: string}}
+        - {name: type_column, in: query, schema: {type: string}}
+        - {name: first_seen_column, in: query, schema: {type: string}}
+        - {name: confidence_column, in: query, schema: {type: string}}
+        - {name: label_column, in: query, schema: {type: string}}
+        - {name: valid_until_column, in: query, schema: {type: string}}
+      requestBody: {required: true, content: {text/csv: {schema: {type: string}}}}
+      responses:
+        '200':
+          description: Imported
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {type: object, properties: {source: {$ref: '#/components/schemas/IndicatorSource'}, merged: {type: boolean}, report: {type: object, properties: {rows: {type: integer}, accepted: {type: integer}, skipped: {type: integer}, problems: {type: array, items: {type: object, properties: {row: {type: integer}, reason: {type: string}}}}}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Not a manual source, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {description: CSV over 16 MiB, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: Indicator limits exceeded, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vulnerability-sources:
+    get:
+      tags: [Threat intelligence]
+      operationId: listVulnerabilitySources
+      summary: List vulnerability and advisory sources
+      description: |
+        Every advisory source (VUL-001): OSV.dev dumps, OpenSSF malicious packages, CISA KEV and FIRST EPSS (downloaded by `scrs-feed-sync`), the NVD CVE API 2.0 and the CVE Program's CVE Services API (synced by the worker for CVEs the register references), and imported VEX statements. Each lists its licence and terms, schedule, last sync and success, record count, lag and failures. A source with no success within twice its schedule is `stale` and raises `feed.stale` once (VUL-010). Scope `read` or `write`.
+      responses:
+        '200': {description: Sources, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/VulnerabilitySource'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vulnerability-sources/{key}:
+    parameters: [{name: key, in: path, required: true, schema: {type: string}}]
+    get:
+      tags: [Threat intelligence]
+      operationId: getVulnerabilitySource
+      summary: Get one advisory source
+      description: One source with its health. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
+      responses:
+        '200': {description: Source, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/VulnerabilitySource'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Threat intelligence]
+      operationId: updateVulnerabilitySource
+      summary: Enable, disable or reschedule a source
+      description: Changes `enabled` or `schedule_minutes` (15 to 10080) of a worker-synced source (`nvd`, `cve_program`). Enabling a licence-restricted source needs `acknowledge_terms` set to true (VUL-011). Every change is audited. Sources downloaded by `scrs-feed-sync` answer `409`. Requires `If-Match`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, properties: {enabled: {type: boolean}, schedule_minutes: {type: integer, minimum: 15, maximum: 10080}, acknowledge_terms: {type: boolean}}}}}}
+      responses:
+        '200': {description: Changed, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/VulnerabilitySource'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Stale revision, managed by feed-sync, or terms not acknowledged, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vulnerability-sources/{key}:sync:
+    parameters: [{name: key, in: path, required: true, schema: {type: string}}]
+    post:
+      tags: [Threat intelligence]
+      operationId: syncVulnerabilitySource
+      summary: Sync an advisory source now
+      description: Makes a worker-synced source (`nvd`, `cve_program`) due now. Set `SCRS_NVD_API_KEY` on the worker for the NVD's higher rate limit. Scope `admin`.
+      responses:
+        '202': {description: Queued, content: {application/json: {schema: {type: object, properties: {queued: {type: boolean}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Managed by scrs-feed-sync, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vulnerabilities/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}, description: 'CVE, GHSA or other advisory id'}
+    get:
+      tags: [Threat intelligence]
+      operationId: getVulnerability
+      summary: Everything known about a vulnerability
+      description: |
+        The vulnerability's records from every synced origin in OSV schema (`nvd`, `cve5`; VUL-002), each with the original kept verbatim server-side; every CVSS vector and score offered with its source (`severity_sources`, VUL-004); CWEs; and vendor statements from imported VEX documents (VUL-009), filtered to a product with `purl` (a statement without a version applies to every version). Statements are attributed inputs and never close a finding. Scope `read` or `write`.
+      parameters: [{name: purl, in: query, schema: {type: string}}]
+      responses:
+        '200':
+          description: Vulnerability
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  records: {type: array, items: {type: object}}
+                  severity_sources: {type: array, items: {type: object, properties: {version: {type: string}, vector: {type: string}, base_score: {type: number}, base_severity: {type: string}, source: {type: string}, type: {type: string}}}}
+                  cwe: {type: array, items: {type: string}}
+                  vendor_statements: {type: array, items: {$ref: '#/components/schemas/VendorStatement'}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vex-documents:
+    get:
+      tags: [Threat intelligence]
+      operationId: listVEXDocuments
+      summary: List imported VEX documents
+      description: Imported OpenVEX, CycloneDX VEX and CSAF documents, newest first, with publisher, statement count and digest. Scope `read` or `write`.
+      responses:
+        '200': {description: Documents, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/VEXDocument'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Threat intelligence]
+      operationId: importVEX
+      summary: Import a VEX document
+      description: |
+        Stores the vendor and maintainer statements of an OpenVEX, CycloneDX VEX or CSAF 2.0 (`csaf_vex` or `csaf_security_advisory`) document (VUL-009), one per vulnerability and product (purl, or product name when the document gives none). CycloneDX analysis states map to `not_affected`, `affected`, `fixed` and `under_investigation`. The same document (by SHA-256) imported twice is `409`. Up to 16 MiB and 20000 statements. Scope `write`.
+      requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
+      responses:
+        '201': {description: Imported, headers: {Location: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/VEXDocument'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: Already imported, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {description: Over 16 MiB, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vex-documents/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    delete:
+      tags: [Threat intelligence]
+      operationId: deleteVEXDocument
+      summary: Delete a VEX document
+      description: Removes the document and its statements. Audited. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/vex-statements:
+    get:
+      tags: [Threat intelligence]
+      operationId: listVendorStatements
+      summary: Find vendor statements
+      description: Statements about a `vulnerability` and/or a product `purl` (a versionless statement purl matches every version), newest first, up to 500. Scope `read` or `write`.
+      parameters:
+        - {name: vulnerability, in: query, schema: {type: string}}
+        - {name: purl, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Statements, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/VendorStatement'}}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1684,6 +1963,132 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /maintenance/reset:
+    post:
+      tags: [Operations]
+      operationId: resetData
+      summary: Reset one scope of data
+      description: |
+        Scoped reset (MNT-001), audited. `feed_state` clears TAXII cursors and NVD/CVE sync state so the next runs resync from scratch. `indicators` deletes every indicator of `source_id`. `asset_findings` deletes one asset's register entries and their history (`asset_id`); assets on legal hold are refused. `confirm` must repeat the scope. Scope `admin`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [scope, confirm]
+              properties:
+                scope: {type: string, enum: [feed_state, indicators, asset_findings]}
+                confirm: {type: string, description: The scope name again}
+                asset_id: {type: string, format: uuid}
+                source_id: {type: string, format: uuid}
+      responses:
+        '200': {description: Reset, content: {application/json: {schema: {type: object, properties: {scope: {type: string}, removed: {type: object, additionalProperties: {type: integer}}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: The asset is on legal hold, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /maintenance/rebuild:
+    post:
+      tags: [Operations]
+      operationId: rebuildDerived
+      summary: Re-assess current revisions
+      description: Queues the newest successful assessment of every tracked asset and ref (last 180 days) again (MNT-002), so findings, scores, KEV/EPSS, indicator and rule matches are recomputed against current feeds. Pull requests are left to their own events. Audited. Scope `admin`.
+      responses:
+        '202': {description: Queued, content: {application/json: {schema: {type: object, properties: {assessments_queued: {type: integer}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /maintenance/update-sensors:
+    post:
+      tags: [Operations]
+      operationId: updateSensors
+      summary: Refresh feeds now
+      description: Makes every enabled TAXII feed and NVD/CVE Program sync due now (MNT-003) and returns the vulnerability sources with their freshness. OSV, KEV, EPSS and ClamAV signatures refresh on their own schedules in `scrs-feed-sync` and `scrs-clamav`. Audited. Scope `admin`.
+      responses:
+        '202': {description: Due now, content: {application/json: {schema: {type: object, properties: {due_now: {type: object, additionalProperties: {type: integer}}, sources: {type: array, items: {$ref: '#/components/schemas/VulnerabilitySource'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /maintenance/schedule:
+    get:
+      tags: [Operations]
+      operationId: maintenanceSchedule
+      summary: Scheduled jobs and their last runs
+      description: Each scheduled job (maintenance and retention, TAXII polling, advisory sync, feed monitor, GitHub delivery check) with interval, last start, finish, status, detail and next run, plus every feed source's schedule and health (MNT-005). Scope `admin`.
+      responses:
+        '200':
+          description: Schedule
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs: {type: array, items: {type: object, properties: {job: {type: string}, interval_seconds: {type: integer}, last_started_at: {type: [string, 'null'], format: date-time}, last_finished_at: {type: [string, 'null'], format: date-time}, last_status: {type: string}, last_detail: {type: object}, next_run_at: {type: [string, 'null'], format: date-time}}}}
+                  feeds: {type: array, items: {type: object}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /maintenance/versions:
+    get:
+      tags: [Operations]
+      operationId: platformVersions
+      summary: Platform versions and update check
+      description: The SCRS build (version, Go, VCS revision), feed freshness, the Karate runner's versions, and the newest published release when `SCRS_RELEASE_FEED_URL` names an https JSON feed with `tag_name` or `version` (MNT-004). Scope `admin`.
+      responses:
+        '200': {description: Versions, content: {application/json: {schema: {type: object, properties: {scrs: {type: object}, feeds: {type: object}, qa_runner: {type: object}, latest_release: {type: object}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /audit:
+    get:
+      tags: [Operations]
+      operationId: listAudit
+      summary: Query the audit log
+      description: Audit records newest first (OBS-002), 100 per page (`limit` up to 500). Filter by `action` (exact, or a prefix ending in `*` such as `connection.*`), `target_id`, `actor_id`, `since` and `until` (RFC 3339). Page with `cursor` set to the previous `next_cursor`. Scope `admin`.
+      parameters:
+        - {name: action, in: query, schema: {type: string}}
+        - {name: target_id, in: query, schema: {type: string, format: uuid}}
+        - {name: actor_id, in: query, schema: {type: string, format: uuid}}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: until, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+        - {$ref: '#/components/parameters/Cursor'}
+      responses:
+        '200': {description: Audit records, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/AuditEntry'}}, next_cursor: {type: string}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /schemas/events:
+    get:
+      tags: [Webhook subscriptions]
+      operationId: listEventSchemas
+      summary: List event schemas
+      description: Every outbound event type with its schema versions and links (OUT-008). Payload version is also in the `X-SCRS-Event-Version` header. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Event types, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {type: object, properties: {type: {$ref: '#/components/schemas/EventType'}, versions: {type: array, items: {type: integer}}, link: {type: string}}}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /schemas/events/{type}/{version}:
+    parameters:
+      - {name: type, in: path, required: true, schema: {$ref: '#/components/schemas/EventType'}}
+      - {name: version, in: path, required: true, schema: {type: integer}}
+    get:
+      tags: [Webhook subscriptions]
+      operationId: getEventSchema
+      summary: Get one event JSON Schema
+      description: The JSON Schema (draft 2020-12) of an event type and version, describing the `event` envelope and `data` (for `assessment.completed`, both the summary and the full/agent context profiles). Data objects allow added properties; a breaking change raises the version. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: JSON Schema, content: {application/schema+json: {schema: {type: object}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /events/inbound:
     get:
       tags: [Operations]
@@ -1732,7 +2137,8 @@ paths:
       tags: [Operations]
       operationId: getRetention
       summary: Get the retention policy
-      description: Days to keep inbound event bodies and webhook deliveries. Scope `admin`.
+      description: |
+        The policy (RET-001). `classes` lists every data class: its policy `days` (null = not set), `effective_days` and its `source` (`policy`, or `default` from `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS`), its guard, and the last purge. Zero keeps forever. Open register entries, the current revision of each tracked ref and assets on legal hold are never purged; the audit log keeps at least 365 days. `inbound_event_days` and `webhook_delivery_days` are the original fields for their classes. Scope `admin`.
       responses:
         '200':
           description: Policy
@@ -1745,7 +2151,7 @@ paths:
       tags: [Operations]
       operationId: setRetention
       summary: Set the retention policy
-      description: Requires `If-Match`. Preview first with `:preview`. Scope `admin`.
+      description: Applies the given classes atomically and audits old and new values (RET-002); classes not named keep their setting. Requires `If-Match`. Preview first with `:preview`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
       requestBody:
         required: true
@@ -1754,10 +2160,10 @@ paths:
             schema:
               type: object
               additionalProperties: false
-              required: [inbound_event_days]
               properties:
-                inbound_event_days: {type: integer, minimum: 1}
-                webhook_delivery_days: {type: integer, minimum: 1}
+                classes: {type: object, additionalProperties: {type: [integer, 'null'], minimum: 0, maximum: 36500}, description: 'Class to days; null = not set (environment default); 0 = keep forever. audit_log needs 0 or at least 365'}
+                inbound_event_days: {type: integer, minimum: 0, description: Shorthand for classes.inbound_events}
+                webhook_delivery_days: {type: integer, minimum: 0, description: Shorthand for classes.webhook_deliveries}
       responses:
         '200':
           description: Updated
@@ -1773,12 +2179,13 @@ paths:
       tags: [Operations]
       operationId: previewRetention
       summary: Preview what a retention change deletes
-      description: Counts rows a policy would delete, without deleting. Scope `admin`.
+      description: Counts what proposed values would delete now, without deleting (RET-003). Send `classes` for per-class counts, or `inbound_event_days` for the original rows-and-bytes preview. Scope `admin`.
       requestBody:
         required: true
-        content: {application/json: {schema: {type: object, additionalProperties: false, required: [inbound_event_days], properties: {inbound_event_days: {type: integer, minimum: 1}}}}}
+        content: {application/json: {schema: {type: object, additionalProperties: false, properties: {classes: {type: object, additionalProperties: {type: [integer, 'null']}}, inbound_event_days: {type: integer, minimum: 0}}}}}
       responses:
-        '200': {description: Counts, content: {application/json: {schema: {type: object}}}}
+        '200': {description: Counts, content: {application/json: {schema: {type: object, properties: {classes: {type: object, additionalProperties: {type: integer}}, rows: {type: integer}, bytes: {type: integer}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1786,11 +2193,11 @@ paths:
     post:
       tags: [Operations]
       operationId: purgeRetention
-      summary: Purge expired inbound events now
-      description: Deletes inbound event bodies older than the current policy. Requires `If-Match` with the policy revision you previewed. Scope `admin`.
+      summary: Apply the retention policy now
+      description: Purges every class past its effective retention in bounded batches, deletes the purged objects from S3 and audits the counts (RET-005, RET-007). Hourly maintenance does the same on schedule. Requires `If-Match` with the policy revision you previewed. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
       responses:
-        '200': {description: Deleted, content: {application/json: {schema: {type: object, properties: {deleted_events: {type: integer}}}}}}
+        '200': {description: Deleted, content: {application/json: {schema: {type: object, properties: {deleted_events: {type: integer}, purged: {type: object, additionalProperties: {type: integer}}}}}}}
         '409': {$ref: '#/components/responses/Conflict'}
         '428': {$ref: '#/components/responses/PreconditionRequired'}
 
@@ -2470,6 +2877,15 @@ components:
         scope: {$ref: '#/components/schemas/ConnectionScope'}
         status: {type: object, description: 'Last check: state (pending, ok, degraded, disabled), checked_at, counts'}
         enabled: {type: boolean}
+        webhook: {$ref: '#/components/schemas/ConnectionWebhook'}
+    ConnectionWebhook:
+      type: object
+      description: Inbound webhook state of GitHub, GitLab and registry connections. The secret is never returned after it is set
+      properties:
+        configured: {type: boolean}
+        path: {type: string, examples: ['/scrs/v1/ingest/github/acme-github']}
+        hook_url: {type: string, description: GitHub only; the public hook URL when GitHub calls a relay rather than path}
+        rotated_at: {type: string, format: date-time}
     AssetType: {type: string, enum: [github_repo, gitlab_repo, container_image]}
     Asset:
       type: object
@@ -2484,6 +2900,7 @@ components:
         criticality: {type: integer, minimum: 0, maximum: 5}
         exposure: {type: string, enum: ['', internet, internal, offline]}
         labels: {type: object, additionalProperties: {type: string}}
+        legal_hold: {type: boolean, description: Excluded from every retention class and from asset_findings resets}
         revision: {type: integer}
     AssetPage:
       type: object
@@ -2499,6 +2916,7 @@ components:
         criticality: {type: integer, minimum: 0, maximum: 5}
         exposure: {type: string, enum: ['', internet, internal, offline]}
         labels: {type: object, maxProperties: 50, additionalProperties: {type: string, maxLength: 256}}
+        legal_hold: {type: boolean, description: Needs admin scope}
     OwnerInput:
       type: object
       additionalProperties: false
@@ -2670,7 +3088,7 @@ components:
               digest: {type: string}
               status: {type: string, enum: [queued, replayed, ignored_out_of_scope, invalid_reference, ambiguous_connection]}
               assessment_id: {type: string, format: uuid}
-    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, ping]}
+    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, finding.rescored, malicious_dependency.reported, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, ping]}
     AuthHeader:
       type: object
       description: Configure as Header Auth in n8n (name and value).
@@ -2687,6 +3105,7 @@ components:
         profile: {type: string, enum: [summary, full, agent]}
         egress_ack: {type: boolean}
         include_contacts: {type: boolean}
+        connections: {type: array, items: {type: string, format: uuid}, description: Connection scope; empty receives every connection's events}
         enabled: {type: boolean}
         revision: {type: integer}
         created_at: {type: string, format: date-time}
@@ -2728,7 +3147,7 @@ components:
             required: [id, type, value, valid_until]
             properties:
               id: {type: string, maxLength: 128, description: Unique within the bundle}
-              type: {type: string, enum: [sha256, sha1, md5, domain, ipv4, url, purl, workflow_step_name, file_path_regex, file_content_regex, git_branch_regex, commit_message_regex, pr_title_regex]}
+              type: {type: string, enum: [sha256, sha1, md5, domain, ipv4, ipv6, url, purl, workflow_step_name, file_path_regex, file_content_regex, git_branch_regex, commit_message_regex, pr_title_regex]}
               value: {type: string, description: 'Defanged domains, addresses and URLs (`[.]`, `hxxp`) are normalized. URLs are http, https or ftp and match exactly after lower-casing the scheme and host and dropping the fragment.'}
               valid_until: {type: string, format: date-time}
               confidence: {type: integer, minimum: 0, maximum: 100, description: 'As in STIX 2.1; compared with the source''s `min_confidence`'}
@@ -2747,6 +3166,20 @@ components:
         revision: {type: integer}
         inbound_event_days: {type: integer}
         webhook_delivery_days: {type: integer}
+        classes:
+          type: array
+          items:
+            type: object
+            properties:
+              class: {type: string, enum: [inbound_events, webhook_deliveries, closed_findings, scan_artifacts, sbom_documents, source_snapshots, remediation_plans, qa_reports, expired_indicators, audit_log]}
+              description: {type: string}
+              guard: {type: string, description: What the class never purges}
+              days: {type: [integer, 'null']}
+              effective_days: {type: integer}
+              source: {type: string, enum: [policy, default]}
+              minimum_days: {type: integer}
+              last_purged_at: {type: [string, 'null'], format: date-time}
+              last_purged_count: {type: integer}
     MaintenanceReport:
       type: object
       properties:
@@ -2755,6 +3188,66 @@ components:
         idempotency_keys_expired: {type: integer}
         rescans_queued: {type: integer}
         skipped_concurrent_run: {type: boolean}
+        purged: {type: object, additionalProperties: {type: integer}, description: Rows removed per retention class}
+        objects_deleted: {type: integer}
+        object_errors: {type: integer}
+    AuditEntry:
+      type: object
+      properties:
+        id: {type: integer}
+        occurred_at: {type: string, format: date-time}
+        action: {type: string}
+        target_id: {type: [string, 'null'], format: uuid}
+        details: {type: object}
+    VulnerabilitySource:
+      type: object
+      properties:
+        key: {type: string, enum: [osv, malicious_packages, kev, epss, nvd, cve_program, vex]}
+        name: {type: string}
+        kind: {type: string}
+        url: {type: string}
+        managed_by: {type: string, enum: [feed-sync, worker, operator]}
+        schedule_minutes: {type: integer}
+        licence: {type: string}
+        terms_url: {type: string}
+        restricted: {type: boolean, description: Licence restricts use; enabling needs acknowledge_terms}
+        enabled: {type: boolean}
+        state: {type: object}
+        last_sync_at: {type: [string, 'null'], format: date-time}
+        last_success_at: {type: [string, 'null'], format: date-time}
+        next_sync_at: {type: string, format: date-time}
+        record_count: {type: integer}
+        last_error: {type: string}
+        failures: {type: integer}
+        stale: {type: boolean, description: No success within twice the schedule (raises feed.stale once)}
+        lag_seconds: {type: [integer, 'null']}
+        revision: {type: integer}
+    VendorStatement:
+      type: object
+      properties:
+        vulnerability: {type: string}
+        purl: {type: string}
+        product: {type: string}
+        status: {type: string, enum: [not_affected, affected, fixed, under_investigation]}
+        justification: {type: string}
+        impact: {type: string}
+        action: {type: string}
+        document_id: {type: string, format: uuid}
+        format: {type: string, enum: [openvex, cyclonedx, csaf]}
+        publisher: {type: string}
+        issued_at: {type: [string, 'null'], format: date-time}
+    VEXDocument:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        format: {type: string, enum: [openvex, cyclonedx, csaf]}
+        publisher: {type: string}
+        title: {type: string}
+        issued_at: {type: [string, 'null'], format: date-time}
+        sha256: {type: string}
+        statements: {type: integer}
+        imported_by: {type: string}
+        imported_at: {type: string, format: date-time}
     QAAuth:
       type: object
       description: Header added to every generated request, valued `prefix` + the variable's value

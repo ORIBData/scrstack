@@ -10,8 +10,8 @@ Importable workflows live next to this file:
 
 | File | What it does |
 | --- | --- |
-| [`scrs-github-relay.json`](scrs-github-relay.json) | GitHub organization webhook → SCRS `/ingest/github` (relay mode, signature forwarded) |
-| [`scrs-gitlab-relay.json`](scrs-gitlab-relay.json) | GitLab group webhook → SCRS `/ingest/gitlab` (relay mode, token forwarded) |
+| [`scrs-github-relay.json`](scrs-github-relay.json) | GitHub organization webhook → SCRS `/ingest/github` (relay mode, signature forwarded). Change the URL to `/ingest/github/<connection>` to bind events to one connection |
+| [`scrs-gitlab-relay.json`](scrs-gitlab-relay.json) | GitLab group webhook → SCRS `/ingest/gitlab` (relay mode, token forwarded). Change the URL to `/ingest/gitlab/<connection>` to bind events to one connection |
 | [`scrs-registry-relay.json`](scrs-registry-relay.json) | Docker Hub webhook or GAR Pub/Sub push → SCRS `/ingest/registry/{provider}` |
 | [`scrs-assessment-completed.json`](scrs-assessment-completed.json) | SCRS `assessment.completed` → Header Auth → commit status by verdict |
 | [`scrs-nightly-reconcile.json`](scrs-nightly-reconcile.json) | Nightly `POST /maintenance/rescan` so missed events are re-assessed |
@@ -71,14 +71,15 @@ Use `/assessments:batch` for up to 100 targets in one call. For an image, send
 
 GitHub's HMAC covers the exact bytes it sent, so the relay must forward the
 **unchanged body** and the `X-GitHub-Event`, `X-GitHub-Delivery` and
-`X-Hub-Signature-256` headers. When the signature is forwarded and
-`SCRS_GITHUB_WEBHOOK_SECRET` is configured, SCRS verifies it, so neither n8n
-nor anything between it and GitHub can alter or forge events. Without the
-header or without the secret, the relay token alone is trusted.
+`X-Hub-Signature-256` headers. When the signature is forwarded and the
+connection has a webhook secret, SCRS verifies it, so neither n8n nor anything
+between it and GitHub can alter or forge events. Without the header or without
+a secret, the relay token alone is trusted.
 
 - **Webhook node:** HTTP method `POST`, Respond `Immediately`, and enable the
   **Raw Body** option so the original bytes are kept as binary.
-- **HTTP Request node:** `POST {{SCRS_BASE_URL}}/scrs/v1/ingest/github`, with
+- **HTTP Request node:** `POST {{SCRS_BASE_URL}}/scrs/v1/ingest/github/<connection>`
+  (the shared `/ingest/github` still works with `SCRS_GITHUB_WEBHOOK_SECRET`), with
   these settings:
   - **Authentication:** Header Auth credential `Authorization: Bearer <relay token>`.
   - **Body:** "n8n Binary File" using the webhook's binary data.
@@ -91,14 +92,15 @@ out-of-scope repository) or `4xx/5xx` (fix and retry). Pushes and PRs create
 assessments; force pushes, deletions, membership and visibility changes, and
 campaign-pattern matches create `integrity.alert` events immediately.
 
-Equivalent without n8n: point a second organization webhook straight at
-`/scrs/v1/webhooks/github` with `SCRS_GITHUB_WEBHOOK_SECRET`.
+Equivalent without n8n: point the organization webhook straight at the
+connection's receiver, `/scrs/v1/ingest/github/<connection>`, with the secret from
+`POST /scrs/v1/connections/{id}:webhook` (see PROVIDERS.md).
 
 ### GitLab
 
 GitLab group webhooks (Push, Tag push and Merge request events) can call
-`/scrs/v1/ingest/gitlab` directly with the "Secret token" set to
-`SCRS_GITLAB_WEBHOOK_SECRET`, or go through `scrs-gitlab-relay.json`, which
+`/scrs/v1/ingest/gitlab/<connection>` directly with the "Secret token" set to
+the connection's webhook secret, or go through `scrs-gitlab-relay.json`, which
 forwards `X-Gitlab-Event`, `Idempotency-Key`, `X-Gitlab-Event-UUID` and
 `X-Gitlab-Token` (verified by SCRS when the secret is configured). GitLab's
 `Idempotency-Key` is the idempotency key, since it is stable across retries of

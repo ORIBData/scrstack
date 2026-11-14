@@ -16,6 +16,8 @@ import (
 type Store struct {
 	pool   *pgxpool.Pool
 	schema string
+	// objects deletes stored objects of purged rows (UseObjects).
+	objects ObjectStore
 }
 
 func Open(ctx context.Context, url, schema string) (*Store, error) {
@@ -34,7 +36,7 @@ func Open(ctx context.Context, url, schema string) (*Store, error) {
 		p.Close()
 		return nil, errors.New("assessment database unavailable")
 	}
-	return &Store{p, pgx.Identifier{schema}.Sanitize()}, nil
+	return &Store{pool: p, schema: pgx.Identifier{schema}.Sanitize()}, nil
 }
 func (s *Store) Close() { s.pool.Close() }
 

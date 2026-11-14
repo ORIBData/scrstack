@@ -1,5 +1,7 @@
 # SCRS production gate status — 2026-11-12
 
+> **Historical record (2026-11-12).** The milestone status below is out of date: M2–M7 have since been delivered. Current status and remaining work are in the README roadmap and [PRODUCTION_READINESS_AUDIT.md](PRODUCTION_READINESS_AUDIT.md).
+
 **Latest implementation status:** see [PRD expansion audit](PRD_EXPANSION_AUDIT.md).
 It supersedes this report for malware, IOC, workflow ingress, retention and active
 automatic remediation. The evidence below records the earlier baseline.

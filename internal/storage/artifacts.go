@@ -198,3 +198,12 @@ func (a *Artifacts) GetQAReport(ctx context.Context, key string) ([]byte, error)
 	}
 	return data, nil
 }
+
+// DeleteObject removes an object retention purged. Only content-addressed
+// SBOM, snapshot, remediation and QA report keys may be deleted.
+func (a *Artifacts) DeleteObject(ctx context.Context, key string) error {
+	if !sbomKey.MatchString(key) && !snapshotKey.MatchString(key) && !planKey.MatchString(key) && !qaReportKey.MatchString(key) {
+		return errors.New("object key is not a purgeable artifact")
+	}
+	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})
+}

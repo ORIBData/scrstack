@@ -94,7 +94,7 @@ func (s *Store) CompletePlan(ctx context.Context, a Assessment, key, digest stri
 	if err != nil {
 		return err
 	}
-	if _, err := notify.Emit(ctx, tx, s.schema, "assessment.completed", Summary(done), done.Request.Notify); err != nil {
+	if _, err := notify.EmitScoped(ctx, tx, s.schema, "assessment.completed", Summary(done), done.Request.Notify, notify.Scope{Connection: done.ConnectionID}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

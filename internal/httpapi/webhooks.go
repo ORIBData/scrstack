@@ -24,8 +24,15 @@ import (
 // githubIngest normalizes direct and relay deliveries from GitHub and GitLab
 // into one path (ING-009, ING-011). Payload content is a hint: SCRS resolves
 // and fetches commits itself (TRG-003).
+//
+// Each connection has its own receiver, /ingest/<provider>/<connection>,
+// verified with that connection's webhook secret, and its events resolve only
+// to that connection's repositories. The shared receivers (/ingest/github,
+// /ingest/gitlab, /webhooks/github) remain for deployments that still set
+// SCRS_GITHUB_WEBHOOK_SECRET or SCRS_GITLAB_WEBHOOK_SECRET.
 type githubIngest struct {
 	store        *assessments.Store
+	hooks        webhookStore
 	secret       string
 	gitlabSecret string
 	remediation  bool
@@ -48,19 +55,51 @@ var webhookActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:github-webhook")
 var gitlabActor = uuid.NewSHA1(uuid.NameSpaceURL, []byte("scrs:gitlab-webhook"))
 
 // verifyGitHub checks X-Hub-Signature-256 over the exact raw body.
-func (g *githubIngest) verifyGitHub(r *http.Request, body []byte) bool {
+func verifyGitHub(r *http.Request, body []byte, secret string) bool {
 	header := r.Header.Get("X-Hub-Signature-256")
 	supplied, err := hex.DecodeString(strings.TrimPrefix(header, "sha256="))
-	mac := hmac.New(sha256.New, []byte(g.secret))
+	mac := hmac.New(sha256.New, []byte(secret))
 	_, _ = mac.Write(body)
 	return err == nil && strings.HasPrefix(header, "sha256=") && hmac.Equal(supplied, mac.Sum(nil))
 }
 
-// verifyGitLab compares X-Gitlab-Token with the configured shared secret.
-func (g *githubIngest) verifyGitLab(r *http.Request) bool {
-	supplied := sha256.Sum256([]byte(r.Header.Get("X-Gitlab-Token")))
-	expected := sha256.Sum256([]byte(g.gitlabSecret))
-	return hmac.Equal(supplied[:], expected[:])
+// sameSecret compares a supplied token with a secret in constant time.
+func sameSecret(supplied, secret string) bool {
+	a, b := sha256.Sum256([]byte(supplied)), sha256.Sum256([]byte(secret))
+	return hmac.Equal(a[:], b[:])
+}
+
+// verify checks a delivery with the provider's mechanism.
+func verify(provider string, r *http.Request, body []byte, secret string) bool {
+	if provider == "gitlab" {
+		return sameSecret(r.Header.Get("X-Gitlab-Token"), secret)
+	}
+	return verifyGitHub(r, body, secret)
+}
+
+var errNoWebhookSecret = errors.New("no webhook secret")
+
+// secretFor returns the secret that authenticates a delivery: the named
+// connection's, or the shared legacy secret on the shared receivers.
+func (g *githubIngest) secretFor(ctx context.Context, provider, connection string) (string, error) {
+	if connection == "" {
+		secret := g.secret
+		if provider == "gitlab" {
+			secret = g.gitlabSecret
+		}
+		if len(secret) < 32 {
+			return "", errNoWebhookSecret
+		}
+		return secret, nil
+	}
+	if g.hooks == nil {
+		return "", errNoWebhookSecret
+	}
+	_, secret, err := g.hooks.WebhookSecret(ctx, provider, connection)
+	if errors.Is(err, connections.ErrNotFound) {
+		return "", errNoWebhookSecret
+	}
+	return secret, err
 }
 
 // direct authenticates with the provider's own mechanism.
@@ -70,28 +109,41 @@ func (g *githubIngest) direct(provider string) http.Handler {
 			return
 		}
 		defer func() { <-g.slots }()
-		secret := g.secret
-		if provider == "gitlab" {
-			secret = g.gitlabSecret
+		connection := r.PathValue("connection")
+		// Unsigned deliveries are refused before any secret is looked up.
+		if connection != "" && r.Header.Get("X-Hub-Signature-256") == "" && r.Header.Get("X-Gitlab-Token") == "" {
+			writeError(w, 401, "invalid webhook signature")
+			return
 		}
-		if len(secret) < 32 {
-			writeError(w, 503, provider+" webhook authentication not configured")
+		lookup, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		secret, err := g.secretFor(lookup, provider, connection)
+		cancel()
+		switch {
+		case errors.Is(err, errNoWebhookSecret) && connection == "":
+			writeError(w, 503, provider+" webhook authentication not configured; give the connection a webhook secret and use /ingest/"+provider+"/<connection>")
+			return
+		case errors.Is(err, errNoWebhookSecret):
+			// An unknown, disabled or unconfigured connection looks like a
+			// bad signature, so the receiver does not reveal which exist.
+			writeError(w, 401, "invalid webhook signature")
+			return
+		case err != nil:
+			writeError(w, 503, "webhook authentication unavailable")
 			return
 		}
 		body, ok := g.read(w, r)
 		if !ok {
 			return
 		}
-		valid := g.verifyGitHub(r, body)
 		actor, actorName := webhookActor, "github-webhook"
 		if provider == "gitlab" {
-			valid, actor, actorName = g.verifyGitLab(r), gitlabActor, "gitlab-webhook"
+			actor, actorName = gitlabActor, "gitlab-webhook"
 		}
-		if !valid {
+		if !verify(provider, r, body, secret) {
 			writeError(w, 401, "invalid webhook signature")
 			return
 		}
-		g.process(w, r, body, provider, "direct", actor, actorName)
+		g.process(w, r, body, provider, "direct", actor, actorName, connection)
 	})
 }
 
@@ -114,24 +166,24 @@ func (g *githubIngest) relay(provider string) http.Handler {
 		if !ok {
 			return
 		}
-		forwarded, secret := r.Header.Get("X-Hub-Signature-256") != "", g.secret
+		connection := r.PathValue("connection")
+		forwarded := r.Header.Get("X-Hub-Signature-256") != ""
 		if provider == "gitlab" {
-			forwarded, secret = r.Header.Get("X-Gitlab-Token") != "", g.gitlabSecret
+			forwarded = r.Header.Get("X-Gitlab-Token") != ""
 		}
 		// The relay token already authenticates the caller. When SCRS also
 		// holds the provider secret, a forwarded signature must be valid; with
 		// no secret configured it cannot be checked and is ignored.
-		if forwarded && len(secret) >= 32 {
-			valid := g.verifyGitHub(r, body)
-			if provider == "gitlab" {
-				valid = g.verifyGitLab(r)
-			}
-			if !valid {
-				writeError(w, 401, "invalid forwarded provider signature")
-				return
-			}
+		secret, err := g.secretFor(r.Context(), provider, connection)
+		if err != nil && !errors.Is(err, errNoWebhookSecret) {
+			writeError(w, 503, "webhook authentication unavailable")
+			return
 		}
-		g.process(w, r, body, provider, "relay", principal.ID, principal.Name)
+		if forwarded && err == nil && !verify(provider, r, body, secret) {
+			writeError(w, 401, "invalid forwarded provider signature")
+			return
+		}
+		g.process(w, r, body, provider, "relay", principal.ID, principal.Name, connection)
 	})
 }
 
@@ -211,7 +263,7 @@ type githubPayload struct {
 	} `json:"organization"`
 }
 
-func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []byte, provider, mode string, actor uuid.UUID, actorName string) {
+func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []byte, provider, mode string, actor uuid.UUID, actorName, connection string) {
 	var delivery string
 	var event string
 	var p githubPayload
@@ -344,6 +396,8 @@ func (g *githubIngest) process(w http.ResponseWriter, r *http.Request, body []by
 		writeJSON(w, 200, map[string]any{"status": statusFor(event, p), "integrity_signals": recorded})
 		return
 	}
+	// A per-connection receiver only reaches that connection's repositories.
+	request.Connection = connection
 	request.Trigger.Origin = provider + "_" + mode
 	request.Trigger.Event = event
 	request.Trigger.DeliveryID = delivery

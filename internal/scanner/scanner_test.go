@@ -141,11 +141,11 @@ func TestFeedFreshness(t *testing.T) {
 	}
 }
 func TestScannerProgressPathsAreNotProblems(t *testing.T) {
-	benign := "Scanning dir /work/scrs-scan-1/checkout\nScanned /work/scrs-scan-1/checkout/packages/error-pages/package-lock.json file and found 12 packages\nScanned /work/x/warnings/go.mod file and found 1 package\n"
+	benign := "Scanning dir /work/scrs-scan-1/checkout\nScanned /work/scrs-scan-1/checkout/packages/error-pages/package-lock.json file and found 12 packages\nScanned /work/x/warnings/go.mod file and found 1 package\nFailed to parse package URL: unable to determine purl type of libgpg-error@1.46-1 (Debian:12)\n"
 	if reportsProblem(benign) {
 		t.Fatal("repository path text treated as scanner problem")
 	}
-	for _, bad := range []string{benign + "Error during extraction of yarn.lock\n", "Warning: lockfile could not be parsed\n"} {
+	for _, bad := range []string{benign + "Error during extraction of yarn.lock\n", "Warning: lockfile could not be parsed\n", "Failed to parse package URL: unable to determine purl type of x (Debian:12)\nerror: layer truncated\n"} {
 		if !reportsProblem(bad) {
 			t.Fatalf("scanner problem ignored: %q", bad)
 		}

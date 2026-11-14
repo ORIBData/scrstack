@@ -21,9 +21,28 @@ import (
 // Header" setting; Docker Hub and GAR Pub/Sub cannot set headers and reach
 // SCRS through n8n. Each pushed manifest becomes one image assessment, pinned
 // to the pushed digest when the registry reports it.
+//
+// A registry connection's own receiver, /ingest/registry/<provider>/<name>,
+// takes that connection's webhook secret instead of an API token: as
+// "Authorization: Bearer <secret>" (Harbor's Auth Header, OCI Distribution
+// notification headers), X-SCRS-Webhook-Token, or a token query parameter
+// for Docker Hub and Pub/Sub push, which cannot send headers. Its pushes
+// resolve only to that connection's images.
 type registryIngest struct {
 	store        *assessments.Store
 	relayEnabled bool
+	hooks        webhookStore
+}
+
+// connectionToken reads the secret a registry sent with a delivery.
+func connectionToken(r *http.Request) string {
+	if token := r.Header.Get("X-SCRS-Webhook-Token"); token != "" {
+		return token
+	}
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	}
+	return r.URL.Query().Get("token")
 }
 
 type imagePush struct {
@@ -35,11 +54,41 @@ type imagePush struct {
 var errRegistryProvider = errors.New("unsupported registry provider")
 
 func (h registryIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !h.relayEnabled {
-		writeError(w, 503, "relay ingestion disabled; set SCRS_RELAY_ENABLED=true")
-		return
+	provider, connection := r.PathValue("provider"), r.PathValue("connection")
+	var actor connections.Token
+	if connection != "" {
+		w.Header().Set("Cache-Control", "no-store")
+		if h.hooks == nil {
+			writeError(w, 503, "webhook authentication unavailable")
+			return
+		}
+		token := connectionToken(r)
+		if token == "" {
+			writeError(w, 401, "invalid webhook token")
+			return
+		}
+		lookup, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		c, secret, err := h.hooks.WebhookSecret(lookup, provider, connection)
+		cancel()
+		switch {
+		case errors.Is(err, connections.ErrNotFound):
+			writeError(w, 401, "invalid webhook token")
+			return
+		case err != nil:
+			writeError(w, 503, "webhook authentication unavailable")
+			return
+		case !sameSecret(token, secret):
+			writeError(w, 401, "invalid webhook token")
+			return
+		}
+		actor = connections.Token{ID: c.ID, Name: "registry:" + c.Name}
+	} else {
+		if !h.relayEnabled {
+			writeError(w, 503, "relay ingestion disabled; set SCRS_RELAY_ENABLED=true")
+			return
+		}
+		actor = r.Context().Value(principalKey{}).(connections.Token)
 	}
-	provider := r.PathValue("provider")
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		writeError(w, 413, "webhook payload limit exceeded")
@@ -60,7 +109,6 @@ func (h registryIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "registry event lists more than 50 images")
 		return
 	}
-	principal := r.Context().Value(principalKey{}).(connections.Token)
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 	// Registries do not send a stable delivery id; the body digest is one, so
@@ -70,10 +118,14 @@ func (h registryIngest) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	queued := 0
 	for i, push := range pushes {
 		item := map[string]any{"locator": push.Locator, "tag": push.Tag, "digest": push.Digest}
-		req := assessments.Request{Target: assessments.Target{Type: "image", Repository: push.Locator, Ref: push.Tag, Commit: push.Digest}}
+		req := assessments.Request{Connection: connection, Target: assessments.Target{Type: "image", Repository: push.Locator, Ref: push.Tag, Commit: push.Digest}}
 		req.Trigger.Origin, req.Trigger.Event = "registry_"+provider, "push"
 		req.Trigger.DeliveryID = key + ":" + strconv.Itoa(i)
-		a, replay, err := h.store.EnqueueEvent(ctx, req, principal.ID, principal.Name, req.Trigger.DeliveryID, body, "relay", "registry:"+provider)
+		mode := "relay"
+		if connection != "" {
+			mode = "direct"
+		}
+		a, replay, err := h.store.EnqueueEvent(ctx, req, actor.ID, actor.Name, req.Trigger.DeliveryID, body, mode, "registry:"+provider)
 		switch {
 		case errors.Is(err, assessments.ErrScope):
 			item["status"] = "ignored_out_of_scope"
