@@ -461,3 +461,26 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 	}
 	return result, nil
 }
+
+// Seal encrypts a secret held by another store (for example TAXII feed
+// credentials) with SCRS_MASTER_KEY. aad binds it to its owner, so a sealed
+// value cannot be moved to another record.
+func (s *Store) Seal(plain, aad []byte) ([]byte, error) {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return s.aead.Seal(nonce, nonce, plain, aad), nil
+}
+
+// Unseal reverses Seal with the same aad.
+func (s *Store) Unseal(sealed, aad []byte) ([]byte, error) {
+	if len(sealed) < s.aead.NonceSize() {
+		return nil, errors.New("sealed secret invalid")
+	}
+	plain, err := s.aead.Open(nil, sealed[:s.aead.NonceSize()], sealed[s.aead.NonceSize():], aad)
+	if err != nil {
+		return nil, errors.New("sealed secret decryption failed; check SCRS_MASTER_KEY")
+	}
+	return plain, nil
+}

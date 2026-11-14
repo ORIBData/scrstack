@@ -148,6 +148,7 @@ outages never block scanning; the previous copy is carried forward.
 | `SCRS_RELAY_ENABLED` | API | Accept n8n relay deliveries on `/scrs/v1/ingest/github` |
 | `SCRS_PUBLIC_BASE_URL` | API, worker | Absolute links in webhook payloads; deployment acceptance |
 | `SCRS_WEBHOOK_PRIVATE_HOSTS` | API, worker | Hostnames allowed as http or private-address webhook targets |
+| `SCRS_TAXII_PRIVATE_HOSTS` | API, worker | TAXII server hostnames allowed to resolve to private addresses, such as an OpenCTI on the same network |
 | `SCRS_EVENT_MAX_BYTES`, `SCRS_EVENT_FIELD_MAX`, `SCRS_EVENT_REDACT` | API, worker | Context-document limits and JSON Pointer redaction |
 | `SCRS_MASS_DELETION_FILES` | API | Mass-deletion alert threshold (default 50 files) |
 | `SCRS_MAX_IMAGE_BYTES`, `SCRS_SCANNER_MEMORY` | worker, scanner | Image size cap (400 MiB) and scanner memory (3 GiB) |
@@ -201,6 +202,7 @@ for n8n Header Auth.
 | `SCRS_GITLAB_WEBHOOK_SECRET` | API | GitLab webhook secret token (32+ characters); also verifies relayed GitLab events |
 | `SCRS_YARA_BINARY` | API, scanner | YARA-X CLI used to validate and run YARA rulesets (default `/usr/local/bin/yr`, shipped in the image) |
 | `SCRS_GITHUB_HOOK_CHECK_MINUTES` | worker | GitHub webhook delivery check interval (default 5; 0 disables). GitHub never retries a failed delivery, so the worker reads SCRS's webhook delivery log, requests redelivery of missed events and reports hook misconfiguration at `GET /system/github-webhooks` |
+| `SCRS_TAXII_POLL_SECONDS` | worker | How often the worker checks for due TAXII feeds (default 60; 0 disables polling). Each feed has its own `interval_minutes` |
 | `SCRS_GITHUB_HOOK_URL` | worker | Public URL of the GitHub webhook when it is not an SCRS path (for example an n8n relay); by default any hook ending in `/scrs/v1/webhooks/github` or `/scrs/v1/ingest/github` is checked |
 | `SCRS_MIRRORS_ENABLED` | worker | Run the mirror queue (default `true`) |
 | `SCRS_MIRROR_INTERVAL_HOURS` | worker | Mirror assets labelled `mirror=true` on this interval; 0 = on demand only |
@@ -222,3 +224,73 @@ assessment. A Harbor push queued a digest-pinned image assessment. A Trivy
 import completed with its verdict. A mirror request reached github.com and was
 recorded as failed with a clear `HTTP 401`, because the test used a synthetic
 token.
+
+## E2E QA (Karate) additions
+
+Tables `llm_providers`, `qa_profiles`, `qa_runs`, `qa_scenarios`, `qa_generations`
+and `qa_suites` are created by `scrs-storage-init`. All changes are additive.
+
+**Two images, one stack.** The repository builds two images:
+- **SCRS:** `deploy/Dockerfile.scrs`, published with `make release`.
+- **The Karate runner:** `deploy/karate-runner/Dockerfile`, published with
+  `make release-qa-runner SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}`.
+  It builds for amd64 and arm64.
+
+`deploy/compose.dokploy.yaml` deploys both in the same Dokploy stack:
+
+| Service | Image | Private address | Public URL (Traefik, TLS) |
+| --- | --- | --- | --- |
+| `scrs-api` | `SCRS_IMAGE` | `http://scrs-api:7000` | `https://${SCRS_DOMAIN}/scrs/v1` |
+| `scrs-qa-runner` | `SCRS_QA_RUNNER_IMAGE` | `http://scrs-qa-runner:8090` | `https://${SCRS_QA_DOMAIN}`, limited to `SCRS_QA_RUNNER_ALLOWED_CIDRS` |
+
+How the two services connect:
+- **Private path.** The API and worker reach the runner over the stack's internal
+  `qa` network (`SCRS_QA_RUNNER_URL=http://scrs-qa-runner:8090`). QA traffic never
+  leaves the host or passes through Traefik.
+- **Public router.** Traefik gives the runner its own router (`SCRS_QA_ROUTER_NAME`),
+  certificate and hostname, with an http→https redirect. Every call also needs the
+  runner's bearer token.
+- **Allowlist.** The default `SCRS_QA_RUNNER_ALLOWED_CIDRS=127.0.0.1/32` lets nobody
+  in from outside. Add the CIDRs of tools that should call the runner directly.
+- **Ports.** Each service has its own container port (7000 and 8090), and both are
+  published on 443 by hostname. Neither binds a host port.
+- **DNS.** Create a record for `SCRS_QA_DOMAIN` pointing at the VPS.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_QA_RUNNER_IMAGE` | runner | Published runner image reference |
+| `SCRS_QA_RUNNER_TOKEN` | API, worker, runner | Shared bearer token (32+ characters) |
+| `SCRS_QA_DOMAIN`, `SCRS_QA_ROUTER_NAME` | runner | Runner hostname and Traefik router name (default `scrs-qa`) |
+| `SCRS_QA_RUNNER_ALLOWED_CIDRS` | runner | Client CIDRs allowed through Traefik (default `127.0.0.1/32`, nobody) |
+| `SCRS_QA_RUNNER_SLOTS`, `SCRS_QA_RUNNER_MEMORY`, `SCRS_QA_RUNNER_WORK_SIZE` | runner | Parallel jobs (default 1), memory limit (3g) and job tmpfs (2g) |
+| `SCRS_QA_RUNNER_URL`, `SCRS_QA_RUNNER_ALLOW_HTTP` | API, worker | Default to the private runner; set an https URL and `false` for a runner on another host |
+| `SCRS_QA_RUNNER_CA_FILE` | API, worker | PEM file trusted for a privately issued runner certificate |
+| `SCRS_QA_MAX_ACTIVE` | worker | Runs on the runner at once (default 4) |
+| `SCRS_QA_GENERATION_ENABLED` | worker | `false` disables LLM test generation |
+| `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Self-hosted model hosts (Ollama, vLLM) allowed to resolve privately and use http |
+
+**Runner isolation in the shared stack.** The runner executes repository test code on
+the same host as SCRS.
+- **What protects SCRS:**
+  - The runner has no SCRS secrets, and its tests run as uid 10001 without the runner token.
+  - The container keeps six capabilities and a read-only root filesystem.
+  - It is not on the stack's `default` network.
+- **What it can still reach:**
+  - It joins `dokploy-network`, because Traefik routes to it there and that network
+    gives it internet access to your staging URLs. So it can also reach every other
+    container attached to `dokploy-network`.
+  - It can reach the host's published ports.
+- **Actions:**
+  - Keep databases and admin services off `dokploy-network`, or protect them with credentials.
+  - Block cloud metadata (`169.254.169.254`) for the runner on the host firewall.
+- **Check from inside the runner** that it cannot reach your database or Redis:
+  `docker exec <runner> curl -m 3 telnet://<db-host>:5432` should fail.
+
+For a hard boundary, run `deploy/compose.qa-runner.yaml` on a separate VM instead, and
+point `SCRS_QA_RUNNER_URL` at its https URL. No other change is needed.
+
+**Outbound access** from `scrs-worker` also includes the inference URLs of the LLM
+providers you add, such as `api.openai.com`, `api.anthropic.com` and
+`generativelanguage.googleapis.com`. The API calls a provider too when an admin runs
+`POST /llm/providers/{id}:test`. Report archives are stored in the existing bucket
+under `qa/`. See [QA_TESTING.md](QA_TESTING.md).

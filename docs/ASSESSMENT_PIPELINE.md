@@ -22,6 +22,13 @@ routes. Database migration `2026111204` is additive and runs through `scrs init`
    and asset eligibility again. Cancelled or stale workers cannot publish findings.
 7. Read results through `/assessments/{id}`, `/components`, `/findings`, `/sbom`, and
    `/report`. The register at `/register` retains findings across assessments.
+8. When the repository has an enabled QA profile covering the ref, the completion
+   transaction also queues an E2E QA run (Karate). A commit whose verdict is `fail` is
+   recorded as a `skipped` run and never sent to the runner. The worker sends the
+   commit's Karate suites to the operator's runner, polls it and records scenarios,
+   API coverage and report-only `qa_*` findings; QA never changes the verdict. A
+   complete scan of a repository with an OpenAPI document but no profile raises a
+   report-only `qa_unconfigured` finding. See [QA_TESTING.md](QA_TESTING.md).
 
 Example body for `POST /scrs/v1/assessments`:
 
@@ -242,8 +249,9 @@ mode (`hunt`, `alert` or `block`), severity and minimum confidence; see
 unexpired indicators of every enabled source. `PUT /feeds/indicators` still activates an
 immutable version of up to 10,000 indicators, keeps prior versions and audit history,
 and feeds the block-mode `bundle` source. Text matching (domains, IPv4, URLs, content
-patterns) is capped at 1 MiB per file; skipped text means partial coverage. STIX upload
-and TAXII polling are being built. Workflow `toJSON(secrets)` matches are critical; changes to workflow
+patterns) is capped at 1 MiB per file; skipped text means partial coverage. STIX 2.1
+bundles can be uploaded into `stix` sources, and `taxii` sources poll a TAXII 2.1
+collection from the worker. Workflow `toJSON(secrets)` matches are critical; changes to workflow
 file hashes compared with the prior assessment raise high-severity integrity entries.
 This is a change baseline, not a last-known-good declaration.
 

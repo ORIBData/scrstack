@@ -14,7 +14,9 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
+	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/scanner"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/ORIBData/scrstack/internal/worker"
@@ -211,8 +213,57 @@ func pipelineCommand() error {
 		if hookCheck > 0 {
 			go w.CheckGitHubHooks(ctx, hookCheck, os.Getenv("SCRS_GITHUB_HOOK_URL"))
 		}
+		taxiiPoll := time.Minute
+		if seconds, err := strconv.Atoi(os.Getenv("SCRS_TAXII_POLL_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {
+			taxiiPoll = time.Duration(seconds) * time.Second
+		}
+		if taxiiPoll > 0 {
+			w.TAXIIPrivateHosts = netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS"))
+			yara := setting("SCRS_YARA_BINARY", "/usr/local/bin/yr")
+			w.ValidateRules = func(ctx context.Context, rules string) error {
+				_, err := scanner.ValidateRules(ctx, yara, os.TempDir(), rules)
+				return err
+			}
+			go w.PollTAXII(ctx, taxiiPoll)
+		}
+		// E2E QA: runs need the Karate runner; generation needs only an LLM
+		// provider configured through the API.
+		runner, err := qaRunnerFromEnv()
+		if err != nil {
+			return err
+		}
+		w.LLMPrivateHosts = netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS"))
+		if runner != nil {
+			w.QARunner, w.QAReports = runner, artifacts
+			w.QAMaxActive = 4
+			if active, err := strconv.Atoi(os.Getenv("SCRS_QA_MAX_ACTIVE")); err == nil && active > 0 && active <= 64 {
+				w.QAMaxActive = active
+			}
+			go w.RunQA(ctx)
+		}
+		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
+			go w.RunGenerations(ctx)
+		}
 		go w.Maintain(ctx, time.Hour, rescan, mirror)
 		return w.Run(ctx)
 	}
 	return errors.New("unknown pipeline command")
+}
+
+// qaRunnerFromEnv returns the Karate runner client, or nil when
+// SCRS_QA_RUNNER_URL is unset (QA runs stay queued).
+func qaRunnerFromEnv() (*qa.Runner, error) {
+	raw := os.Getenv("SCRS_QA_RUNNER_URL")
+	if raw == "" {
+		return nil, nil
+	}
+	var ca string
+	if file := os.Getenv("SCRS_QA_RUNNER_CA_FILE"); file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, errors.New("SCRS_QA_RUNNER_CA_FILE unreadable")
+		}
+		ca = string(data)
+	}
+	return qa.NewRunner(raw, os.Getenv("SCRS_QA_RUNNER_TOKEN"), ca, os.Getenv("SCRS_QA_RUNNER_ALLOW_HTTP") == "true")
 }

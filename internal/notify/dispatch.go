@@ -11,15 +11,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/google/uuid"
 )
 
@@ -50,32 +48,6 @@ func Verify(secret string, body []byte, header string) bool {
 	return hmac.Equal([]byte(Sign(secret, body)), []byte(header))
 }
 
-// Special-purpose ranges that are not reachable public destinations
-// (RFC 6890): "this network", carrier-grade NAT, IETF protocol assignments,
-// benchmarking, reserved, and NAT64 (which can front private IPv4).
-var nonPublic = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("64:ff9b::/96"),
-}
-
-func publicIP(ip net.IP) bool {
-	addr, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return false
-	}
-	addr = addr.Unmap()
-	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsMulticast() {
-		return false
-	}
-	for _, p := range nonPublic {
-		if p.Contains(addr) {
-			return false
-		}
-	}
-	return true
-}
-
 // Retry delay after a failed attempt: 30s doubling, capped at one hour.
 func backoff(attempt int) time.Duration {
 	if attempt < 1 {
@@ -101,26 +73,9 @@ type Dispatcher struct {
 // SafeClient connects only to addresses it validated itself, so DNS cannot
 // rebind a public name to an internal service between check and connect.
 func (s *Store) SafeClient() *http.Client {
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	transport := &http.Transport{
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, err
-			}
-			ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
-			if err != nil || len(ips) == 0 {
-				return nil, errors.New("destination unresolvable")
-			}
-			private := s.PrivateHosts[strings.ToLower(host)]
-			for _, ip := range ips {
-				if !private && !publicIP(ip) {
-					return nil, errors.New("destination address not permitted")
-				}
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))
-		},
+		Proxy:                 nil,
+		DialContext:           netguard.DialContext(s.PrivateHosts),
 		TLSHandshakeTimeout:   5 * time.Second,
 		ResponseHeaderTimeout: 10 * time.Second,
 		MaxIdleConns:          8,

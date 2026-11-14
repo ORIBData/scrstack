@@ -1,0 +1,32 @@
+          waiting:         0 / active:         0  / done:         2
+========================================================================================================================
+
+Parsing log file(s)...
+Parsing log file(s) done in 0s.
+Generating reports...
+
+========================================================================================================================
+---- Global Information -------------------------------------------------------------|---Total---|-----OK----|----KO----
+> request count                                                                      |       322 |         - |       322
+> min response time (ms)                                                             |         0 |         - |         0
+> max response time (ms)                                                             |        32 |         - |        32
+> mean response time (ms)                                                            |         2 |         - |         2
+> response time std deviation (ms)                                                   |         2 |         - |         2
+> response time 50th percentile (ms)                                                 |         1 |         - |         1
+> response time 75th percentile (ms)                                                 |         2 |         - |         2
+> response time 95th percentile (ms)                                                 |         4 |         - |         4
+> response time 99th percentile (ms)                                                 |         7 |         - |         7
+> mean throughput (rps)                                                              |    107.33 |         - |    107.33
+---- Response Time Distribution ----------------------------------------------------------------------------------------
+> OK: t < 800 ms                                                                                              0     (0%)
+> OK: 800 ms <= t < 1200 ms                                                                                   0     (0%)
+> OK: t >= 1200 ms                                                                                            0     (0%)
+> KO                                                                                                        322   (100%)
+---- Errors ------------------------------------------------------------------------------------------------------------
+> /work/job/tests/loadfail.feature:7 Then status 200 - expected status: 200, actual: 404     322   (100%)
+ Then status 200 - expected sta
+========================================================================================================================
+
+Reports generated, please open the following file: file:///work/job/gatling-out2/loadsimulation-20261114160325314/index.html
+Global: 95th percentile of response time is less than 1.0 : false (actual : 4.0)
+Global: percentage of failed events is less than or equal to 1.0 : false (actual : 100.0)

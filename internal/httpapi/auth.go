@@ -15,6 +15,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/notify"
+	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -47,6 +48,16 @@ type Security struct {
 	GitHubHooks connections.HookAPI
 	// ValidateRules overrides the YARA-X compiler; tests only.
 	ValidateRules RuleValidator
+	// Secrets seals TAXII credentials; when nil, the connection store is used.
+	Secrets Sealer
+	// TAXIIPrivateHosts may resolve to private addresses (SCRS_TAXII_PRIVATE_HOSTS).
+	TAXIIPrivateHosts map[string]bool
+	// QAReports opens stored Karate reports; QARunner, when set, answers
+	// GET /qa/runner. LLMPrivateHosts may resolve to private addresses
+	// (SCRS_LLM_PRIVATE_HOSTS, self-hosted models).
+	QAReports       QAReportReader
+	QARunner        *qa.Runner
+	LLMPrivateHosts map[string]bool
 }
 
 var tokenWindow = redis.NewScript(`
@@ -122,11 +133,16 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		if validate == nil {
 			validate = yaraValidator()
 		}
-		rules := security.protect("read|write", ruleHandler{store: security.Assessments, validate: validate, compiles: make(chan struct{}, 2)})
+		compiles := make(chan struct{}, 2)
+		rules := security.protect("read|write", ruleHandler{store: security.Assessments, validate: validate, compiles: compiles})
 		for _, path := range []string{"/intel/yara-rulesets", "/intel/yara-rulesets:validate", "/intel/yara-rulesets/"} {
 			mux.Handle(BasePath+path, rules)
 		}
-		sources := security.protect("read|write", sourceHandler{store: security.Assessments})
+		secrets := security.Secrets
+		if sealer, ok := store.(Sealer); ok && secrets == nil {
+			secrets = sealer
+		}
+		sources := security.protect("read|write", sourceHandler{store: security.Assessments, validate: validate, compiles: compiles, secrets: secrets, taxiiHosts: security.TAXIIPrivateHosts})
 		mux.Handle(BasePath+"/intel/indicator-sources", sources)
 		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
 		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}", security.protect("ingest:relay", registryIngest{store: security.Assessments, relayEnabled: security.RelayEnabled}))
@@ -182,6 +198,21 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/assets/{id}/mirrors/{mirror}/bundle", security.protect("admin", mirrors))
 		mux.Handle(BasePath+"/register", security.protect("read|write", h))
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
+		// E2E QA (Karate) and the LLM providers that draft tests.
+		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner}
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/profile", security.protect("read|write", qaH))
+		mux.Handle("PUT "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
+		mux.Handle("DELETE "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/runs", security.protect("read|write", qaH))
+		mux.Handle("POST "+BasePath+"/assets/{id}/qa/runs", security.protect("write|trigger", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/coverage", security.protect("read|write", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/generations", security.protect("read|write", qaH))
+		mux.Handle("POST "+BasePath+"/assets/{id}/qa/generations", security.protect("write", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write", qaH))
+		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger", qaH))
+		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger", qaH))
+		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts})
+		mux.Handle(BasePath+"/llm/", models)
 	}
 	return security.observe(m, security.cors(mux))
 }

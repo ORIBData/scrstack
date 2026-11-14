@@ -60,5 +60,11 @@ unset dockerhub_pat
 
 image="$SCRS_IMAGE"
 echo "Publishing ${image} for ${PLATFORMS}"
-"$DOCKER" buildx build --platform "$PLATFORMS" -f deploy/Dockerfile.scrs -t "$image" --sbom=true --provenance=mode=max --push .
+# SCRS_DOCKERFILE selects the image: SCRS (default) or the Karate runner.
+dockerfile=${SCRS_DOCKERFILE:-deploy/Dockerfile.scrs}
+case "$dockerfile" in
+  deploy/Dockerfile.scrs|deploy/karate-runner/Dockerfile) ;;
+  *) echo 'SCRS_DOCKERFILE must be deploy/Dockerfile.scrs or deploy/karate-runner/Dockerfile' >&2; exit 2 ;;
+esac
+"$DOCKER" buildx build --platform "$PLATFORMS" -f "$dockerfile" -t "$image" --sbom=true --provenance=mode=max --push .
 echo "Published ${image}"

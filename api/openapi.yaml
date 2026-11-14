@@ -72,6 +72,10 @@ tags:
     description: Versioned indicator-of-compromise bundles (admin).
   - name: Operations
     description: Maintenance, inbound event log and retention (admin).
+  - name: E2E QA
+    description: Karate API, integration, UI and load testing of each assessed repository against its deployed environment, with API coverage, report-only findings and LLM-drafted tests.
+  - name: LLM providers
+    description: Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests (admin).
 paths:
   # ---------------------------------------------------------------- System
   /system/healthz:
@@ -1440,6 +1444,8 @@ paths:
         Creates an empty source; import indicators next. New sources default to mode `hunt`: matches are recorded as `ioc_hunt`
         findings and never change a verdict. Scope `write` for `hunt`; `admin` to create in `alert` (`ioc_alert` findings gate
         by the source severity like vulnerabilities) or `block` (`ioc_match`, any match fails the assessment like malware).
+        Sources of kind `taxii` poll a TAXII 2.1 collection and need `admin` for every change; give their settings and
+        credential in `taxii`. The credential is encrypted with `SCRS_MASTER_KEY` and never returned.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/IndicatorSourceInput'}}}
@@ -1529,6 +1535,103 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '422': {description: Enabled sources would exceed the scan bundle limit, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:import-stix:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Threat intelligence]
+      operationId: importSTIXBundle
+      summary: Upload a STIX 2.1 bundle
+      description: |
+        For sources of kind `stix`. Indicator objects whose patterns can be checked against files at rest become indicators:
+        `file:hashes` (MD5, SHA-1, SHA-256), `file:name`, `domain-name:value`, `ipv4-addr:value` (single addresses) and
+        `url:value`, compared with `=` or `IN`. Alternatives joined by OR are imported separately; in an AND with a file hash,
+        the hash is used. `pattern_type: yara` patterns are compiled into the ruleset `stix_<source>`, which follows the
+        source's mode, severity and enabled flag and is rebuilt on every upload. Everything else (patterns that join
+        observations, time windows, network traffic and other runtime objects, other pattern types, revoked and expired
+        indicators) is counted in the report by reason. Without `merge`, the upload replaces all the source's indicators;
+        with `merge=true` it replaces only what the bundle's indicator objects produced before, so revoked objects are
+        removed. Max 32 MiB, 50000 indicators and 200 YARA patterns. `taxii` sources also accept uploads, for a backfill
+        from an export. `write` for `hunt` sources of kind `stix`, otherwise `admin`.
+      parameters:
+        - {name: merge, in: query, schema: {type: boolean, default: false}}
+        - {name: valid_days, in: query, description: Expiry for indicators without valid_until, schema: {type: integer, minimum: 1, maximum: 3650, default: 180}}
+      requestBody:
+        required: true
+        content:
+          application/stix+json: {schema: {$ref: '#/components/schemas/STIXBundle'}}
+          application/json: {schema: {$ref: '#/components/schemas/STIXBundle'}}
+      responses:
+        '200': {description: Imported, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/STIXImportResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: The source is not of kind stix, or another ruleset has the name stix_<source>, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '413': {description: Bundle too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: The combined YARA patterns do not compile, or a scan limit would be exceeded, content: {application/json: {schema: {$ref: '#/components/schemas/RuleCompileError'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}/taxii:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    get:
+      tags: [Threat intelligence]
+      operationId: getTAXIIFeed
+      summary: TAXII feed settings and poll state
+      description: Settings, cursor and the last poll's outcome of a `taxii` source. The credential is never returned. Scope `read` or `write`.
+      responses:
+        '200': {description: Feed, content: {application/json: {schema: {$ref: '#/components/schemas/TAXIIFeed'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [Threat intelligence]
+      operationId: updateTAXIIFeed
+      summary: Change a TAXII feed
+      description: |
+        Changes settings; omitted fields are unchanged. Any credential field (`api_key`, `username`, `password`, `cert_pem`,
+        `key_pem`) replaces the whole credential, so send all the parts the feed needs. A new `api_root` or `collection`, or
+        `reset_cursor`, restarts from the beginning of the collection. The next poll is due at once. Scope `admin`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TAXIIFeedInput'}}}
+      responses:
+        '200': {description: Updated, content: {application/json: {schema: {$ref: '#/components/schemas/TAXIIFeed'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:poll:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Threat intelligence]
+      operationId: pollTAXIIFeed
+      summary: Poll a TAXII feed now
+      description: Makes the feed due; the worker polls it within `SCRS_TAXII_POLL_SECONDS`. Scope `admin`.
+      responses:
+        '202': {description: Queued, content: {application/json: {schema: {type: object, properties: {queued: {type: boolean}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /intel/indicator-sources/{id}:test:
+    parameters:
+      - $ref: '#/components/parameters/Id'
+    post:
+      tags: [Threat intelligence]
+      operationId: testTAXIIFeed
+      summary: Check a TAXII feed's settings
+      description: Reads the collection resource with the stored URL, credential and certificates, and reports whether the collection can be read. Scope `admin`.
+      responses:
+        '200': {description: Reached, content: {application/json: {schema: {type: object, properties: {ok: {type: boolean, description: The collection allows reading}, collection: {type: object, properties: {id: {type: string}, title: {type: string}, can_read: {type: boolean}, can_write: {type: boolean}}}}}}}}
+        '502': {description: The server could not be reached or refused the request, content: {application/json: {schema: {type: object, properties: {ok: {type: boolean}, error: {type: string}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1694,6 +1797,395 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- E2E QA (Karate)
+  /assets/{id}/qa/profile:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: getQAProfile
+      summary: Get a repository's QA profile
+      description: The Karate settings of a GitHub or GitLab asset. Variable values are write-only; `variable_names` lists them. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
+      responses:
+        '200': {description: Profile, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/QAProfile'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [E2E QA]
+      operationId: putQAProfile
+      summary: Create or replace a repository's QA profile
+      description: |
+        Sets where QA runs test (`base_url`, a deployed staging or preview environment), which Karate suites run (`test_path` in the repository, `tags`), the secrets the tests receive as `QA_<NAME>` environment variables, an optional load profile and the LLM provider that drafts tests. Omitted fields take defaults; omitting `variables` keeps the stored ones. Replacing an existing profile needs `If-Match`. With `auto_run`, every successful assessment of a matching ref queues a functional run. Scope `admin`, because the runner calls `base_url` with these secrets.
+      parameters: [{name: If-Match, in: header, schema: {type: string}, description: 'Required when the profile exists: its ETag revision'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/QAProfileInput'}, examples: {staging: {value: {base_url: 'https://api.staging.example.com', environment: staging, refs: [main, 'release/*'], test_path: karate, openapi_path: api/openapi.yaml, variables: {API_TOKEN: '…'}, auth: {header: Authorization, variable: API_TOKEN, prefix: 'Bearer '}, perf: {features: [perf/browse.feature], users: 20, ramp_seconds: 30, duration_seconds: 120, p95_millis: 800, max_error_percent: 1, auto_run: false}}}}}}}
+      responses:
+        '201': {description: Created, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/QAProfile'}}}}
+        '200': {description: Replaced, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/QAProfile'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {description: Not an in-scope GitHub or GitLab repository, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '503': {description: Secret encryption unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [E2E QA]
+      operationId: deleteQAProfile
+      summary: Remove a repository's QA profile
+      description: Stops automatic QA runs for the asset. Past runs, reports, findings and generated suites are kept. Scope `admin`.
+      responses:
+        '204': {description: Removed}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/qa/runs:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: listQARuns
+      summary: List a repository's QA runs
+      description: The 50 newest runs, newest first. Page with `before` set to the previous response's `next_before`. Scope `read` or `write`.
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [functional, performance]}}
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/QARunStatus'}}
+        - {name: before, in: query, schema: {type: string, format: date-time}}
+      responses:
+        '200': {description: Runs, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QARun'}}, next_before: {type: string}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [E2E QA]
+      operationId: createQARun
+      summary: Run QA tests now
+      description: Queues a functional or performance run of the latest successful git assessment of the asset, or of `assessment_id`. A commit whose verdict is `fail` is never sent to the runner. `include_drafts` also runs draft generated features (admin only). Scope `write` or `trigger`.
+      requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QARunRequest'}}}}
+      responses:
+        '202': {description: Queued, headers: {Location: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/QARun'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: No enabled profile, no successful assessment, or the verdict is fail, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/qa/coverage:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: qaCoverageHistory
+      summary: API coverage history of a repository
+      description: Finished functional runs with API coverage, oldest first, for trend charts. Coverage is the share of documented OpenAPI operations that the tests called. Scope `read` or `write`.
+      parameters:
+        - {name: ref, in: query, schema: {type: string}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
+      responses:
+        '200': {description: History, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QACoveragePoint'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/qa/generations:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: listQAGenerations
+      summary: List a repository's test generations
+      description: The 50 newest generations with their token usage and accepted and rejected file counts. Scope `read` or `write`.
+      responses:
+        '200': {description: Generations, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QAGeneration'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [E2E QA]
+      operationId: createQAGeneration
+      summary: Draft tests with the profile's LLM
+      description: |
+        Queues test generation at the latest successful assessment. `api` sends the OpenAPI document's operations (untested ones first) to the profile's LLM provider and stores Karate features as drafts; they run only after approval. `unit` sends source files that have no tests (Go, TypeScript, JavaScript, Python, Java, Kotlin) and stores unit tests for developers to download and commit; it needs `allow_source_upload` on the profile. Every file passes static checks first; failing files are stored `rejected` with their problems. Scope `write`.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/QAGenerationRequest'}}}}
+      responses:
+        '202': {description: Queued, headers: {Location: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/QAGeneration'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {description: No profile, provider, successful assessment, or source upload not allowed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/qa/suites:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: listQASuites
+      summary: List generated test files
+      description: Generated files of the asset without their content, by path. Filter by `kind` (api or unit) and `status` (draft, approved, rejected, superseded). Scope `read` or `write`.
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [api, unit]}}
+        - {name: status, in: query, schema: {type: string, enum: [draft, approved, rejected, superseded]}}
+      responses:
+        '200': {description: Suites, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QASuite'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assessments/{id}/qa:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: assessmentQARuns
+      summary: QA runs of an assessment
+      description: Functional and performance runs of the assessed commit, newest first. A run is `skipped` when the assessment's verdict was `fail`. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Runs, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QARun'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runner:
+    get:
+      tags: [E2E QA]
+      operationId: qaRunnerStatus
+      summary: Karate runner status
+      description: Whether the API process has a runner configured and can reach it, with the runner's Karate version, Gatling support, slots and queue. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Runner status, content: {application/json: {schema: {$ref: '#/components/schemas/QARunnerStatus'}}}}
+        '502': {description: Runner unreachable, content: {application/json: {schema: {$ref: '#/components/schemas/QARunnerStatus'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runs/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: getQARun
+      summary: Get a QA run
+      description: Status, scenario counts, coverage summary and load statistics of one run. Poll until `status` is passed, failed, error, cancelled or skipped, or subscribe to `qa.completed` and `qa.failed`. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Run, content: {application/json: {schema: {$ref: '#/components/schemas/QARun'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runs/{id}/scenarios:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: listQAScenarios
+      summary: Scenarios of a QA run
+      description: Executed Karate scenarios with outcome, duration, tags and failure reason, 500 per page. Filter with `status=failed`. Scope `read`, `write` or `trigger`.
+      parameters:
+        - {$ref: '#/components/parameters/Cursor'}
+        - {name: status, in: query, schema: {type: string, enum: [passed, failed, skipped]}}
+      responses:
+        '200': {description: Scenarios, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/QAScenario'}}, next_cursor: {type: string}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runs/{id}/coverage:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: getQACoverage
+      summary: API coverage of a QA run
+      description: Every documented operation with the number of test calls and response statuses seen, plus called paths the document does not describe. Present when the commit had an OpenAPI document. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Coverage, content: {application/json: {schema: {$ref: '#/components/schemas/QACoverage'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runs/{id}/report:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: downloadQAReport
+      summary: Download a QA run's reports
+      description: The runner's report archive (gzip tar) with `result.json`, `console.log`, Karate HTML, JUnit XML and JSON Lines reports, or the Gatling report. Secret values and credential headers are redacted by the runner. Verify against `X-Content-SHA256`. Scope `read`, `write` or `trigger`.
+      responses:
+        '200':
+          description: Report archive
+          headers: {X-Content-SHA256: {schema: {type: string}}}
+          content: {application/gzip: {schema: {type: string, format: binary}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: The run has no stored report, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '502': {description: Object store unavailable or integrity check failed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/runs/{id}:cancel:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [E2E QA]
+      operationId: cancelQARun
+      summary: Cancel a QA run
+      description: Stops a queued or active run; the worker also removes the job from the runner. Finished runs cannot be cancelled. Scope `write` or `trigger`.
+      responses:
+        '200': {description: Cancelled, content: {application/json: {schema: {$ref: '#/components/schemas/QARun'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/generations/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: getQAGeneration
+      summary: Get a test generation and its files
+      description: The generation's status, provider, model, token usage and every file it produced (without content). Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Generation, content: {application/json: {schema: {type: object, properties: {generation: {$ref: '#/components/schemas/QAGeneration'}, suites: {type: array, items: {$ref: '#/components/schemas/QASuite'}}}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/generations/{id}/files:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: downloadQAGeneration
+      summary: Download a generation's files
+      description: A gzip tar with drafts and approved files under `files/` at their repository paths, rejected and superseded ones under their status, and `MANIFEST.json` with each file's status and problems. Use it to commit generated unit tests. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Files, content: {application/gzip: {schema: {type: string, format: binary}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/suites/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [E2E QA]
+      operationId: getQASuite
+      summary: Get a generated test file
+      description: One generated file with its content, the operations or source file it covers, its static-check problems and its review. Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: Suite, content: {application/json: {schema: {$ref: '#/components/schemas/QASuite'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/suites/{id}:approve:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [E2E QA]
+      operationId: approveQASuite
+      summary: Approve a generated test file
+      description: Approves a draft without problems. Approved API features run in every later functional run of the asset (suite `generated`); approving replaces the previously approved file at the same path. Scope `admin`, since approved features run against the target.
+      requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QAReview'}}}}
+      responses:
+        '200': {description: Approved, content: {application/json: {schema: {$ref: '#/components/schemas/QASuite'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Not a draft, or the draft has problems, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /qa/suites/{id}:reject:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [E2E QA]
+      operationId: rejectQASuite
+      summary: Reject a generated test file
+      description: Marks a draft rejected with an optional note; it never runs. Scope `write`.
+      requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QAReview'}}}}
+      responses:
+        '200': {description: Rejected, content: {application/json: {schema: {$ref: '#/components/schemas/QASuite'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Not a draft, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- LLM providers
+  /llm/presets:
+    get:
+      tags: [LLM providers]
+      operationId: listLLMPresets
+      summary: List supported LLM provider kinds
+      description: Each provider kind with its wire protocol (OpenAI chat completions, Anthropic Messages or Gemini generateContent), default inference URL, and whether a base URL or API key is required. Scope `read` or `write`.
+      responses:
+        '200': {description: Presets, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/LLMPreset'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /llm/providers:
+    get:
+      tags: [LLM providers]
+      operationId: listLLMProviders
+      summary: List LLM providers
+      description: Configured model endpoints by name. Keys are never returned; `has_api_key` tells whether one is stored. Scope `read` or `write`.
+      responses:
+        '200': {description: Providers, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/LLMProvider'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [LLM providers]
+      operationId: createLLMProvider
+      summary: Add an LLM provider
+      description: |
+        Stores a model endpoint for test generation. `base_url` defaults to the kind's inference URL and can point at a regional endpoint, Azure resource, gateway or self-hosted server (plain http only for hosts in `SCRS_LLM_PRIVATE_HOSTS`). The API key is sealed with `SCRS_MASTER_KEY`. Scope `admin`.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LLMProviderInput'}, examples: {openai: {value: {name: openai-main, kind: openai, model: gpt-5.1, api_key: 'sk-…'}}, anthropic: {value: {name: claude, kind: anthropic, model: claude-sonnet-5-5, max_tokens: 16000, api_key: 'sk-ant-…'}}, azure: {value: {name: azure-eu, kind: azure_openai, base_url: 'https://acme.openai.azure.com/openai/v1', model: gpt-5-deployment, api_key: '…'}}, ollama: {value: {name: local, kind: ollama, base_url: 'http://gpu-box:11434/v1', model: 'qwen3-coder:30b'}}}}}}
+      responses:
+        '201': {description: Created, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/LLMProvider'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '503': {description: Secret encryption unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /llm/providers/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [LLM providers]
+      operationId: getLLMProvider
+      summary: Get an LLM provider
+      description: One provider's settings and last connectivity check. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
+      responses:
+        '200': {description: Provider, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/LLMProvider'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    patch:
+      tags: [LLM providers]
+      operationId: updateLLMProvider
+      summary: Change an LLM provider
+      description: Changes the given fields; `api_key` replaces the stored key and an empty string removes it. `clear_temperature` removes a set temperature. The name cannot change. Requires `If-Match`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LLMProviderInput'}}}}
+      responses:
+        '200': {description: Changed, headers: {ETag: {$ref: '#/components/headers/ETag'}}, content: {application/json: {schema: {$ref: '#/components/schemas/LLMProvider'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [LLM providers]
+      operationId: deleteLLMProvider
+      summary: Delete an LLM provider
+      description: Removes the provider and its key. QA profiles that used it lose their provider; past generations keep its name. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /llm/providers/{id}:test:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [LLM providers]
+      operationId: testLLMProvider
+      summary: Check an LLM provider
+      description: Sends a one-line prompt with the stored settings and key and reports the reply, model, latency and token usage, or the provider's error. The outcome is kept as `last_test_at` and `last_test_error`. Scope `admin`.
+      responses:
+        '200': {description: The provider answered, content: {application/json: {schema: {$ref: '#/components/schemas/LLMTestResult'}}}}
+        '502': {description: The provider failed, content: {application/json: {schema: {$ref: '#/components/schemas/LLMTestResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
 components:
   securitySchemes:
     bearerAuth:
@@ -1762,13 +2254,56 @@ components:
       additionalProperties: false
       properties:
         name: {type: string, pattern: '^[a-z][a-z0-9_]{0,62}$', description: Prefix of finding advisory IDs (`<name>:<indicator id>`); cannot change}
-        kind: {type: string, enum: [manual], default: manual, description: STIX upload and TAXII polling sources are coming}
+        kind: {type: string, enum: [manual, stix, taxii], default: manual, description: '`manual` sources import SCRS bundles with PUT; `stix` sources import STIX 2.1 with `:import-stix`; `taxii` sources poll a TAXII 2.1 collection (scope `admin`)'}
         description: {type: string, maxLength: 1000}
         mode: {type: string, enum: [hunt, alert, block], default: hunt}
         severity: {type: string, enum: [critical, high, medium, low, info], default: high, description: Severity of `ioc_alert` and `ioc_hunt` findings}
         min_confidence: {type: integer, minimum: 0, maximum: 100, default: 0}
         enabled: {type: boolean, default: true}
         origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+        taxii: {$ref: '#/components/schemas/TAXIIFeedInput'}
+    TAXIIFeedInput:
+      type: object
+      additionalProperties: false
+      description: |
+        Required with kind `taxii`. Examples: OpenCTI `auth_type: api_key` with `api_key: "Bearer <token>"`; MISP `api_key`
+        with the MISP auth key; vendors often `auth_header: X-API-Key`; CISA AIS a client certificate (`cert_pem`, `key_pem`),
+        with `basic` if AIS issued a username. Credential fields are write-only.
+      properties:
+        api_root: {type: string, format: uri, description: 'TAXII API root, https, ending in /'}
+        collection: {type: string, maxLength: 256, description: Collection id}
+        auth_type: {type: string, enum: [none, api_key, basic], default: none}
+        auth_header: {type: string, default: Authorization, description: Header that carries `api_key`}
+        api_key: {type: string, writeOnly: true, description: Full header value}
+        username: {type: string, writeOnly: true}
+        password: {type: string, writeOnly: true}
+        cert_pem: {type: string, writeOnly: true, description: Client certificate (PEM); works with any auth_type}
+        key_pem: {type: string, writeOnly: true, description: Client private key (PEM)}
+        ca_pem: {type: string, description: 'CA certificates (PEM) for the server, instead of the system roots'}
+        interval_minutes: {type: integer, minimum: 5, maximum: 10080, default: 60}
+        page_size: {type: integer, minimum: 1, maximum: 10000, default: 1000}
+        valid_days: {type: integer, minimum: 1, maximum: 3650, default: 180, description: Expiry for indicators without valid_until}
+        reset_cursor: {type: boolean, description: PATCH only; poll the collection from the start}
+    TAXIIFeed:
+      type: object
+      properties:
+        source_id: {type: string, format: uuid}
+        api_root: {type: string}
+        collection: {type: string}
+        auth_type: {type: string, enum: [none, api_key, basic]}
+        auth_header: {type: string}
+        client_cert: {type: boolean}
+        ca_pem: {type: string}
+        interval_minutes: {type: integer}
+        page_size: {type: integer}
+        valid_days: {type: integer}
+        cursor: {type: string, description: 'added_after for the next poll (the last X-TAXII-Date-Added-Last)'}
+        next_poll_at: {type: string, format: date-time}
+        last_poll_at: {type: [string, 'null'], format: date-time}
+        last_success_at: {type: [string, 'null'], format: date-time}
+        last_error: {type: string}
+        failures: {type: integer, description: 'Consecutive failures; the third emits feed.stale'}
+        objects_polled: {type: integer}
     IndicatorSourceChange:
       type: object
       additionalProperties: false
@@ -1779,6 +2314,34 @@ components:
         min_confidence: {type: integer, minimum: 0, maximum: 100}
         enabled: {type: boolean}
         origin: {$ref: '#/components/schemas/YaraRuleOrigin'}
+    STIXBundle:
+      type: object
+      required: [type, id, objects]
+      properties:
+        type: {type: string, const: bundle}
+        id: {type: string, pattern: '^bundle--'}
+        objects: {type: array, maxItems: 200000, items: {type: object, description: STIX 2.1 objects; only indicator objects are read}}
+    STIXImportResult:
+      type: object
+      properties:
+        source: {$ref: '#/components/schemas/IndicatorSource'}
+        yara_ruleset: {oneOf: [{$ref: '#/components/schemas/YaraRuleset'}, {type: 'null'}]}
+        report:
+          type: object
+          properties:
+            objects: {type: integer}
+            indicators: {type: integer, description: Indicator objects in the bundle}
+            imported: {type: integer, description: SCRS indicators produced}
+            yara_patterns: {type: integer, description: YARA patterns that compile on their own}
+            partial: {type: integer, description: Patterns where only some OR alternatives could be checked}
+            skipped:
+              type: object
+              additionalProperties: {type: integer}
+              description: 'Counts by reason: revoked, expired, superseded, unsupported_version, unsupported_pattern_type, combines_observations, time_window, unsupported_object, unsupported_hash, unsupported_operator, unsupported_value, combines_conditions, invalid_pattern, invalid_yara, too_many_yara, duplicate_rule_name, ruleset_full, too_many_indicators'
+            samples:
+              type: array
+              maxItems: 50
+              items: {type: object, properties: {id: {type: string}, reason: {type: string}, detail: {type: string}}}
     IndicatorSource:
       type: object
       properties:
@@ -1794,6 +2357,8 @@ components:
         version: {type: string, description: Version of the last import}
         indicator_count: {type: integer}
         imported_at: {type: [string, 'null'], format: date-time}
+        yara_ruleset_id: {type: [string, 'null'], format: uuid, description: 'The `stix_<source>` ruleset built from the source''s YARA patterns'}
+        taxii: {$ref: '#/components/schemas/TAXIIFeed', description: Present for kind `taxii` on list, get and create}
         revision: {type: integer}
         created_by: {type: [string, 'null'], format: uuid}
         created_at: {type: string, format: date-time}
@@ -2061,7 +2626,7 @@ components:
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate'}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate'}
         advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
         severity: {type: string, enum: [critical, high, medium, low, info, unknown]}
@@ -2105,7 +2670,7 @@ components:
               digest: {type: string}
               status: {type: string, enum: [queued, replayed, ignored_out_of_scope, invalid_reference, ambiguous_connection]}
               assessment_id: {type: string, format: uuid}
-    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, ping]}
+    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, ping]}
     AuthHeader:
       type: object
       description: Configure as Header Auth in n8n (name and value).
@@ -2190,3 +2755,257 @@ components:
         idempotency_keys_expired: {type: integer}
         rescans_queued: {type: integer}
         skipped_concurrent_run: {type: boolean}
+    QAAuth:
+      type: object
+      description: Header added to every generated request, valued `prefix` + the variable's value
+      properties:
+        header: {type: string, examples: [Authorization]}
+        variable: {type: string, description: Name of one of the profile's variables}
+        prefix: {type: string, maxLength: 32, examples: ['Bearer ']}
+    QAPerf:
+      type: object
+      required: [features, users, duration_seconds, p95_millis]
+      description: Load profile run with karate-gatling; a breached threshold fails the run
+      properties:
+        features: {type: array, items: {type: string}, maxItems: 20, description: Feature paths relative to `test_path`}
+        users: {type: integer, minimum: 1, maximum: 500}
+        ramp_seconds: {type: integer, minimum: 0, maximum: 3600}
+        duration_seconds: {type: integer, minimum: 5, maximum: 3600}
+        p95_millis: {type: integer, minimum: 1, maximum: 600000}
+        max_error_percent: {type: integer, minimum: 0, maximum: 100}
+        auto_run: {type: boolean, description: Run after every passing functional run}
+    QAProfileInput:
+      type: object
+      required: [base_url]
+      properties:
+        enabled: {type: boolean, default: true}
+        auto_run: {type: boolean, default: true, description: Queue a functional run after each successful assessment of a matching ref}
+        refs: {type: array, items: {type: string}, maxItems: 20, description: 'Refs or patterns (main, release/*, pull/*); empty means every ref'}
+        base_url: {type: string, format: uri, description: Deployed environment the tests call (SCRS_BASE_URL / baseUrl)}
+        environment: {type: string, description: karate.env}
+        tags: {type: array, items: {type: string}, maxItems: 8, description: 'Karate tag expressions for the repository suite, for example @smoke or ~@slow'}
+        threads: {type: integer, minimum: 1, maximum: 16, default: 1}
+        timeout_seconds: {type: integer, minimum: 60, maximum: 7200, default: 900}
+        test_path: {type: string, default: karate, description: Repository directory holding the Karate project; empty for the root}
+        openapi_path: {type: string, description: OpenAPI document path; empty finds openapi.yaml, openapi.json, swagger.yaml or swagger.json}
+        auth: {$ref: '#/components/schemas/QAAuth'}
+        variables: {type: object, additionalProperties: {type: string}, description: 'Secrets passed to tests as QA_<NAME> environment variables and redacted from reports; write-only, omitted keeps the stored set'}
+        perf: {oneOf: [{$ref: '#/components/schemas/QAPerf'}, {type: 'null'}]}
+        llm_provider_id: {type: [string, 'null'], format: uuid}
+        allow_source_upload: {type: boolean, default: false, description: Allow unit-test generation to send source files to the LLM provider}
+    QAProfile:
+      allOf:
+        - {$ref: '#/components/schemas/QAProfileInput'}
+        - type: object
+          properties:
+            asset_id: {type: string, format: uuid}
+            variable_names: {type: array, items: {type: string}}
+            revision: {type: integer}
+            updated_at: {type: string, format: date-time}
+    QARunStatus: {type: string, enum: [queued, submitted, running, passed, failed, error, cancelled, skipped]}
+    QARunRequest:
+      type: object
+      properties:
+        kind: {type: string, enum: [functional, performance], default: functional}
+        assessment_id: {type: string, format: uuid, description: Defaults to the latest successful git assessment of the asset}
+        include_drafts: {type: boolean, description: Also run draft generated features (admin)}
+    QASummary:
+      type: object
+      properties:
+        features: {type: integer}
+        scenarios: {type: integer}
+        passed: {type: integer}
+        failed: {type: integer}
+        skipped: {type: integer}
+        duration_ms: {type: integer}
+        karate_version: {type: string}
+    QAPerfStats:
+      type: object
+      properties:
+        requests: {type: integer}
+        ok: {type: integer}
+        ko: {type: integer}
+        min_ms: {type: number}
+        mean_ms: {type: number}
+        max_ms: {type: number}
+        p50_ms: {type: number}
+        p75_ms: {type: number}
+        p95_ms: {type: number}
+        p99_ms: {type: number}
+        throughput_rps: {type: number}
+        assertions: {type: array, items: {type: object, properties: {description: {type: string}, passed: {type: boolean}, actual: {type: number}}}}
+    QARun:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        assessment_id: {type: [string, 'null'], format: uuid}
+        kind: {type: string, enum: [functional, performance]}
+        trigger: {type: string, enum: [assessment, manual, functional_pass]}
+        requested_by: {type: string}
+        ref: {type: string}
+        commit: {type: string}
+        include_drafts: {type: boolean}
+        status: {$ref: '#/components/schemas/QARunStatus'}
+        attempts: {type: integer}
+        base_url: {type: string}
+        summary: {$ref: '#/components/schemas/QASummary'}
+        coverage: {type: object, properties: {total: {type: integer}, covered: {type: integer}, percent: {type: number}, spec: {type: string}, problems: {type: array, items: {type: string}}}}
+        perf: {$ref: '#/components/schemas/QAPerfStats'}
+        report_sha256: {type: string}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        submitted_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    QAScenario:
+      type: object
+      properties:
+        suite: {type: string, enum: [repo, generated]}
+        feature: {type: string}
+        name: {type: string}
+        line: {type: integer}
+        tags: {type: array, items: {type: string}}
+        status: {type: string, enum: [passed, failed, skipped]}
+        duration_ms: {type: integer}
+        error: {type: string}
+    QACoverage:
+      type: object
+      properties:
+        total: {type: integer, description: Documented operations, less deprecated ones}
+        covered: {type: integer}
+        percent: {type: number}
+        spec: {type: string}
+        problems: {type: array, items: {type: string}}
+        operations:
+          type: array
+          items:
+            type: object
+            properties:
+              method: {type: string}
+              path: {type: string}
+              operation_id: {type: string}
+              summary: {type: string}
+              deprecated: {type: boolean}
+              hits: {type: integer}
+              statuses: {type: array, items: {type: integer}}
+        unmatched: {type: array, items: {type: string}, description: Called paths no operation describes (first 50)}
+    QACoveragePoint:
+      type: object
+      properties:
+        run_id: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        ref: {type: string}
+        commit: {type: string}
+        status: {type: string}
+        total: {type: integer}
+        covered: {type: integer}
+        percent: {type: number}
+        passed: {type: integer}
+        failed: {type: integer}
+    QAGenerationRequest:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [api, unit]}
+        max_operations: {type: integer, minimum: 1, maximum: 200, default: 30}
+        operations: {type: array, items: {type: string}, description: 'Only these operations, as "GET /users/{id}"'}
+        max_files: {type: integer, minimum: 1, maximum: 20, default: 5}
+        paths: {type: array, items: {type: string}, description: Only these source files (unit)}
+    QAGeneration:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        kind: {type: string, enum: [api, unit]}
+        provider_id: {type: [string, 'null'], format: uuid}
+        provider_name: {type: string}
+        model: {type: string}
+        assessment_id: {type: string, format: uuid}
+        ref: {type: string}
+        commit: {type: string}
+        options: {$ref: '#/components/schemas/QAGenerationRequest'}
+        status: {type: string, enum: [queued, running, succeeded, failed]}
+        requested_by: {type: string}
+        attempts: {type: integer}
+        input_tokens: {type: integer}
+        output_tokens: {type: integer}
+        accepted: {type: integer}
+        rejected: {type: integer}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    QASuite:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        generation_id: {type: string, format: uuid}
+        kind: {type: string, enum: [api, unit]}
+        path: {type: string}
+        source: {type: string, description: Operations (api) or source file (unit) the file covers}
+        content: {type: string, description: 'Present on GET /qa/suites/{id}'}
+        sha256: {type: string}
+        status: {type: string, enum: [draft, approved, rejected, superseded]}
+        problems: {type: array, items: {type: string}}
+        reviewed_by: {type: string}
+        reviewed_at: {type: string, format: date-time}
+        note: {type: string}
+        created_at: {type: string, format: date-time}
+    QAReview:
+      type: object
+      properties: {note: {type: string, maxLength: 1000}}
+    QARunnerStatus:
+      type: object
+      properties:
+        configured: {type: boolean}
+        reachable: {type: boolean}
+        error: {type: string}
+        runner: {type: object, properties: {karate: {type: string}, gatling: {type: boolean}, slots: {type: integer}, queued: {type: integer}, running: {type: integer}}}
+    LLMPreset:
+      type: object
+      properties:
+        kind: {type: string}
+        protocol: {type: string, enum: [openai, anthropic, gemini]}
+        base_url: {type: string}
+        base_url_required: {type: boolean}
+        api_key_optional: {type: boolean}
+    LLMProviderInput:
+      type: object
+      properties:
+        name: {type: string, pattern: '^[a-z][a-z0-9_-]{1,62}$', description: Required on create; cannot change}
+        kind: {type: string, enum: [openai, azure_openai, anthropic, gemini, mistral, groq, deepseek, xai, openrouter, together, ollama, openai_compatible]}
+        base_url: {type: string, description: Defaults to the kind's inference URL; required for azure_openai and openai_compatible}
+        model: {type: string, description: Model or deployment name}
+        max_tokens: {type: integer, minimum: 256, maximum: 131072, default: 8192}
+        temperature: {type: number, minimum: 0, maximum: 2}
+        clear_temperature: {type: boolean}
+        enabled: {type: boolean, default: true}
+        api_key: {type: string, writeOnly: true}
+    LLMProvider:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        kind: {type: string}
+        base_url: {type: string}
+        model: {type: string}
+        max_tokens: {type: integer}
+        temperature: {type: [number, 'null']}
+        enabled: {type: boolean}
+        has_api_key: {type: boolean}
+        revision: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        last_test_at: {type: [string, 'null'], format: date-time}
+        last_test_error: {type: string}
+    LLMTestResult:
+      type: object
+      properties:
+        ok: {type: boolean}
+        model: {type: string}
+        reply: {type: string}
+        latency_ms: {type: integer}
+        input_tokens: {type: integer}
+        output_tokens: {type: integer}
+        error: {type: string}

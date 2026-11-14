@@ -109,3 +109,56 @@ func CheckPack(p RulePack) (string, error) {
 	}
 	return hex.EncodeToString(hash.Sum(nil))[:16], nil
 }
+
+var (
+	ruleName   = regexp.MustCompile(`(?m)^\s*(?:(?:private|global)\s+)*rule\s+([A-Za-z_][A-Za-z0-9_]*)`)
+	importLine = regexp.MustCompile(`(?m)^[ \t]*import[ \t]+"[^"\n]+"[ \t]*\r?$`)
+)
+
+// CombineRules joins rule texts, in order, into one ruleset. Imports are
+// hoisted and deduplicated. A text that declares a rule name an earlier text
+// declared is left out with SkipDuplicateRule, and one that would pass
+// MaxRuleSetBytes with SkipRulesetFull; reasons[i] is "" for kept texts.
+func CombineRules(texts []string) (combined string, reasons []string) {
+	reasons = make([]string, len(texts))
+	declared := map[string]bool{}
+	imports := map[string]bool{}
+	var head, body strings.Builder
+	for n, text := range texts {
+		names := ruleName.FindAllStringSubmatch(text, -1)
+		duplicate := false
+		for _, m := range names {
+			duplicate = duplicate || declared[m[1]]
+		}
+		lines := importLine.FindAllString(text, -1)
+		added := 0
+		for _, line := range lines {
+			if line = strings.TrimSpace(line); !imports[line] {
+				added += len(line) + 1
+			}
+		}
+		rest := importLine.ReplaceAllString(text, "")
+		switch {
+		case duplicate:
+			reasons[n] = SkipDuplicateRule
+			continue
+		case head.Len()+body.Len()+added+len(rest)+1 > MaxRuleSetBytes:
+			reasons[n] = SkipRulesetFull
+			continue
+		}
+		for _, m := range names {
+			declared[m[1]] = true
+		}
+		for _, line := range lines {
+			if line = strings.TrimSpace(line); !imports[line] {
+				imports[line] = true
+				head.WriteString(line + "\n")
+			}
+		}
+		body.WriteString(strings.TrimSpace(rest) + "\n\n")
+	}
+	if body.Len() == 0 {
+		return "", reasons
+	}
+	return head.String() + "\n" + body.String(), reasons
+}

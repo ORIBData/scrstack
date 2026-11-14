@@ -163,3 +163,38 @@ func (a *Artifacts) DeleteMirror(ctx context.Context, key string) error {
 	}
 	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})
 }
+
+var qaReportKey = regexp.MustCompile(`^qa/[a-f0-9]{64}\.tar\.gz$`)
+
+// PutQAReport stores a Karate runner report archive content-addressed.
+func (a *Artifacts) PutQAReport(ctx context.Context, data []byte) (string, string, error) {
+	if len(data) > 64<<20 {
+		return "", "", errors.New("QA report size exceeded")
+	}
+	hash := sha256.Sum256(data)
+	digest := hex.EncodeToString(hash[:])
+	key := "qa/" + digest + ".tar.gz"
+	_, err := a.client.PutObject(ctx, a.bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/gzip"})
+	return key, digest, err
+}
+
+// GetQAReport reads a stored QA report and checks its digest.
+func (a *Artifacts) GetQAReport(ctx context.Context, key string) ([]byte, error) {
+	if !qaReportKey.MatchString(key) {
+		return nil, errors.New("invalid QA report key")
+	}
+	object, err := a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer object.Close()
+	data, err := io.ReadAll(io.LimitReader(object, (64<<20)+1))
+	if err != nil || len(data) > 64<<20 {
+		return nil, errors.New("QA report unavailable")
+	}
+	hash := sha256.Sum256(data)
+	if "qa/"+hex.EncodeToString(hash[:])+".tar.gz" != key {
+		return nil, errors.New("QA report integrity check failed")
+	}
+	return data, nil
+}

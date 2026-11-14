@@ -233,11 +233,51 @@ staticcheck (non-style) is clean.
 | Medium | Image scans streamed a raw body, so the database indicator bundle never reached them; image IOC matching used only the optional `SCRS_INDICATOR_FILE`. | Image scan requests are multipart: indicators, then rules, then the image streamed last. | Worker DB test checks part order; scanner unit test. |
 | — | YARA ran only inside ClamAV, with no modules and no way to add rules. | YARA-X rulesets: team rules from the Web UI and third-party packs, with the `pe`, `elf`, `math`, `hash` and `dotnet` modules, on repositories and image layers. Hunt by default; admins promote to alert or block. `include` directives are rejected because the compiler echoes the included file in errors. See `docs/THREAT_INTELLIGENCE.md`. | Scanner tests with the real `yr` binary (modules, located errors, large-file spill, deleted layer files, cache); HTTP test for scopes, revisions and the pack. |
 | — | All indicators came from one admin-only bundle that always blocked, with no source, confidence or report-only mode, and no MD5, SHA-1 or URL types. | Indicator sources (`/intel/indicator-sources`): each has a mode (`hunt` by default, giving `ioc_hunt` findings that never gate; `alert` gives `ioc_alert`, gating by severity; `block` gives `ioc_match`), a severity and a minimum confidence. MD5, SHA-1 (hashed only when such indicators are loaded) and URL indicators were added, and defanged values are normalized. `write` manages hunt sources; `admin` promotes. On migration, the active legacy bundle becomes the block-mode `bundle` source, which keeps plain IDs so existing findings keep their fingerprints. Enabled sources are capped at 100,000 indicators so the scan bundle (32 MiB) always fits. | Parser tests; scanner test for modes, MD5 on small and streamed files, SHA-1 and URL; DB tests for confidence, expiry and disable filtering, per-source IDs, the one-time legacy migration and cascade delete; HTTP test for scopes, revisions, the limit and audit. |
+| — | There was no way to load STIX 2.1 threat intelligence. | `POST /intel/indicator-sources/{id}:import-stix` for `stix` sources. Patterns checkable against files at rest (file hashes, file names, domains, single IPv4 addresses, URLs; `=` and `IN`; OR alternatives; a hash inside an AND) become indicators. `pattern_type: yara` patterns compile into a linked `stix_<source>` ruleset that follows the source mode. Everything else is counted by reason. `merge=true` updates by STIX ID and removes revoked objects. | Parser tests for 23 pattern shapes and a mixed bundle; DB/HTTP test for kinds, the report, the linked ruleset (create, follow mode, remove), merge and replace; combined ruleset compiled with the real `yr` 1.22.0. |
+| — | Threat intelligence could not be pulled from a TAXII 2.1 server. | `taxii` sources poll a collection from the worker, with API key, basic auth and/or a client certificate (OpenCTI, MISP, vendors, CISA AIS). Pages are STIX merges, with the `added_after` cursor saved per page, a 15-minute lease, failure backoff and `feed.stale` on the third failure. Credentials are sealed with `SCRS_MASTER_KEY` and bound to the source. Requests use a shared SSRF-safe dialer (`internal/netguard`, now also used by webhooks), require https and refuse redirects. Admin-only, with `:test` and `:poll`. | Client tests against TLS servers (API key, basic plus a required client certificate, paging, untrusted CA, loopback refused, redirects, 429); worker DB test for paging, cursor resume, YARA, backoff, leases and disabled sources; HTTP test for scopes, write-only credentials, rotation and `:test`. |
 
 **Accepted or documented**
 
-- Ubuntu is not supported offline: its OSV archive is 815 MB and expands to 8.1 GiB. Use a Trivy import for Ubuntu-based images.
+- Ubuntu is not supported offline
+- TAXII: not yet run against a live OpenCTI, MISP or AIS server; interoperability rests on the TAXII 2.1 specification and the tests above. Servers that send no `X-TAXII-Date-Added-Last` are re-read from the start on every poll.
+- STIX: a `valid_from` in the future is not enforced; such indicators match as soon as they are imported. Expired YARA patterns leave the linked ruleset only at the next upload.: its OSV archive is 815 MB and expands to 8.1 GiB. Use a Trivy import for Ubuntu-based images.
 - CocoaPods has no OSV feed and OSV-Scanner does not read `Podfile.lock`.
 - GitLab force-push detection is out of scope for now (GitHub only).
 - Hunt-mode event patterns (branch, commit message, PR title, pushed path) are not applied to GitHub events, because every integrity event raises an alert. They still apply to file paths during scans.
 - Every GitHub event reloads the enabled event patterns from PostgreSQL; only the four pattern types are read.
+
+## 2026-11-14 E2E QA module (Karate)
+
+**What was added:**
+- A Karate runner (`cmd/scrs-qa-runner`, image `deploy/karate-runner`) on an operator-managed host.
+- QA profiles, runs, scenarios, API coverage and report-only `qa_*` findings in the datastore.
+- Automatic runs after successful assessments; skipped when the verdict is `fail`.
+- karate-gatling load runs with thresholds.
+- LLM providers covering the OpenAI, Anthropic and Gemini protocols plus OpenAI-compatible endpoints, which draft Karate features and unit tests. Drafts need approval.
+
+**Security decisions:**
+- **The runner executes repository test code.** It holds no SCRS credentials and is called by SCRS (never the reverse).
+  - Tests run as a separate user (uid 10001) with an explicit environment that excludes the runner token.
+  - The container has a read-only root, only six capabilities, `no-new-privileges`, and per-job directories that are deleted after each job.
+  - karate-cli project settings (`.karate/`) and `karate-pom.json` are ignored, so a repository cannot change the Karate version or JVM.
+- **Secrets are protected.**
+  - Profile variables and LLM keys are sealed with `SCRS_MASTER_KEY` (AAD bound to the asset or provider).
+  - Variable values and credential headers are redacted from every report file by the runner.
+- **Generated code is untrusted.** Static checks reject Java interop, process execution, file reads, calls and absolute URLs in generated features. Only admin-approved features run, and unit tests are never executed by SCRS.
+- **LLM endpoints** use the same network guard as webhooks: public addresses only, no redirects, and plain http only for listed private hosts.
+
+**Verified:**
+- `make qa-runner-test`: real Karate 2.1.4.
+- `make qa-runner-image-test`: the hardened image runs an API scenario, a headless-Chromium UI scenario and a Gatling load run.
+- `TestPostgresQAPipeline` and `TestPostgresQAAndLLMProviderAPI` against PostgreSQL.
+- Contract tests for the new routes.
+
+Two bugs were found and fixed during this verification:
+- The runner's `JAVA_TOOL_OPTIONS` broke karate-cli's Java detection.
+- Gatling's thousands separators were not parsed.
+
+**Open risks:**
+- **Tests target a deployed environment, not the commit.** A run checks that commit's tests against whatever is deployed at `base_url`; coordinate deployments if you need commit-exact results.
+- **Jobs share a kernel.** They are isolated by user and directory, not by VM. Rebuild the runner host periodically, and keep its outbound firewall tight.
+- **Real hosted providers are untested.** Generation was tested against fake OpenAI-compatible, Anthropic and Gemini servers, not with real keys. Check each provider with `POST /llm/providers/{id}:test` after adding it.
+- **Source code leaves your network** to the LLM provider when `allow_source_upload` is enabled for unit-test generation.

@@ -17,6 +17,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/httpapi"
+	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/redis/go-redis/v9"
@@ -169,9 +170,14 @@ func main() {
 	}
 	defer closeReadiness()
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	qaRunner, err := qaRunnerFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(2)
+	}
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,
