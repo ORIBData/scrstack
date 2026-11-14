@@ -257,7 +257,8 @@ func fingerprint(a Assessment, f Finding) string {
 // content never drops below warn. Threat-intelligence findings carry their
 // source's mode in the type: yara_match and ioc_match block like malware,
 // yara_alert and ioc_alert gate by severity like a vulnerability, and
-// yara_hunt and ioc_hunt never gate.
+// yara_hunt and ioc_hunt never gate. E2E QA findings (qa_*) are
+// report-only.
 func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 	failing, warning := false, false
 	counts := map[string]int{"total": len(r.Findings)}
@@ -268,6 +269,10 @@ func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 		}
 		if huntOnly(f.Type) {
 			counts["hunt"]++
+			continue
+		}
+		if reportOnly(f.Type) {
+			counts["qa"]++
 			continue
 		}
 		malicious := maliciousType(f.Type)
@@ -310,6 +315,10 @@ func maliciousType(t string) bool {
 // huntOnly reports findings recorded for threat hunting that never gate.
 func huntOnly(t string) bool { return t == "yara_hunt" || t == "ioc_hunt" }
 
+// reportOnly reports E2E QA findings (qa_failure, qa_untested,
+// qa_performance, qa_config, qa_unconfigured): they inform, never gate.
+func reportOnly(t string) bool { return strings.HasPrefix(t, "qa_") }
+
 // closableTypes lists finding types whose producing stages all completed, so
 // their absence from this scan is evidence of a fix rather than lost coverage.
 func closableTypes(stages []Stage) []string {
@@ -329,6 +338,7 @@ func closableTypes(stages []Stage) []string {
 		"yara_match":           {"yara_x"},
 		"yara_alert":           {"yara_x"},
 		"yara_hunt":            {"yara_x"},
+		"qa_unconfigured":      {"integrity"},
 	}
 	types := []string{}
 	for kind, needed := range producers {

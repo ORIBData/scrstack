@@ -26,6 +26,9 @@ func indicatorSchema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.indicator_sources(id uuid PRIMARY KEY,name text NOT NULL UNIQUE,kind text NOT NULL CHECK(kind IN ('manual','stix','taxii')),description text NOT NULL DEFAULT '',mode text NOT NULL DEFAULT 'hunt' CHECK(mode IN ('hunt','alert','block')),severity text NOT NULL DEFAULT 'high' CHECK(severity IN ('critical','high','medium','low','info')),min_confidence integer NOT NULL DEFAULT 0 CHECK(min_confidence BETWEEN 0 AND 100),enabled boolean NOT NULL DEFAULT true,origin jsonb NOT NULL DEFAULT '{}',version text NOT NULL DEFAULT '',indicator_count integer NOT NULL DEFAULT 0,imported_at timestamptz,revision bigint NOT NULL DEFAULT 1,created_by uuid,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),updated_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.indicators(source_id uuid NOT NULL REFERENCES ` + s + `.indicator_sources(id) ON DELETE CASCADE,id text NOT NULL,type text NOT NULL,value text NOT NULL,confidence integer CHECK(confidence BETWEEN 0 AND 100),valid_until timestamptz NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),PRIMARY KEY(source_id,id))`,
 		`CREATE INDEX IF NOT EXISTS indicators_value_idx ON ` + s + `.indicators(type,value)`,
+		// STIX sources keep pattern_type yara patterns as type 'yara' rows and
+		// compile them into one linked ruleset on each import.
+		`ALTER TABLE ` + s + `.indicator_sources ADD COLUMN IF NOT EXISTS yara_ruleset_id uuid REFERENCES ` + s + `.yara_rulesets(id) ON DELETE SET NULL`,
 		// Before sources existed, PUT /feeds/indicators activated one bundle
 		// that blocked. Carry it over once as the block-mode "bundle" source.
 		`WITH legacy AS (SELECT version,body,created_at FROM ` + s + `.indicator_bundles WHERE active AND NOT EXISTS(SELECT 1 FROM ` + s + `.indicator_sources WHERE name='` + intelligence.LegacySource + `')),
@@ -48,6 +51,7 @@ type IndicatorSource struct {
 	Version        string     `json:"version"`
 	IndicatorCount int        `json:"indicator_count"`
 	ImportedAt     *time.Time `json:"imported_at"`
+	YaraRulesetID  *uuid.UUID `json:"yara_ruleset_id"`
 	Revision       int64      `json:"revision"`
 	CreatedBy      *uuid.UUID `json:"created_by"`
 	CreatedAt      time.Time  `json:"created_at"`
@@ -65,10 +69,14 @@ type IndicatorSourceChange struct {
 }
 
 // ErrIndicatorLimit means enabled sources would exceed the scan bundle limit.
+// ErrSourceKind means the import format does not match the source kind:
+// bundles go to manual sources and STIX to stix sources.
+var ErrSourceKind = errors.New("import format does not match the source kind")
+
 var ErrIndicatorLimit = fmt.Errorf("enabled indicator sources exceed %d indicators or %d MiB", intelligence.MaxScanIndicators, intelligence.MaxScanBundleBytes>>20)
 
 func validSource(r IndicatorSource) bool {
-	if !intelligence.RuleSetName.MatchString(r.Name) || r.Kind != "manual" || len(r.Description) > 1000 || r.MinConfidence < 0 || r.MinConfidence > 100 {
+	if !intelligence.RuleSetName.MatchString(r.Name) || (r.Kind != "manual" && r.Kind != "stix" && r.Kind != "taxii") || len(r.Description) > 1000 || r.MinConfidence < 0 || r.MinConfidence > 100 {
 		return false
 	}
 	if r.Mode != "hunt" && r.Mode != "alert" && r.Mode != "block" {
@@ -90,12 +98,12 @@ func validSource(r IndicatorSource) bool {
 	return true
 }
 
-const sourceColumns = `id,name,kind,description,mode,severity,min_confidence,enabled,origin,version,indicator_count,imported_at,revision,created_by,created_at,updated_at`
+const sourceColumns = `id,name,kind,description,mode,severity,min_confidence,enabled,origin,version,indicator_count,imported_at,yara_ruleset_id,revision,created_by,created_at,updated_at`
 
 func scanSource(row pgx.Row) (IndicatorSource, error) {
 	var r IndicatorSource
 	var origin []byte
-	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.Description, &r.Mode, &r.Severity, &r.MinConfidence, &r.Enabled, &origin, &r.Version, &r.IndicatorCount, &r.ImportedAt, &r.Revision, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt); err != nil {
+	if err := row.Scan(&r.ID, &r.Name, &r.Kind, &r.Description, &r.Mode, &r.Severity, &r.MinConfidence, &r.Enabled, &origin, &r.Version, &r.IndicatorCount, &r.ImportedAt, &r.YaraRulesetID, &r.Revision, &r.CreatedBy, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return r, ErrNotFound
 		}
@@ -115,7 +123,7 @@ func sourceAudit(ctx context.Context, tx pgx.Tx, schema, action string, r Indica
 // large. The byte estimate allows for each indicator's JSON framing.
 func (s *Store) checkIndicatorLimit(ctx context.Context, tx pgx.Tx) error {
 	var count, size int64
-	if err := tx.QueryRow(ctx, `SELECT count(*),COALESCE(sum(octet_length(i.id)+octet_length(i.value)+octet_length(src.name)+200),0) FROM `+s.schema+`.indicators i JOIN `+s.schema+`.indicator_sources src ON src.id=i.source_id WHERE src.enabled AND i.valid_until>clock_timestamp()`).Scan(&count, &size); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(*),COALESCE(sum(octet_length(i.id)+octet_length(i.value)+octet_length(src.name)+200),0) FROM `+s.schema+`.indicators i JOIN `+s.schema+`.indicator_sources src ON src.id=i.source_id WHERE src.enabled AND i.type<>'yara' AND i.valid_until>clock_timestamp()`).Scan(&count, &size); err != nil {
 		return err
 	}
 	if count > intelligence.MaxScanIndicators || size > intelligence.MaxScanBundleBytes {
@@ -126,8 +134,14 @@ func (s *Store) checkIndicatorLimit(ctx context.Context, tx pgx.Tx) error {
 
 // CreateIndicatorSource stores an empty source; indicators are imported next.
 func (s *Store) CreateIndicatorSource(ctx context.Context, r IndicatorSource, actor uuid.UUID) (IndicatorSource, error) {
+	return s.createSource(ctx, r, actor, nil)
+}
+
+// createSource inserts a source; with runs in the same transaction (a TAXII
+// source's feed). Only TAXII sources take one, and they require it.
+func (s *Store) createSource(ctx context.Context, r IndicatorSource, actor uuid.UUID, with func(pgx.Tx, IndicatorSource) error) (IndicatorSource, error) {
 	r.Description = strings.TrimSpace(r.Description)
-	if !validSource(r) {
+	if !validSource(r) || (r.Kind == "taxii") != (with != nil) {
 		return r, ErrInput
 	}
 	origin, _ := json.Marshal(r.Origin)
@@ -143,6 +157,11 @@ func (s *Store) CreateIndicatorSource(ctx context.Context, r IndicatorSource, ac
 			return r, ErrConflict
 		}
 		return r, err
+	}
+	if with != nil {
+		if err := with(tx, created); err != nil {
+			return r, err
+		}
 	}
 	if err := sourceAudit(ctx, tx, s.schema, "indicator_source.created", created, actor); err != nil {
 		return r, err
@@ -179,7 +198,7 @@ func (s *Store) SourceIndicators(ctx context.Context, id uuid.UUID) (intelligenc
 		return intelligence.Bundle{}, err
 	}
 	b := intelligence.Bundle{Version: source.Version, Indicators: []intelligence.Indicator{}}
-	rows, err := s.pool.Query(ctx, `SELECT id,type,value,confidence,valid_until FROM `+s.schema+`.indicators WHERE source_id=$1 ORDER BY id`, id)
+	rows, err := s.pool.Query(ctx, `SELECT id,type,value,confidence,valid_until FROM `+s.schema+`.indicators WHERE source_id=$1 AND type<>'yara' ORDER BY id`, id)
 	if err != nil {
 		return b, err
 	}
@@ -242,6 +261,9 @@ func (s *Store) UpdateIndicatorSource(ctx context.Context, id uuid.UUID, expecte
 	if err := s.checkIndicatorLimit(ctx, tx); err != nil {
 		return IndicatorSource{}, err
 	}
+	if err := s.followSource(ctx, tx, before, updated, actor); err != nil {
+		return IndicatorSource{}, err
+	}
 	action := "indicator_source.changed"
 	if before.Mode != after.Mode {
 		action = "indicator_source.mode_changed"
@@ -267,6 +289,11 @@ func (s *Store) DeleteIndicatorSource(ctx context.Context, id uuid.UUID, actor u
 	if err := authorize(r); err != nil {
 		return err
 	}
+	if r.YaraRulesetID != nil {
+		if _, err := s.dropRuleSet(ctx, tx, *r.YaraRulesetID, actor); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(ctx, `DELETE FROM `+s.schema+`.indicator_sources WHERE id=$1`, id); err != nil {
 		return err
 	}
@@ -288,6 +315,9 @@ func (s *Store) ImportSourceIndicators(ctx context.Context, id uuid.UUID, b inte
 	if err != nil {
 		return source, err
 	}
+	if source.Kind != "manual" {
+		return source, ErrSourceKind
+	}
 	if err := authorize(source); err != nil {
 		return source, err
 	}
@@ -304,12 +334,7 @@ func (s *Store) replaceIndicators(ctx context.Context, tx pgx.Tx, id uuid.UUID, 
 	if _, err := tx.Exec(ctx, `DELETE FROM `+s.schema+`.indicators WHERE source_id=$1`, id); err != nil {
 		return IndicatorSource{}, err
 	}
-	n := len(b.Indicators)
-	ids, types, values, confidence, until := make([]string, n), make([]string, n), make([]string, n), make([]*int, n), make([]time.Time, n)
-	for k, i := range b.Indicators {
-		ids[k], types[k], values[k], confidence[k], until[k] = i.ID, i.Type, i.Value, i.Confidence, i.ValidUntil
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.indicators(source_id,id,type,value,confidence,valid_until) SELECT $1,* FROM unnest($2::text[],$3::text[],$4::text[],$5::integer[],$6::timestamptz[])`, id, ids, types, values, confidence, until); err != nil {
+	if err := s.insertIndicators(ctx, tx, id, b.Indicators); err != nil {
 		return IndicatorSource{}, err
 	}
 	source, err := scanSource(tx.QueryRow(ctx, `UPDATE `+s.schema+`.indicator_sources SET version=$2,indicator_count=$3,imported_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE id=$1 RETURNING `+sourceColumns, id, b.Version, len(b.Indicators)))
@@ -317,6 +342,16 @@ func (s *Store) replaceIndicators(ctx context.Context, tx pgx.Tx, id uuid.UUID, 
 		return source, err
 	}
 	return source, s.checkIndicatorLimit(ctx, tx)
+}
+
+func (s *Store) insertIndicators(ctx context.Context, tx pgx.Tx, id uuid.UUID, indicators []intelligence.Indicator) error {
+	n := len(indicators)
+	ids, types, values, confidence, until := make([]string, n), make([]string, n), make([]string, n), make([]*int, n), make([]time.Time, n)
+	for k, i := range indicators {
+		ids[k], types[k], values[k], confidence[k], until[k] = i.ID, i.Type, i.Value, i.Confidence, i.ValidUntil
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.indicators(source_id,id,type,value,confidence,valid_until) SELECT $1,* FROM unnest($2::text[],$3::text[],$4::text[],$5::integer[],$6::timestamptz[])`, id, ids, types, values, confidence, until)
+	return err
 }
 
 // ImportIndicators activates a bundle from PUT /feeds/indicators: versions
@@ -382,7 +417,7 @@ func (s *Store) ScanIndicators(ctx context.Context) (json.RawMessage, error) {
 // activeIndicators builds the merged bundle, limited to some indicator types
 // when types is not nil.
 func (s *Store) activeIndicators(ctx context.Context, types []string) (json.RawMessage, error) {
-	rows, err := s.pool.Query(ctx, `SELECT i.id,i.type,i.value,i.confidence,i.valid_until,src.name,src.mode,src.severity FROM `+s.schema+`.indicators i JOIN `+s.schema+`.indicator_sources src ON src.id=i.source_id WHERE src.enabled AND i.valid_until>clock_timestamp() AND (i.confidence IS NULL OR i.confidence>=src.min_confidence) AND ($2::text[] IS NULL OR i.type=ANY($2)) ORDER BY src.name,i.id LIMIT $1`, intelligence.MaxScanIndicators+1, types)
+	rows, err := s.pool.Query(ctx, `SELECT i.id,i.type,i.value,i.confidence,i.valid_until,src.name,src.mode,src.severity FROM `+s.schema+`.indicators i JOIN `+s.schema+`.indicator_sources src ON src.id=i.source_id WHERE src.enabled AND i.type<>'yara' AND i.valid_until>clock_timestamp() AND (i.confidence IS NULL OR i.confidence>=src.min_confidence) AND ($2::text[] IS NULL OR i.type=ANY($2)) ORDER BY src.name,i.id LIMIT $1`, intelligence.MaxScanIndicators+1, types)
 	if err != nil {
 		return nil, err
 	}

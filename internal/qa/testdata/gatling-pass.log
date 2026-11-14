@@ -1,0 +1,38 @@
+
+========================================================================================================================
+2026-11-14 16:03:04 GMT                                                                               4s elapsed
+---- Requests -----------------------------------------------------------------------|---Total---|-----OK----|----KO----
+> Global                                                                             |       858 |       858 |         0
+> GET /users/1                                                                       |       858 |       858 |         0
+
+---- SCRS load ---------------------------------------------------------------------------------------------------------
+[###############################################################################################################]   100%
+          waiting:         0 / active:         0  / done:         3
+========================================================================================================================
+
+Parsing log file(s)...
+Parsing log file(s) done in 0s.
+Generating reports...
+
+========================================================================================================================
+---- Global Information -------------------------------------------------------------|---Total---|-----OK----|----KO----
+> request count                                                                      |       858 |       858 |         -
+> min response time (ms)                                                             |         0 |         0 |         -
+> max response time (ms)                                                             |        93 |        93 |         -
+> mean response time (ms)                                                            |         5 |         5 |         -
+> response time std deviation (ms)                                                   |         7 |         7 |         -
+> response time 50th percentile (ms)                                                 |         2 |         2 |         -
+> response time 75th percentile (ms)                                                 |         5 |         5 |         -
+> response time 95th percentile (ms)                                                 |        15 |        15 |         -
+> response time 99th percentile (ms)                                                 |        28 |        28 |         -
+> mean throughput (rps)                                                              |     171.6 |     171.6 |         -
+---- Response Time Distribution ----------------------------------------------------------------------------------------
+> OK: t < 800 ms                                                                                            858   (100%)
+> OK: 800 ms <= t < 1200 ms                                                                                   0     (0%)
+> OK: t >= 1200 ms                                                                                            0     (0%)
+> KO                                                                                                          0     (0%)
+========================================================================================================================
+
+Reports generated, please open the following file: file:///work/job/gatling-out/loadsimulation-20261114160300104/index.html
+Global: 95th percentile of response time is less than 2000.0 : true (actual : 15.0)
+Global: percentage of failed events is less than or equal to 1.0 : true (actual : 0.0)

@@ -72,9 +72,10 @@ was added on top. The full product specification is in
 | **External scanner import** | Trivy JSON (vulnerabilities, misconfigurations, secrets with values discarded) and SARIF 2.1.0 (Semgrep, CodeQL and similar) recorded as assessments, so their findings share the register, waivers and gate. |
 | **Git history mirrors** | On-demand or scheduled git bundles of every branch and tag (GitHub and GitLab) in S3, fetched natively without a git binary, checksum-verified, pruned to the newest N, restorable with `git clone`. |
 | **Risk register** | Findings deduplicated by fingerprint across assessments, with lifecycle `open → triaged → in_progress → fixed`. Time-boxed waivers (`accepted`), suppressions and false positives, with full event history. |
+| **E2E QA testing (Karate)** | After each successful assessment, a repository's Karate suites (API, integration, headless-Chromium UI, mocks) run against its deployed staging or preview environment on a runner you host, with optional karate-gatling load runs and thresholds. SCRS records scenarios, OpenAPI coverage and report-only findings (failing scenarios, untested operations, breached thresholds, setup gaps), and can draft Karate features and unit tests with your own LLM key (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible endpoint), for human approval. Commits that fail the security gate never reach the runner. See [docs/QA_TESTING.md](docs/QA_TESTING.md). |
 | **Guided remediation** | npm `package-lock.json` (in-place) and Maven `pom.xml` (override) plans generated in an isolated sandbox. Advice only: SCRS never writes to repositories. OpenVEX export reflects register triage. |
 | **Automation API** | Token-scoped REST API (`admin`, `read`, `write`, `trigger`, `ingest:relay`). Inbound: idempotent and batch triggers carrying caller context, provider and registry webhooks. Outbound: signed event webhooks. Plus long-poll, latest-by-commit lookup, last-known-good revisions, Swagger UI and an OpenAPI contract. |
-| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`. `summary`, `full` and AI-`agent` payload profiles. |
+| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`, `qa.completed`, `qa.failed`. `summary`, `full` and AI-`agent` payload profiles. |
 | **Operations** | Owners and asset attributes, Prometheus metrics, request IDs and access logs, hourly maintenance (retention, key expiry, optional default-branch rescans), inbound-event log with replay, opt-in source snapshots for restore. |
 | **Retention** | Policy-driven, previewable and audited purging of raw inbound events and the webhook delivery log. Findings, assessments and audit history are never purged. |
 
@@ -335,7 +336,8 @@ fail the build if a route is added without documentation.
 | `PATCH /register/{id}` | write; admin to accept, suppress or mark false positive | Triage |
 | `POST /assets/{id}/remediations`, `GET /remediation/capabilities` | write / read | Guided remediation plans |
 | `GET`/`PUT /feeds/indicators` | admin | IOC bundle (the `bundle` source) |
-| `/intel/indicator-sources` (list, create, get, patch, delete, `/indicators` get and put, `:hunt`) | read, write (hunt), admin (alert, block) | Indicator sources |
+| `/intel/indicator-sources` (list, create, get, patch, delete, `/indicators` get and put, `:import-stix`, `:hunt`) | read, write (hunt), admin (alert, block) | Indicator sources |
+| `/intel/indicator-sources/{id}/taxii` (get, patch), `:poll`, `:test` | read; admin | TAXII 2.1 feeds |
 | `/intel/yara-rulesets` (list, create, `:validate`, get, patch, delete, `:hunt`) | read, write (hunt), admin (alert, block) | YARA rulesets |
 | `/settings/retention`, `:preview`, `:purge` | admin | Raw-event retention |
 | `POST /webhooks/github` | GitHub HMAC | Signed push events |
@@ -367,10 +369,11 @@ Milestones follow PRD section 15.2.
 | M1 Platform core | Done: tokens, audit, owners and asset attributes, metrics, request IDs, access logs |
 | M2 Repository scanning | Done: trigger, batch, latest, long-poll, direct and relay GitHub ingestion, PR assessments, diffs and new-versus-existing gating, integrity events |
 | M3 Malware and malicious dependencies | Done: ClamAV, YARA via ClamAV with canary, `MAL-` matching, campaign IOC types, KEV and EPSS |
-| M4 Threat-intelligence feeds | Done: indicator bundles, KEV/EPSS, Trivy and SARIF import, YARA-X rulesets (team and third-party), indicator sources with modes and confidence. STIX 2.1 and TAXII 2.1 in progress; CSV, VEX import and NVD outstanding |
+| M4 Threat-intelligence feeds | Done: indicator bundles, KEV/EPSS, Trivy and SARIF import, YARA-X rulesets (team and third-party), indicator sources with modes and confidence, STIX 2.1 upload, TAXII 2.1 polling (OpenCTI, MISP, vendors, CISA AIS). CSV, VEX import and NVD outstanding |
 | M5 Retention, maintenance, outbound | Done: signed outbound webhooks with profiles and header auth, scheduler, maintenance actions, event log and replay, n8n workflows, source snapshots, git-bundle mirrors |
 | M6 Images and registries | Done: Docker Hub, GAR, Harbor and OCI images by digest with layer malware/YARA/IOC scanning; registry push events; GitLab repositories and webhooks |
 | M7 Remediation and hardening | Done: npm and Maven plans, OpenVEX export, load and crash-recovery test |
+| E2E QA (Karate) | Done: Karate runner service and image, per-repository QA profiles, automatic runs after assessments, API coverage, report-only QA findings, load runs, LLM-drafted Karate features and unit tests with approval |
 | M8 Licences, SPDX, compliance reports | Not started |
 | M9 SAST and reachability | SARIF import of external SAST done; built-in SAST and reachability not started |
 | Dependency-Track SBOM export (P2) | Not started (forward SBOMs through n8n until then) |
@@ -387,6 +390,8 @@ make database-test         # disposable PostgreSQL/Redis/MinIO integration
 make scanner-test          # real OSV-Scanner against adversarial fixtures
 make malware-test          # private ClamAV: clean file and EICAR
 make storage-integration   # production image against disposable stores
+make qa-runner-test        # Karate runner against the pinned Karate 2.1.4 jar (Java 21)
+make qa-runner-image-test  # runner image: API, Chromium UI and Gatling load runs
 ```
 
 To run locally, copy `.env.example` to `.env`, fill in the placeholders, then
@@ -401,6 +406,7 @@ To run locally, copy `.env.example` to `.env`, fill in the placeholders, then
 | [docs/DOKPLOY.md](docs/DOKPLOY.md) | Deployment contract, tokens, backup and recovery |
 | [docs/ASSESSMENT_PIPELINE.md](docs/ASSESSMENT_PIPELINE.md) | Pipeline design, limits and finding lifecycle |
 | [docs/PROVIDERS.md](docs/PROVIDERS.md) | GitHub, Docker Hub and GAR connections |
+| [docs/QA_TESTING.md](docs/QA_TESTING.md) | E2E QA with Karate: runner host, profiles, coverage, findings, LLM test generation |
 | [docs/FOUNDATION.md](docs/FOUNDATION.md) | URL contract and local work |
 | [docs/RELEASING.md](docs/RELEASING.md) | Image tags and releases |
 | [docs/PRODUCTION_READINESS_AUDIT.md](docs/PRODUCTION_READINESS_AUDIT.md) | Latest engineering audit and open risks |

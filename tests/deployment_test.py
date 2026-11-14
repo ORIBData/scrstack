@@ -23,6 +23,10 @@ class DeploymentTest(unittest.TestCase):
             'SCRS_S3_ACCESS_KEY': 'synthetic', 'SCRS_S3_SECRET_KEY': 'synthetic',
             'SCRS_SCANNER_API_TOKEN': 'synthetic-scanner-token-at-least-32-characters',
             'SCRS_MASTER_KEY': 'synthetic', 'SCRS_BOOTSTRAP_API_TOKEN': 'synthetic-token',
+            'SCRS_QA_RUNNER_IMAGE': 'example/scrs-qa-runner:scrs_2026_11_14_v123456abcdef',
+            'SCRS_QA_RUNNER_TOKEN': 'synthetic-runner-token-at-least-32-characters',
+            'SCRS_QA_DOMAIN': 'qa-runner.staging.example.com',
+            'SCRS_QA_ROUTER_NAME': 'scrs-qa-staging',
         }
         with tempfile.NamedTemporaryFile(mode='w') as env:
             env.write('\n'.join(f'{key}={value}' for key,value in values.items())); env.flush()
@@ -47,3 +51,23 @@ class DeploymentTest(unittest.TestCase):
             self.assertFalse(set(env) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN'})
             self.assertNotIn('ports', config['services'][service])
         self.assertEqual(scanner['environment']['SCRS_REMEDIATION_ENABLED'], 'true')
+
+        # The Karate runner: its own router and hostname, private qa network
+        # shared with the API and worker, and no SCRS secrets.
+        runner=config['services']['scrs-qa-runner']; rl=runner['labels']
+        self.assertEqual(runner['image'], 'example/scrs-qa-runner:scrs_2026_11_14_v123456abcdef')
+        self.assertEqual(set(runner['networks']), {'qa', 'proxy'})
+        self.assertTrue(config['networks']['qa']['internal'])
+        self.assertIn('qa', config['services']['scrs-worker']['networks'])
+        self.assertIn('qa', api['networks'])
+        self.assertNotIn('ports', runner)
+        self.assertEqual(rl['traefik.http.routers.scrs-qa-staging.rule'], 'Host(`qa-runner.staging.example.com`)')
+        self.assertEqual(rl['traefik.http.services.scrs-qa-staging.loadbalancer.server.port'], '8090')
+        self.assertEqual(rl['traefik.http.routers.scrs-qa-staging.middlewares'], 'scrs-qa-staging-allow')
+        self.assertEqual(rl['traefik.http.middlewares.scrs-qa-staging-allow.ipallowlist.sourcerange'], '127.0.0.1/32')
+        self.assertFalse(set(runner['environment']) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN', 'SCRS_SCANNER_API_TOKEN'})
+        self.assertEqual(runner['environment']['SCRS_QA_RUNNER_JOB_UID'], '10001')
+        self.assertEqual(runner['cap_drop'], ['ALL'])
+        self.assertTrue(runner['read_only'])
+        self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_QA_RUNNER_URL'], 'http://scrs-qa-runner:8090')
+        self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_QA_RUNNER_TOKEN'], runner['environment']['SCRS_QA_RUNNER_TOKEN'])

@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/ORIBData/scrstack/internal/netguard"
 	"net"
 	"net/url"
 	"os"
@@ -37,6 +38,8 @@ var Events = map[string]bool{
 	"feed.stale":             true,
 	"connection.degraded":    true,
 	"maintenance.completed":  true,
+	"qa.completed":           true,
+	"qa.failed":              true,
 	"ping":                   true,
 }
 
@@ -179,7 +182,7 @@ func (s *Store) validURL(raw string) bool {
 		return false
 	}
 	// Literal private addresses are only reachable through the explicit allow-list.
-	if ip := net.ParseIP(host); ip != nil && !private && !publicIP(ip) {
+	if ip := net.ParseIP(host); ip != nil && !private && !netguard.Public(ip) {
 		return false
 	}
 	return true

@@ -2,7 +2,7 @@ package assessments
 
 // Schema is applied under the storage migration lock. No destructive DDL.
 func Schema(s string) []string {
-	return append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...)
+	return append(append(append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...), taxiiSchema(s)...), qaSchema(s)...)
 }
 
 func baseSchema(s string) []string {

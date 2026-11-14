@@ -2,8 +2,7 @@
 
 SCRS checks every repository file and every container image layer file
 against threat intelligence. This page covers YARA rulesets and indicator
-sources. STIX 2.1 and TAXII 2.1 sources are being built next (see
-[Roadmap](#roadmap)).
+sources, which can be uploaded as STIX 2.1 or polled over TAXII 2.1.
 
 ## Sources
 
@@ -13,7 +12,8 @@ sources. STIX 2.1 and TAXII 2.1 sources are being built next (see
 | Indicator sources (`/intel/indicator-sources`) | Available | Repositories, image layers, GitHub events |
 | Indicator bundle (`PUT /feeds/indicators`) | Available; feeds the `bundle` source | Repositories, image layers, GitHub events |
 | YARA rulesets (`/intel/yara-rulesets`) | Available; run with YARA-X | Repositories, image layers |
-| STIX 2.1 upload and TAXII 2.1 polling | In progress | Repositories, image layers |
+| STIX 2.1 upload (`:import-stix`) | Available | Repositories, image layers, GitHub events |
+| TAXII 2.1 polling (`kind: taxii`) | Available | Repositories, image layers, GitHub events |
 
 ## YARA rulesets
 
@@ -153,17 +153,165 @@ existed. When an existing deployment is upgraded, its active bundle becomes
 the `bundle` source once. Its findings keep plain indicator IDs, so existing
 findings and waivers keep their fingerprints.
 
+## STIX 2.1 upload
+
+Create a source with `"kind": "stix"`, then upload a STIX 2.1 bundle:
+
+```sh
+curl -X POST "$SCRS/api/v1/intel/indicator-sources/$ID:import-stix?merge=true" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/stix+json" \
+  --data-binary @bundle.json
+```
+
+Only `indicator` objects are read; identities, relationships, malware objects
+and the rest are ignored. A STIX source takes only STIX, and a manual source
+only SCRS bundles.
+
+### What becomes an indicator
+
+| STIX pattern | SCRS indicator |
+| --- | --- |
+| `[file:hashes.MD5 = '…']`, `'SHA-1'`, `'SHA-256'` | `md5`, `sha1`, `sha256` |
+| `[file:name = 'run.sh']` | `file_path_regex` matching that exact last path element |
+| `[domain-name:value = '…']` | `domain` |
+| `[ipv4-addr:value = '…']` (a single address or `/32`) | `ipv4` |
+| `[url:value = '…']` | `url` |
+
+- `=` and `IN ('a', 'b')` are supported.
+- Alternatives joined by OR, inside one observation or between observations
+  (`[a] OR [b]`), become separate indicators. When only some alternatives can
+  be checked, those are imported and the pattern counts as `partial`.
+- In an AND that includes a file hash, such as
+  `[file:name = 'x.exe' AND file:hashes.MD5 = '…']`, the hash identifies the
+  file, so only the hash is used.
+- A pattern that yields several indicators gives them IDs `<stix id>#1`,
+  `#2` and so on. Findings use `<source>:<id>`.
+- `confidence` is kept and compared with the source's `min_confidence`.
+  Indicators without `valid_until` expire after `valid_days` (default 180).
+- When a bundle holds several versions of one indicator, the latest
+  `modified` wins.
+
+### What is counted, not imported
+
+The response has a `report` that counts each skipped indicator by reason, with
+up to 50 samples:
+
+| Reason | Example |
+| --- | --- |
+| `combines_observations` | `[a] AND [b]`, `[a] FOLLOWEDBY [b]` |
+| `time_window` | `WITHIN 600 SECONDS`, `REPEATS`, `START`/`STOP` |
+| `unsupported_object` | `network-traffic`, `process`, `email-message`, or `file:size` |
+| `unsupported_operator` | `MATCHES`, `LIKE`, `>`, `NOT =`, `EXISTS` |
+| `combines_conditions` | `[file:name = 'a' AND file:size = 10]` |
+| `unsupported_hash`, `unsupported_value` | SHA-512, SSDEEP; IPv4 ranges such as `/24` |
+| `unsupported_pattern_type` | Sigma, Snort, Suricata, PCRE |
+| `revoked`, `expired`, `superseded`, `unsupported_version` | STIX 2.0 objects |
+| `invalid_pattern`, `invalid_yara` | Patterns that do not parse or compile |
+
+### Merge or replace
+
+Without `merge`, an upload replaces all the source's indicators. With
+`merge=true`, it replaces only the indicators that the bundle's indicator
+objects produced before. Objects the bundle does not mention are kept, and
+revoked or expired ones are removed. Use `merge=true` for incremental exports.
+
+### YARA patterns
+
+Indicators with `pattern_type: yara` are compiled into one ruleset named
+`stix_<source>`, rebuilt on every upload:
+
+- Each pattern is compiled on its own first; one that fails is skipped as
+  `invalid_yara` with the compiler message.
+- `import` lines are hoisted and deduplicated. A pattern declaring a rule name
+  that an earlier pattern (in STIX ID order) already declared is left out as
+  `duplicate_rule_name`.
+- The ruleset takes the source's mode, severity and enabled flag, now and
+  whenever the source changes, and is deleted with the source. Edits made
+  directly to the ruleset are replaced by the next upload.
+- Expired and below-confidence patterns leave the ruleset at the next upload.
+- An upload holds at most 200 YARA patterns.
+
+## TAXII 2.1 polling
+
+A source of kind `taxii` polls one TAXII 2.1 collection. Each page of
+indicator objects is imported as a STIX merge (see
+[STIX 2.1 upload](#stix-21-upload)), so the same pattern rules, YARA handling
+and report reasons apply. Only `admin` can create, change, poll or delete a
+TAXII source.
+
+```sh
+curl -X POST "$SCRS/api/v1/intel/indicator-sources" -H "Authorization: Bearer $ADMIN" \
+  -H "Content-Type: application/json" -d '{
+    "name": "opencti",
+    "kind": "taxii",
+    "min_confidence": 60,
+    "taxii": {
+      "api_root": "https://opencti.example.org/taxii2/root/",
+      "collection": "a1b2c3d4-...",
+      "auth_type": "api_key",
+      "api_key": "Bearer <OpenCTI API token>",
+      "interval_minutes": 60
+    }
+  }'
+curl -X POST "$SCRS/api/v1/intel/indicator-sources/$ID:test" -H "Authorization: Bearer $ADMIN"
+```
+
+`:test` reads the collection with the stored settings and returns its title
+and whether it can be read. Use it before the first poll.
+
+### Settings for common servers
+
+| Server | Settings |
+| --- | --- |
+| OpenCTI | `api_root` `https://<host>/taxii2/root/`; the collection id from Data sharing > TAXII collections; `auth_type: api_key`, `api_key: "Bearer <token>"` |
+| MISP | The API root of the TAXII 2.1 server that publishes your MISP data, with the API key (`auth_type: api_key`, and `auth_header` if it is not `Authorization`) or basic auth that server uses |
+| Commercial vendor | The vendor's API root and collection; usually `auth_type: api_key` with `auth_header: X-API-Key`, or `basic` |
+| CISA AIS | The API root and collection from your AIS onboarding; `cert_pem` and `key_pem` for the client certificate you enrolled (with `auth_type: none`, or `basic` if AIS issued a username); `ca_pem` if the server certificate does not chain to a public root |
+
+A client certificate (`cert_pem` and `key_pem`) can be added to any
+`auth_type`. `ca_pem` replaces the system roots for the server certificate.
+
+### How polling works
+
+- **Schedule.** The worker checks for due feeds every
+  `SCRS_TAXII_POLL_SECONDS` (default 60; 0 disables polling). Each feed is
+  polled every `interval_minutes` (default 60, 5 to 10080).
+  `POST .../{id}:poll` makes a feed due at once.
+- **Cursor.** Each request asks for `match[type]=indicator`, at most
+  `page_size` objects (default 1000), and objects `added_after` the cursor.
+  The cursor is the last `X-TAXII-Date-Added-Last` the server sent, saved
+  after every imported page. A worker that stops mid-poll fetches at most
+  one page again, and the merge makes that harmless.
+- **Paging.** Pages are followed with `next`, or by date when the server
+  sends no `next`. One poll reads at most 20 pages; when more remain, the
+  feed is due again at once.
+- **Servers without `X-TAXII-Date-Added-Last`.** The cursor does not move,
+  so each poll reads the collection from the start. The merge keeps the
+  result correct, but large collections cost more to poll.
+- **Failures.** A failed poll keeps the cursor and records `last_error`.
+  The retry waits `interval_minutes`, doubling with each consecutive failure
+  up to one day. The third consecutive failure emits a `feed.stale` event
+  with the source name.
+- **Leases.** A worker leases a feed for 15 minutes, so several workers never
+  poll one feed at once.
+- **Changing settings.** `PATCH .../{id}/taxii` changes settings. Any
+  credential field replaces the whole credential. A new `api_root` or
+  `collection`, or `reset_cursor: true`, polls the collection from the start.
+
+### Security
+
+- Credentials are encrypted with `SCRS_MASTER_KEY` (AES-GCM, bound to the
+  source) and are never returned by the API. `GET .../{id}/taxii` shows the
+  settings, cursor and last outcome.
+- `api_root` must be https. Redirects are refused, so a credential is never
+  sent to another host.
+- Requests resolve the host and connect only to public addresses, so a feed
+  URL cannot reach internal services. To poll an internal server such as an
+  OpenCTI on the same network, list its hostname in
+  `SCRS_TAXII_PRIVATE_HOSTS` on the API and worker.
+
 ## Roadmap
 
-These items are being built, in this order:
-
-1. **STIX 2.1 upload.** Simple comparison patterns become indicators:
-   `file:hashes`, `domain-name`, `ipv4-addr`, `url` and `file:name`.
-   `pattern_type: yara` becomes a YARA ruleset. Patterns that cannot be checked
-   against files at rest are counted and reported: patterns that combine
-   observations, time windows and network traffic.
-2. **TAXII 2.1 polling.** Supports OpenCTI and MISP, commercial vendors, and
-   CISA AIS. Authentication is by API key, basic auth or a client TLS
-   certificate. The `added_after` cursor means each poll fetches only new
-   objects. Credentials are encrypted, and outbound requests use the
-   SSRF-safe dialer.
+The threat-intelligence module (YARA-X rulesets, indicator sources, STIX 2.1
+upload and TAXII 2.1 polling) is complete. Next is milestone M8: licences,
+SPDX export and compliance evidence reports.

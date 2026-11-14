@@ -39,6 +39,14 @@ services:
       SCRS_MASS_DELETION_FILES: ${SCRS_MASS_DELETION_FILES:-50}
       SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
       SCRS_WEBHOOK_PRIVATE_HOSTS: ${SCRS_WEBHOOK_PRIVATE_HOSTS:-}
+      # TAXII feed hosts allowed to resolve to private addresses (feed checks).
+      SCRS_TAXII_PRIVATE_HOSTS: ${SCRS_TAXII_PRIVATE_HOSTS:-}
+      # E2E QA: the Karate runner (for GET /qa/runner) and self-hosted model
+      # hosts allowed to resolve privately (LLM provider checks).
+      SCRS_QA_RUNNER_URL: ${SCRS_QA_RUNNER_URL:-http://scrs-qa-runner:8090}
+      SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN to 32+ random characters}
+      SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
+      SCRS_LLM_PRIVATE_HOSTS: ${SCRS_LLM_PRIVATE_HOSTS:-}
       SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
       SCRS_EVENT_FIELD_MAX: ${SCRS_EVENT_FIELD_MAX:-512}
       SCRS_EVENT_REDACT: ${SCRS_EVENT_REDACT:-}
@@ -54,6 +62,7 @@ services:
     networks:
       - default
       - proxy
+      - qa
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=${SCRS_TRAEFIK_NETWORK:-dokploy-network}"
@@ -99,6 +108,19 @@ services:
       # GitHub webhook delivery check: redeliver missed events (0 disables).
       SCRS_GITHUB_HOOK_CHECK_MINUTES: ${SCRS_GITHUB_HOOK_CHECK_MINUTES:-5}
       SCRS_GITHUB_HOOK_URL: ${SCRS_GITHUB_HOOK_URL:-}
+      # TAXII 2.1 feeds: how often due feeds are checked (0 disables polling),
+      # and feed hosts allowed to resolve to private addresses.
+      SCRS_TAXII_POLL_SECONDS: ${SCRS_TAXII_POLL_SECONDS:-60}
+      SCRS_TAXII_PRIVATE_HOSTS: ${SCRS_TAXII_PRIVATE_HOSTS:-}
+      # E2E QA: the stack's Karate runner over the private qa network (set an
+      # https URL instead for a runner on another host); test generation calls
+      # the LLM providers added through the API.
+      SCRS_QA_RUNNER_URL: ${SCRS_QA_RUNNER_URL:-http://scrs-qa-runner:8090}
+      SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN}
+      SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
+      SCRS_QA_MAX_ACTIVE: ${SCRS_QA_MAX_ACTIVE:-4}
+      SCRS_QA_GENERATION_ENABLED: ${SCRS_QA_GENERATION_ENABLED:-true}
+      SCRS_LLM_PRIVATE_HOSTS: ${SCRS_LLM_PRIVATE_HOSTS:-}
       # Git history mirrors (bundles in S3); scheduled for assets labelled mirror=true.
       SCRS_MIRRORS_ENABLED: ${SCRS_MIRRORS_ENABLED:-true}
       SCRS_MIRROR_INTERVAL_HOURS: ${SCRS_MIRROR_INTERVAL_HOURS:-0}
@@ -118,8 +140,10 @@ services:
         condition: service_completed_successfully
       scrs-scanner:
         condition: service_healthy
-    networks: [default, scanning]
+    networks: [default, scanning, qa]
     read_only: true
+    # YARA patterns from TAXII feeds compile in a scratch directory.
+    tmpfs: ["/tmp:size=67108864,mode=1777,noexec,nosuid"]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     mem_limit: 512m
@@ -224,6 +248,64 @@ services:
     cpus: 1
     labels: ["traefik.enable=false"]
 
+  # E2E QA Karate runner (its own image, deploy/karate-runner/Dockerfile).
+  # SCRS reaches it privately at http://scrs-qa-runner:8090 on the internal
+  # qa network; Traefik also publishes it at SCRS_QA_DOMAIN for external
+  # callers, limited to SCRS_QA_RUNNER_ALLOWED_CIDRS and the bearer token.
+  # It runs repository test code: it holds no SCRS secrets and is kept off
+  # the default network. See docs/QA_TESTING.md for the host firewall rules.
+  scrs-qa-runner:
+    image: ${SCRS_QA_RUNNER_IMAGE:?Set SCRS_QA_RUNNER_IMAGE to your published runner image reference}
+    restart: unless-stopped
+    environment:
+      SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN}
+      SCRS_QA_RUNNER_SLOTS: ${SCRS_QA_RUNNER_SLOTS:-1}
+      SCRS_QA_RUNNER_MAX_QUEUED: ${SCRS_QA_RUNNER_MAX_QUEUED:-20}
+      SCRS_QA_RUNNER_RETENTION_HOURS: ${SCRS_QA_RUNNER_RETENTION_HOURS:-24}
+      # Tests run as this user: they cannot read the runner's token.
+      SCRS_QA_RUNNER_JOB_UID: "10001"
+      SCRS_QA_RUNNER_JOB_GID: "10001"
+    networks:
+      - qa
+      - proxy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${SCRS_TRAEFIK_NETWORK:-dokploy-network}"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.rule=Host(`${SCRS_QA_DOMAIN:?Set SCRS_QA_DOMAIN to the runner's DNS hostname}`)"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.entrypoints=${SCRS_HTTPS_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.tls=true"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.tls.certresolver=${SCRS_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.middlewares=${SCRS_QA_ROUTER_NAME:-scrs-qa}-allow"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}.service=${SCRS_QA_ROUTER_NAME:-scrs-qa}"
+      - "traefik.http.services.${SCRS_QA_ROUTER_NAME:-scrs-qa}.loadbalancer.server.port=8090"
+      - "traefik.http.middlewares.${SCRS_QA_ROUTER_NAME:-scrs-qa}-allow.ipallowlist.sourcerange=${SCRS_QA_RUNNER_ALLOWED_CIDRS:-127.0.0.1/32}"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}-http.rule=Host(`${SCRS_QA_DOMAIN}`)"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}-http.entrypoints=${SCRS_HTTP_ENTRYPOINT:-web}"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}-http.middlewares=${SCRS_QA_ROUTER_NAME:-scrs-qa}-https"
+      - "traefik.http.routers.${SCRS_QA_ROUTER_NAME:-scrs-qa}-http.service=${SCRS_QA_ROUTER_NAME:-scrs-qa}"
+      - "traefik.http.middlewares.${SCRS_QA_ROUTER_NAME:-scrs-qa}-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${SCRS_QA_ROUTER_NAME:-scrs-qa}-https.redirectscheme.permanent=true"
+    expose:
+      - "8090"
+    # The supervisor starts as root only to switch test processes to the job
+    # user and manage their files; every other capability is dropped.
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, FOWNER, DAC_OVERRIDE, KILL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /work:size=${SCRS_QA_RUNNER_WORK_SIZE:-2g},mode=0711
+      - /tmp:size=512m,mode=1777
+    shm_size: 1g
+    mem_limit: ${SCRS_QA_RUNNER_MEMORY:-3g}
+    pids_limit: 2048
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   scrs-clamav-signatures:
   scrs-feeds:
@@ -231,6 +313,9 @@ volumes:
 
 networks:
   scanning:
+    internal: true
+  # API and worker <-> Karate runner only; no route out.
+  qa:
     internal: true
   proxy:
     external: true

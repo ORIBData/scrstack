@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -505,7 +507,8 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 	// TIF indicator sources follow the ruleset permission model.
 	must(call(intel, "POST", "/intel/indicator-sources", reader, `{"name":"partner_feed"}`, nil), 403)
 	must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"partner_feed","mode":"block"}`, nil), 403)
-	must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"partner_feed","kind":"taxii"}`, nil), 400)
+	must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"partner_feed","kind":"taxii"}`, nil), 403)
+	must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"partner_feed","kind":"feed"}`, nil), 400)
 	var source assessments.IndicatorSource
 	decode(must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"partner_feed","min_confidence":60,"origin":{"vendor":"Partner CERT","url":"https://cert.example/feed"}}`, nil), 201), &source)
 	if source.Mode != "hunt" || source.Severity != "high" || !source.Enabled || source.IndicatorCount != 0 {
@@ -556,8 +559,142 @@ func TestPostgresGitLabRegistryImportAndMirrors(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.audit_log WHERE action='indicator_source.mode_changed' AND target_id=$1`, source.ID).Scan(&audited); err != nil || audited != 1 {
 		t.Fatal("source promotion is audited", audited, err)
 	}
+
+	// STIX 2.1 upload into a stix source.
+	stixObject := func(n int, patternType, pattern, extra string) string {
+		body, _ := json.Marshal(pattern)
+		return fmt.Sprintf(`{"type":"indicator","spec_version":"2.1","id":"indicator--00000000-0000-4000-8000-%012d","created":"2026-01-01T00:00:00Z","modified":"2026-01-01T00:00:00Z","pattern":%s,"pattern_type":%q,"valid_from":"2026-01-01T00:00:00Z"%s}`, n, body, patternType, extra)
+	}
+	stixBundle := func(id string, objects ...string) string {
+		return `{"type":"bundle","id":"bundle--00000000-0000-4000-8000-` + id + `","objects":[` + strings.Join(objects, ",") + `]}`
+	}
+	upload := stixBundle("000000000001",
+		stixObject(1, "stix", `[domain-name:value = 'c2.example']`, `,"confidence":90`),
+		stixObject(2, "stix", `[file:hashes.MD5 = 'd41d8cd98f00b204e9800998ecf8427e' OR file:hashes.'SHA-1' = 'da39a3ee5e6b4b0d3255bfef95601890afd80709']`, ``),
+		stixObject(3, "stix", `[network-traffic:dst_port = 4444]`, ``),
+		stixObject(4, "yara", "import \"pe\"\nrule Stix_Dropper { condition: pe.is_pe }", ``),
+		stixObject(5, "yara", "rule Broken { BROKEN }", ``),
+		stixObject(6, "yara", "rule Stix_Dropper { condition: true }", ``),
+	)
+	must(call(intel, "POST", sourcePath+":import-stix", admin, upload, nil), 409)
+	var stix assessments.IndicatorSource
+	decode(must(call(intel, "POST", "/intel/indicator-sources", writer, `{"name":"cert_feed","kind":"stix"}`, nil), 201), &stix)
+	stixPath := "/intel/indicator-sources/" + stix.ID.String()
+	must(call(intel, "PUT", stixPath+"/indicators", writer, indicators, nil), 409)
+	must(call(intel, "POST", stixPath+":import-stix?valid_days=0", writer, upload, nil), 400)
+	must(call(intel, "POST", stixPath+":import-stix", writer, `{"type":"indicator"}`, nil), 400)
+	var stixResult struct {
+		Source  assessments.IndicatorSource `json:"source"`
+		Report  intelligence.STIXReport     `json:"report"`
+		RuleSet *assessments.RuleSetRecord  `json:"yara_ruleset"`
+	}
+	decode(must(call(intel, "POST", stixPath+":import-stix", writer, upload, nil), 200), &stixResult)
+	report := stixResult.Report
+	if report.Imported != 3 || report.Yara != 2 || report.Skipped["unsupported_object"] != 1 || report.Skipped["invalid_yara"] != 1 || report.Skipped["duplicate_rule_name"] != 1 {
+		t.Fatalf("STIX report: %+v", report)
+	}
+	if stixResult.Source.IndicatorCount != 3 || stixResult.Source.Version != "bundle--00000000-0000-4000-8000-000000000001" || stixResult.RuleSet == nil || stixResult.Source.YaraRulesetID == nil {
+		t.Fatalf("STIX source: %+v ruleset %+v", stixResult.Source, stixResult.RuleSet)
+	}
+	linked := "/intel/yara-rulesets/" + stixResult.RuleSet.ID.String()
+	if body := must(call(intel, "GET", linked, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"name":"stix_cert_feed"`) || !strings.Contains(body, `"mode":"hunt"`) || strings.Count(body, "rule Stix_Dropper") != 1 {
+		t.Fatal("linked ruleset", body)
+	}
+	if scan, err := jobs.ScanIndicators(ctx); err != nil || !strings.Contains(string(scan), `"id":"indicator--00000000-0000-4000-8000-000000000002#2"`) || strings.Contains(string(scan), `"type":"yara"`) {
+		t.Fatal("STIX indicators in the scan bundle, YARA rows kept out", err)
+	}
+	// Promoting the source promotes its ruleset.
+	must(call(intel, "PATCH", stixPath, admin, `{"mode":"alert"}`, map[string]string{"If-Match": fmt.Sprintf(`"%d"`, stixResult.Source.Revision)}), 200)
+	if body := must(call(intel, "GET", linked, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"mode":"alert"`) {
+		t.Fatal("ruleset does not follow the source mode", body)
+	}
+	must(call(intel, "POST", stixPath+":import-stix", writer, upload, nil), 403)
+	// A merge that revokes one object keeps the others.
+	revoke := stixBundle("000000000002", strings.Replace(stixObject(1, "stix", `[domain-name:value = 'c2.example']`, `,"revoked":true`), `"modified":"2026-01-01T00:00:00Z"`, `"modified":"2026-02-01T00:00:00Z"`, 1))
+	decode(must(call(intel, "POST", stixPath+":import-stix?merge=true", admin, revoke, nil), 200), &stixResult)
+	if stixResult.Source.IndicatorCount != 2 || stixResult.Report.Skipped["revoked"] != 1 || stixResult.RuleSet == nil {
+		t.Fatalf("merge: %+v %+v", stixResult.Source, stixResult.Report)
+	}
+	// Replacing without YARA patterns removes the linked ruleset.
+	decode(must(call(intel, "POST", stixPath+":import-stix", admin, revoke, nil), 200), &stixResult)
+	if stixResult.Source.IndicatorCount != 0 || stixResult.RuleSet != nil || stixResult.Source.YaraRulesetID != nil {
+		t.Fatalf("replace: %+v", stixResult.Source)
+	}
+	must(call(intel, "GET", linked, reader, "", nil), 404)
+	must(call(intel, "DELETE", stixPath, admin, "", nil), 204)
+
 	must(call(intel, "DELETE", sourcePath, admin, "", nil), 204)
 	must(call(intel, "GET", sourcePath, reader, "", nil), 404)
+
+	// TAXII 2.1 feeds: admin only, credentials sealed and never returned.
+	_, feedAdmin, err := store.CreateToken(ctx, connections.Token{Name: "cti-admin", Scopes: []string{"admin"}}, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collection := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer opencti-secret" {
+			w.WriteHeader(401)
+			return
+		}
+		fmt.Fprint(w, `{"id":"col","title":"OpenCTI indicators","can_read":true}`)
+	}))
+	defer collection.Close()
+	feedCA, _ := json.Marshal(string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: collection.Certificate().Raw})))
+	cti := HandlerWithSecurity(nil, store, Security{Store: store, Redis: rdb, Assessments: jobs, ValidateRules: compiler, TAXIIPrivateHosts: map[string]bool{"127.0.0.1": true}})
+	taxiiSource := func(root string) string {
+		return `{"name":"opencti","kind":"taxii","taxii":{"api_root":"` + root + `","collection":"col","auth_type":"api_key","api_key":"Bearer opencti-secret","ca_pem":` + string(feedCA) + `,"interval_minutes":30}}`
+	}
+	must(call(cti, "POST", "/intel/indicator-sources", writer, taxiiSource(collection.URL+"/taxii2/"), nil), 403)
+	must(call(cti, "POST", "/intel/indicator-sources", feedAdmin, `{"name":"opencti","kind":"taxii"}`, nil), 400)
+	must(call(cti, "POST", "/intel/indicator-sources", feedAdmin, `{"name":"opencti","taxii":{"api_root":"https://cti.example/"}}`, nil), 400)
+	if body := must(call(cti, "POST", "/intel/indicator-sources", feedAdmin, taxiiSource("http://cti.example/taxii2/"), nil), 400).Body.String(); !strings.Contains(body, "https") {
+		t.Fatal("api_root must be https", body)
+	}
+	var feedSource struct {
+		assessments.IndicatorSource
+		TAXII *assessments.TAXIIFeed `json:"taxii"`
+	}
+	feedCreated := must(call(cti, "POST", "/intel/indicator-sources", feedAdmin, taxiiSource(collection.URL+"/taxii2/"), nil), 201)
+	decode(feedCreated, &feedSource)
+	if feedSource.Kind != "taxii" || feedSource.Mode != "hunt" || feedSource.TAXII == nil || feedSource.TAXII.AuthHeader != "Authorization" || feedSource.TAXII.IntervalMinutes != 30 || strings.Contains(feedCreated.Body.String(), "opencti-secret") {
+		t.Fatalf("created TAXII source %s", feedCreated.Body.String())
+	}
+	feedPath := "/intel/indicator-sources/" + feedSource.ID.String()
+	for _, path := range []string{"/intel/indicator-sources", feedPath, feedPath + "/taxii"} {
+		if body := must(call(cti, "GET", path, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"api_root"`) || strings.Contains(body, "opencti-secret") {
+			t.Fatal("feed state is readable and the credential is not", path, body)
+		}
+	}
+	must(call(cti, "PATCH", feedPath, writer, `{"description":"x"}`, map[string]string{"If-Match": `"1"`}), 403)
+	must(call(cti, "POST", feedPath+":poll", writer, "", nil), 403)
+	must(call(cti, "PATCH", feedPath+"/taxii", writer, `{"interval_minutes":15}`, nil), 403)
+	if body := must(call(cti, "POST", feedPath+":test", feedAdmin, "", nil), 200).Body.String(); !strings.Contains(body, `"ok":true`) || !strings.Contains(body, "OpenCTI indicators") {
+		t.Fatal("feed check", body)
+	}
+	// Rotating the credential replaces it; a wrong one shows in the check.
+	must(call(cti, "PATCH", feedPath+"/taxii", feedAdmin, `{"api_key":"Bearer rotated-wrong"}`, nil), 200)
+	if body := must(call(cti, "POST", feedPath+":test", feedAdmin, "", nil), 502).Body.String(); !strings.Contains(body, "refused the credentials") {
+		t.Fatal("feed check with a wrong key", body)
+	}
+	must(call(cti, "PATCH", feedPath+"/taxii", feedAdmin, `{"auth_type":"basic"}`, nil), 400)
+	var patched assessments.TAXIIFeed
+	decode(must(call(cti, "PATCH", feedPath+"/taxii", feedAdmin, `{"api_key":"Bearer opencti-secret","interval_minutes":15,"reset_cursor":true}`, nil), 200), &patched)
+	if patched.IntervalMinutes != 15 || patched.AuthType != "api_key" {
+		t.Fatalf("patched feed %+v", patched)
+	}
+	must(call(cti, "POST", feedPath+":test", feedAdmin, "", nil), 200)
+	var sealed []byte
+	if err := pool.QueryRow(ctx, `SELECT credential FROM `+schema+`.taxii_feeds WHERE source_id=$1`, feedSource.ID).Scan(&sealed); err != nil || bytes.Contains(sealed, []byte("opencti-secret")) {
+		t.Fatal("credential stored in clear", err)
+	}
+	must(call(cti, "PUT", feedPath+"/indicators", feedAdmin, indicators, nil), 409)
+	must(call(cti, "POST", feedPath+":poll", feedAdmin, "", nil), 202)
+	must(call(cti, "POST", "/intel/indicator-sources/"+uuid.NewString()+":poll", feedAdmin, "", nil), 404)
+	must(call(cti, "DELETE", feedPath, feedAdmin, "", nil), 204)
+	var feeds int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.taxii_feeds`).Scan(&feeds); err != nil || feeds != 0 {
+		t.Fatal("feed outlives its source", feeds, err)
+	}
 }
 
 // missingHook is a GitHub organization without a webhook pointing at SCRS.

@@ -28,6 +28,10 @@ help:
 	@echo 'database-test   Exercise concurrency, tokens, lifecycle and PostgreSQL restore'
 	@echo 'legacy-integration  Test the internal legacy scanner with ClamAV fixtures'
 	@echo 'qa              Run local tests, lint, contracts and tooling checks'
+	@echo 'qa-runner-image Build the Karate runner image (E2E QA)'
+	@echo 'qa-runner-test  Test the runner with the pinned Karate jar (needs Java 21)'
+	@echo 'qa-runner-image-test  Test API, UI and load runs in a hardened runner container'
+	@echo 'release-qa-runner  Push SCRS_QA_RUNNER_IMAGE (Karate runner) for the Dokploy stack'
 	@echo 'clean           Remove older local SCRS images; keep newest and container-used images'
 	@echo 'clean-dry-run   Preview which local SCRS image tags would be removed'
 	@echo 'storage-check   Test the configured PostgreSQL, Redis and S3 stores'
@@ -44,7 +48,7 @@ build:
 	$(GO) build -trimpath -o bin/scrs ./cmd/scrs
 
 test:
-	$(GO) test -race ./cmd/scrs/... ./internal/... ./api/...
+	$(GO) test -race ./cmd/... ./internal/... ./api/...
 
 lint:
 	@test -z "$$(find cmd/scrs internal api -name '*.go' -print0 | xargs -0 gofmt -l)" || { echo 'Go files needed formatting'; exit 1; }
@@ -106,6 +110,40 @@ image-audit:
 qa: test lint contract-check
 	$(GO) test -race . -run 'TestLegacySecurity|TestMalformedMultipart'
 	python3 -m unittest discover -s tests -p '*_test.py'
+
+# E2E QA: the Karate runner image (built from deploy/karate-runner), and the
+# runner tests against the pinned Karate jar and a running runner container.
+QA_RUNNER_IMAGE ?= scrs-qa-runner:local
+KARATE_JAR_URL := https://github.com/karatelabs/karate/releases/download/v2.1.4/karate-2.1.4.jar
+KARATE_JAR_SHA256 := 1f743f4acc56526b39bd88c84bfe4491c46d5e94f4ab5a38c437c9400dbc2488
+
+.PHONY: qa-runner-image qa-runner-test qa-runner-image-test release-qa-runner
+qa-runner-image:
+	$(DOCKER) build -f deploy/karate-runner/Dockerfile -t $(QA_RUNNER_IMAGE) .
+
+# Publishes the runner image the Dokploy stack deploys as scrs-qa-runner.
+# SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}
+SCRS_QA_RUNNER_IMAGE ?=
+release-qa-runner:
+	@test -n "$(SCRS_QA_RUNNER_IMAGE)" || { echo 'Set SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}' >&2; exit 2; }
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+
+qa-runner-test:
+	@mkdir -p bin
+	@test -f bin/karate-2.1.4.jar || curl -fsSL -o bin/karate-2.1.4.jar $(KARATE_JAR_URL)
+	@echo "$(KARATE_JAR_SHA256)  bin/karate-2.1.4.jar" | shasum -a 256 -c -
+	SCRS_TEST_KARATE_JAR=$(CURDIR)/bin/karate-2.1.4.jar $(GO) test -race -count=1 -run 'TestRealKarate|TestRunner' ./internal/qarunner/
+
+qa-runner-image-test: qa-runner-image
+	@name=scrs-qa-runner-test-$$$$; token=$$(openssl rand -hex 24); \
+	trap '$(DOCKER) rm -f '"$$name"' >/dev/null 2>&1' EXIT; \
+	$(DOCKER) run -d --name $$name -e SCRS_QA_RUNNER_TOKEN=$$token -e SCRS_QA_RUNNER_JOB_UID=10001 -e SCRS_QA_RUNNER_JOB_GID=10001 \
+	  --cap-drop ALL --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add FOWNER --cap-add DAC_OVERRIDE --cap-add KILL \
+	  --security-opt no-new-privileges:true --read-only --tmpfs /work:size=2g,mode=0711 --tmpfs /tmp:size=512m,mode=1777 \
+	  --shm-size 1g --add-host host.docker.internal:host-gateway -p 127.0.0.1::8090 $(QA_RUNNER_IMAGE) >/dev/null; \
+	sleep 3; port=$$($(DOCKER) port $$name 8090/tcp | head -1); \
+	SCRS_TEST_RUNNER_URL=http://$$port SCRS_TEST_RUNNER_TOKEN=$$token SCRS_TEST_RUNNER_HOST=host.docker.internal \
+	  $(GO) test -count=1 -run TestRunnerImage -v ./internal/qarunner/
 
 .PHONY: legacy-integration
 legacy-integration:

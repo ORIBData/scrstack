@@ -17,6 +17,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/notify"
+	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/scanner"
 )
 
@@ -66,6 +67,17 @@ type Worker struct {
 	KeepMirrors    int
 	// MirrorMinAgeDays protects bundles younger than this from pruning.
 	MirrorMinAgeDays int
+	// TAXIIPrivateHosts may resolve to internal addresses (SCRS_TAXII_PRIVATE_HOSTS).
+	TAXIIPrivateHosts map[string]bool
+	// ValidateRules compiles YARA rules from STIX feeds.
+	ValidateRules func(ctx context.Context, rules string) error
+	// QARunner is the Karate runner; nil disables QA runs.
+	QARunner *qa.Runner
+	// QAMaxActive bounds runs submitted to the runner at once.
+	QAMaxActive int
+	QAReports   QAReports
+	// LLMPrivateHosts may resolve to internal addresses (SCRS_LLM_PRIVATE_HOSTS).
+	LLMPrivateHosts map[string]bool
 }
 
 // RunMirrors processes queued mirror requests one at a time. A bundle streams

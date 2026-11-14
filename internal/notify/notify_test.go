@@ -1,6 +1,7 @@
 package notify
 
 import (
+	"github.com/ORIBData/scrstack/internal/netguard"
 	"net"
 	"testing"
 	"time"
@@ -38,11 +39,11 @@ func TestSubscriptionURLPolicy(t *testing.T) {
 		}
 	}
 	for _, ip := range []string{"127.0.0.1", "10.0.0.1", "100.64.0.1", "169.254.169.254", "198.18.0.1", "::1", "fd00::1", "64:ff9b::a00:1"} {
-		if publicIP(net.ParseIP(ip)) {
+		if netguard.Public(net.ParseIP(ip)) {
 			t.Errorf("%s treated as public", ip)
 		}
 	}
-	if !publicIP(net.ParseIP("140.82.112.3")) {
+	if !netguard.Public(net.ParseIP("140.82.112.3")) {
 		t.Error("public address rejected")
 	}
 	if !validEvents([]string{"assessment.completed", "integrity.alert"}) || validEvents([]string{"assessment.completed", "assessment.completed"}) || validEvents([]string{"made.up"}) || validEvents(nil) {

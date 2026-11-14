@@ -1,0 +1,41 @@
+# SCRS Karate runner, for the QA host you manage (a VM separate from SCRS).
+# It runs repository test code, so it holds no SCRS credentials: only the
+# runner token SCRS presents. Restrict its outbound traffic to the systems
+# under test (and package mirrors, if tests need them); see docs/QA_TESTING.md.
+#
+#   SCRS_QA_RUNNER_TOKEN=$(openssl rand -hex 32) docker compose -f deploy/compose.qa-runner.yaml up -d
+#
+# Put it behind TLS (a reverse proxy, or SCRS_QA_RUNNER_TLS_CERT/KEY) and set
+# SCRS_QA_RUNNER_URL and SCRS_QA_RUNNER_TOKEN on the SCRS API and worker.
+services:
+  scrs-qa-runner:
+    image: ${SCRS_QA_RUNNER_IMAGE:-scrs-qa-runner:latest}
+    build:
+      context: ..
+      dockerfile: deploy/karate-runner/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Or SCRS_QA_RUNNER_TOKEN_FILE naming a mounted secret file.
+      SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN to 32+ random characters}
+      SCRS_QA_RUNNER_SLOTS: ${SCRS_QA_RUNNER_SLOTS:-2}
+      SCRS_QA_RUNNER_MAX_QUEUED: ${SCRS_QA_RUNNER_MAX_QUEUED:-20}
+      SCRS_QA_RUNNER_RETENTION_HOURS: ${SCRS_QA_RUNNER_RETENTION_HOURS:-24}
+      # Tests run as this user, so they cannot read the runner's token or
+      # other jobs' files.
+      SCRS_QA_RUNNER_JOB_UID: "10001"
+      SCRS_QA_RUNNER_JOB_GID: "10001"
+      SCRS_QA_RUNNER_TLS_CERT: ${SCRS_QA_RUNNER_TLS_CERT:-}
+      SCRS_QA_RUNNER_TLS_KEY: ${SCRS_QA_RUNNER_TLS_KEY:-}
+    ports: ["${SCRS_QA_RUNNER_BIND:-127.0.0.1:8090}:8090"]
+    # The supervisor starts as root only to switch test processes to the job
+    # user and manage their files; every other capability is dropped.
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, FOWNER, DAC_OVERRIDE, KILL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /work:size=4g,mode=0711
+      - /tmp:size=512m,mode=1777
+    mem_limit: ${SCRS_QA_RUNNER_MEMORY:-4g}
+    pids_limit: 2048
+    shm_size: 1g

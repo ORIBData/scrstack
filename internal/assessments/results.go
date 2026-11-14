@@ -132,6 +132,13 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 			}
 		}
 	}
+	// An API repository without a QA profile is reported once per complete
+	// content walk (report-only; see QA_TESTING.md).
+	if missing, err := s.unconfiguredQA(ctx, tx, a, r); err != nil {
+		return err
+	} else if missing != nil && len(r.Findings) < 10000 {
+		r.Findings = append(r.Findings, *missing)
+	}
 	files, err := json.Marshal(r.Files)
 	if err != nil {
 		return ErrInput
@@ -254,6 +261,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		return err
 	}
 	v, counts := verdict(r, waived)
+	queued := a
+	queued.Commit = r.Commit
+	if err := s.queueQA(ctx, tx, queued, v); err != nil {
+		return err
+	}
 	stages, _ := json.Marshal(r.Stages)
 	countJSON, _ := json.Marshal(counts)
 	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff)
