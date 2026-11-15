@@ -385,4 +385,4 @@ The threat-intelligence module is complete:
 - the vulnerability-source registry with NVD and CVE Program records;
 - VEX import.
 
-Next is milestone M8: licences, SPDX export and compliance evidence reports.
+M8 (licences, SBOM exports, safe versions and compliance evidence reports) is done; see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). Next is M9: SAST analyzers and reachability.

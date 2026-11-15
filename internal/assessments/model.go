@@ -201,6 +201,37 @@ type Component struct {
 	Ecosystem string `json:"ecosystem"`
 	PURL      string `json:"purl"`
 	Path      string `json:"path"`
+	// Groups are the lockfile's dependency groups, such as "dev".
+	Groups []string `json:"dependency_groups,omitempty"`
+	// License is the component's licence (LIC-001); nil when unknown.
+	License *ComponentLicense `json:"license,omitempty"`
+}
+
+// Dev reports a development-only dependency.
+func (c Component) Dev() bool {
+	for _, g := range c.Groups {
+		if g == "dev" {
+			return true
+		}
+	}
+	return false
+}
+
+// ComponentLicense records a component's licence and where it came from
+// (LIC-001): "declared" (manifest, lockfile or package database),
+// "detected" (licence file text) or "metadata" (deps.dev).
+type ComponentLicense struct {
+	// Expression is a normalised SPDX license expression or NOASSERTION.
+	Expression string `json:"expression"`
+	Source     string `json:"source"`
+	// Declared is the licence text as found, when it differs.
+	Declared string `json:"declared,omitempty"`
+	// Confidence is set for detected licences (0 to 1).
+	Confidence float64 `json:"confidence,omitempty"`
+	// Evidence is the file the licence came from, or the metadata service.
+	Evidence  string            `json:"evidence,omitempty"`
+	Copyright []string          `json:"copyright,omitempty"`
+	Refs      map[string]string `json:"refs,omitempty"`
 }
 type Finding struct {
 	ID          uuid.UUID       `json:"id"`
@@ -258,7 +289,8 @@ func fingerprint(a Assessment, f Finding) string {
 // source's mode in the type: yara_match and ioc_match block like malware,
 // yara_alert and ioc_alert gate by severity like a vulnerability, and
 // yara_hunt and ioc_hunt never gate. E2E QA findings (qa_*) are
-// report-only.
+// report-only. Licence entries follow the licence policy: while it is
+// report-only a deny warns; once enforcing, deny fails and review warns.
 func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 	failing, warning := false, false
 	counts := map[string]int{"total": len(r.Findings)}
@@ -290,6 +322,11 @@ func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 			failing = true
 		case f.Type == "integrity":
 			warning = warning || serious || !existing
+		case f.Type == "license":
+			// Licence entries gate by policy result, new or existing.
+			counts["license"]++
+			fail, warn := licenseGate(f)
+			failing, warning = failing || fail, warning || warn
 		case f.Severity == "critical" && !existing:
 			failing = true
 		case f.Severity == "critical" || (f.Severity == "high" && !existing):
@@ -339,6 +376,7 @@ func closableTypes(stages []Stage) []string {
 		"yara_alert":           {"yara_x"},
 		"yara_hunt":            {"yara_x"},
 		"qa_unconfigured":      {"integrity"},
+		"license":              {"inventory", "license"},
 	}
 	types := []string{}
 	for kind, needed := range producers {

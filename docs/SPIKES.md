@@ -17,7 +17,7 @@ The PRD planned spikes S1–S13 before M2. Most questions were answered while bu
 | S6 | Image scanning path and layer attribution | Pull by digest, unpack layers in the scanner, inventory with OSV-Scanner, content-scan every layer file including whiteouts | Verified; Trivy parity in `docs/TRIVY_PARITY.md` |
 | S7 | YARA engine | YARA-X CLI for rulesets; ClamAV YARA subset for starter rules (ADR-006) | Verified |
 | S8 | Archive by commit, fork PR head, relay body integrity | Archives by immutable commit with redirects refused; PR scans pin the head commit; relay signatures over the exact body are verified | Verified (archive, relay); fork PR head Observed |
-| S9 | NVD full-sync volume; NVD, CVE and OSV overlap; licence detector | Targeted sync instead of a full mirror; detector deferred to M8 | Partly verified; volumes Open |
+| S9 | NVD full-sync volume; NVD, CVE and OSV overlap; licence detector | Targeted sync instead of a full mirror; licence detector `google/licensecheck` (ADR-025) | Verified (detector); volumes Open |
 | S10 | SAST sandboxing | Not started (M9) | Open |
 | S11 | Zennoxa Shield evaluation | Not started (M9) | Open |
 | S12 | Reachability beyond Go | Not started (M9) | Open |
@@ -104,7 +104,8 @@ The PRD planned spikes S1–S13 before M2. Most questions were answered while bu
 **Open:**
 - Full-sync volume and time; not needed for the targeted design.
 - Measured NVD, CVE and OSV conflict rates on 1,000 CVEs.
-- The licence-detector choice (M8).
+
+**Licence detector (M8):** `github.com/google/licensecheck` (BSD-3-Clause, pure Go, the detector pkg.go.dev uses), embedded in the scanner. ScanCode Toolkit was not chosen: it is a Python runtime with a large data set in the scanner image. Detection only covers licence files next to a package; declared data and deps.dev metadata come first (ADR-025). Tested in `internal/license` and `internal/scanner/licenses_test.go`.
 
 ## S10–S12 SAST, Shield, reachability
 

@@ -139,6 +139,10 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	} else if missing != nil && len(r.Findings) < 10000 {
 		r.Findings = append(r.Findings, *missing)
 	}
+	// Licence entries for review and deny results (LIC-004 to LIC-008).
+	if err := s.licenseFindings(ctx, tx, a, &r); err != nil {
+		return err
+	}
 	files, err := json.Marshal(r.Files)
 	if err != nil {
 		return ErrInput

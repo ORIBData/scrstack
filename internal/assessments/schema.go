@@ -2,7 +2,7 @@ package assessments
 
 // Schema is applied under the storage migration lock. No destructive DDL.
 func Schema(s string) []string {
-	return append(append(append(append(append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...), taxiiSchema(s)...), qaSchema(s)...), vulnSourceSchema(s)...), retentionClassSchema(s)...)
+	return append(append(append(append(append(append(append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...), taxiiSchema(s)...), qaSchema(s)...), vulnSourceSchema(s)...), retentionClassSchema(s)...), licenseSchema(s)...), reportSchema(s)...)
 }
 
 func baseSchema(s string) []string {
@@ -69,6 +69,8 @@ func baseSchema(s string) []string {
 		`CREATE INDEX IF NOT EXISTS assessments_asset_ref_idx ON ` + s + `.assessments(asset_id,(request->'target'->>'ref'),created_at DESC)`,
 		// RET-006: assets under legal hold are excluded from every retention class.
 		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS legal_hold boolean NOT NULL DEFAULT false`,
+		// LIC-005: how the asset reaches users selects the licence policy column.
+		`ALTER TABLE ` + s + `.assets ADD COLUMN IF NOT EXISTS distribution text NOT NULL DEFAULT 'saas' CHECK(distribution IN ('internal','saas','distributed'))`,
 		// OBS-002: audit queries by action and by target, newest first.
 		`CREATE INDEX IF NOT EXISTS audit_log_action_idx ON ` + s + `.audit_log(action,id DESC)`,
 		`CREATE INDEX IF NOT EXISTS audit_log_target_idx ON ` + s + `.audit_log(target_id,id DESC) WHERE target_id IS NOT NULL`,

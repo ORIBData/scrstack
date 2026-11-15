@@ -199,10 +199,50 @@ func (a *Artifacts) GetQAReport(ctx context.Context, key string) ([]byte, error)
 	return data, nil
 }
 
+var reportKey = regexp.MustCompile(`^reports/[a-f0-9]{64}\.(json|csv|md)$`)
+
+// PutReport stores a compliance evidence report content-addressed (CMP-006).
+func (a *Artifacts) PutReport(ctx context.Context, data []byte, extension string) (string, string, error) {
+	if len(data) > 64<<20 {
+		return "", "", errors.New("report size exceeded")
+	}
+	hash := sha256.Sum256(data)
+	digest := hex.EncodeToString(hash[:])
+	key := "reports/" + digest + "." + extension
+	if !reportKey.MatchString(key) {
+		return "", "", errors.New("invalid report format")
+	}
+	_, err := a.client.PutObject(ctx, a.bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/octet-stream"})
+	return key, digest, err
+}
+
+// GetReport reads a stored report and checks its digest.
+func (a *Artifacts) GetReport(ctx context.Context, key string) ([]byte, error) {
+	if !reportKey.MatchString(key) {
+		return nil, errors.New("invalid report key")
+	}
+	object, err := a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer object.Close()
+	data, err := io.ReadAll(io.LimitReader(object, (64<<20)+1))
+	if err != nil || len(data) > 64<<20 {
+		return nil, errors.New("report unavailable")
+	}
+	hash := sha256.Sum256(data)
+	digest := hex.EncodeToString(hash[:])
+	if key[len("reports/"):len("reports/")+64] != digest {
+		return nil, errors.New("report integrity check failed")
+	}
+	return data, nil
+}
+
 // DeleteObject removes an object retention purged. Only content-addressed
-// SBOM, snapshot, remediation and QA report keys may be deleted.
+// SBOM, snapshot, remediation, QA report and compliance report keys may be
+// deleted.
 func (a *Artifacts) DeleteObject(ctx context.Context, key string) error {
-	if !sbomKey.MatchString(key) && !snapshotKey.MatchString(key) && !planKey.MatchString(key) && !qaReportKey.MatchString(key) {
+	if !sbomKey.MatchString(key) && !snapshotKey.MatchString(key) && !planKey.MatchString(key) && !qaReportKey.MatchString(key) && !reportKey.MatchString(key) {
 		return errors.New("object key is not a purgeable artifact")
 	}
 	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})

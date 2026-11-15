@@ -316,15 +316,18 @@ type Asset struct {
 	Exposure     string          `json:"exposure"`
 	Labels       json.RawMessage `json:"labels"`
 	// LegalHold excludes the asset from every retention class (RET-006).
-	LegalHold bool  `json:"legal_hold"`
-	Revision  int64 `json:"revision"`
+	LegalHold bool `json:"legal_hold"`
+	// Distribution is how the asset reaches users (LIC-005): internal,
+	// saas or distributed. It selects the licence policy column.
+	Distribution string `json:"distribution"`
+	Revision     int64  `json:"revision"`
 }
 
-const assetColumns = `id,type,locator,connection_id,flags,owner_id,environment,criticality,exposure,labels,legal_hold,revision`
+const assetColumns = `id,type,locator,connection_id,flags,owner_id,environment,criticality,exposure,labels,legal_hold,distribution,revision`
 
 func scanAsset(row pgx.Row) (Asset, error) {
 	var a Asset
-	err := row.Scan(&a.ID, &a.Type, &a.Locator, &a.ConnectionID, &a.Flags, &a.OwnerID, &a.Environment, &a.Criticality, &a.Exposure, &a.Labels, &a.LegalHold, &a.Revision)
+	err := row.Scan(&a.ID, &a.Type, &a.Locator, &a.ConnectionID, &a.Flags, &a.OwnerID, &a.Environment, &a.Criticality, &a.Exposure, &a.Labels, &a.LegalHold, &a.Distribution, &a.Revision)
 	return a, err
 }
 

@@ -182,7 +182,7 @@ func TestPostgresAdvisoriesRetentionAndMaintenance(t *testing.T) {
 	must(call("PATCH", "/assets/"+asset["org/held"].String(), admin, `{"legal_hold":true}`, map[string]string{"If-Match": fmt.Sprintf(`"%d"`, heldAsset.Revision)}), 200)
 	var policy assessments.Retention
 	decode(must(call("GET", "/settings/retention", admin, "", nil), 200), &policy)
-	if len(policy.Classes) != 10 {
+	if len(policy.Classes) != 11 {
 		t.Fatalf("classes %+v", policy.Classes)
 	}
 	if body := must(call("POST", "/settings/retention:preview", admin, `{"classes":{"closed_findings":30,"audit_log":null}}`, nil), 200).Body.String(); !strings.Contains(body, `"closed_findings":1`) {

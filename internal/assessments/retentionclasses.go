@@ -61,6 +61,7 @@ var retentionDefs = []classDef{
 	{"source_snapshots", "Stored source archives of superseded assessments", "the current revision of each tracked ref; legal hold", 0, true},
 	{"remediation_plans", "Stored remediation plans", "assets on legal hold", 0, true},
 	{"qa_reports", "QA report archives and scenario lists of older runs", "the newest finished run of each asset and kind; legal hold", 0, true},
+	{"reports", "Compliance evidence reports (CMP-006)", "queued and running reports", 0, true},
 	{"expired_indicators", "Indicators past valid_until", "unexpired indicators", 0, false},
 	{"audit_log", "Audit records", "at least 365 days are always kept", AuditFloorDays, false},
 }
@@ -238,6 +239,8 @@ func (s *Store) candidates(class string) string {
 		return `SELECT r.assessment_id FROM ` + s.schema + `.remediation_results r JOIN ` + s.schema + `.assessments x ON x.id=r.assessment_id JOIN ` + s.schema + `.assets a ON a.id=x.asset_id WHERE r.created_at<clock_timestamp()-($1*interval '1 day') AND NOT a.legal_hold`
 	case "qa_reports":
 		return `SELECT q.id FROM ` + s.schema + `.qa_runs q JOIN ` + s.schema + `.assets a ON a.id=q.asset_id WHERE q.report_key<>'' AND q.completed_at<clock_timestamp()-($1*interval '1 day') AND NOT a.legal_hold AND EXISTS(SELECT 1 FROM ` + s.schema + `.qa_runs n WHERE n.asset_id=q.asset_id AND n.kind=q.kind AND n.report_key<>'' AND n.completed_at>q.completed_at)`
+	case "reports":
+		return `SELECT id FROM ` + s.schema + `.reports WHERE status IN ('succeeded','failed') AND created_at<clock_timestamp()-($1*interval '1 day')`
 	case "expired_indicators":
 		return `SELECT source_id,id FROM ` + s.schema + `.indicators WHERE valid_until<clock_timestamp()-($1*interval '1 day')`
 	case "audit_log":
@@ -399,6 +402,28 @@ func (s *Store) purgeClass(ctx context.Context, tx pgx.Tx, class string, days in
 		}
 		unused, err := s.unreferenced(ctx, tx, `SELECT 1 FROM `+s.schema+`.qa_runs WHERE report_key=$1 AND NOT (id=ANY($2::uuid[]))`, cleared, ids)
 		return int64(len(ids)), unused, err
+	case "reports":
+		rows, err := tx.Query(ctx, `DELETE FROM `+s.schema+`.reports WHERE id IN (`+pick+`) RETURNING COALESCE(s3_key,'')`, days)
+		if err != nil {
+			return 0, nil, err
+		}
+		var cleared []string
+		var n int64
+		for rows.Next() {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				rows.Close()
+				return 0, nil, err
+			}
+			n++
+			cleared = append(cleared, k)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, nil, err
+		}
+		unused, err := s.unreferenced(ctx, tx, `SELECT 1 FROM `+s.schema+`.reports WHERE s3_key=$1`, cleared)
+		return n, unused, err
 	case "expired_indicators":
 		rows, err := tx.Query(ctx, `DELETE FROM `+s.schema+`.indicators WHERE (source_id,id) IN (SELECT source_id,id FROM (`+s.candidates(class)+`) c LIMIT `+strconv.Itoa(purgeBatch)+`) RETURNING source_id::text`, days)
 		if err != nil {

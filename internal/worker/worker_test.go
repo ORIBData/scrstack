@@ -113,7 +113,7 @@ func TestPostgresWorkerPublishesAndRejectsRevokedScope(t *testing.T) {
 		if string(b) != "synthetic archive" || r.Header.Get("Authorization") != "Bearer "+token {
 			t.Error("scanner boundary violated")
 		}
-		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "pkg", Version: "1", Ecosystem: "npm", PURL: "pkg:npm/pkg@1", Path: "package-lock.json"}}, SBOM: json.RawMessage(`{"bomFormat":"CycloneDX","specVersion":"1.6"}`), Stages: []assessments.Stage{{Name: "malware", Status: "skipped"}}})
+		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "pkg", Version: "1", Ecosystem: "npm", PURL: "pkg:npm/pkg@1", Path: "package-lock.json"}}, Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "malware", Status: "skipped"}}})
 	}))
 	defer server.Close()
 	sink := &artifactSink{}
@@ -253,7 +253,7 @@ func TestPostgresWorkerAssessesImageByDigest(t *testing.T) {
 		if r.URL.Path != "/scan-image" || image != "synthetic image archive" || strings.Join(parts, ",") != "rules,image" || r.Header.Get("Authorization") != "Bearer "+token {
 			t.Error("image not streamed to the scanner image endpoint after its rules", parts)
 		}
-		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "busybox", Version: "1.36.1-r15", Ecosystem: "Alpine:v3.19", PURL: "pkg:apk/alpine/busybox@1.36.1-r15", Path: "lib/apk/db/installed"}}, SBOM: json.RawMessage(`{"bomFormat":"CycloneDX","specVersion":"1.6"}`), Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "malware", Status: "skipped"}}})
+		_ = json.NewEncoder(w).Encode(scanner.Output{Components: []assessments.Component{{Name: "busybox", Version: "1.36.1-r15", Ecosystem: "Alpine:v3.19", PURL: "pkg:apk/alpine/busybox@1.36.1-r15", Path: "lib/apk/db/installed"}}, Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "malware", Status: "skipped"}}})
 	}))
 	defer server.Close()
 	digest := "sha256:" + strings.Repeat("d", 64)

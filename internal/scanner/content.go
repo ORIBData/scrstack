@@ -232,6 +232,8 @@ type contentScan struct {
 	// rules runs YARA-X over distinct contents under its own deadline.
 	rules    *ruleScan
 	rulesCtx context.Context
+	// licenses collects licence evidence from the files read (nil: off).
+	licenses *licenseCollector
 }
 
 type clamJob struct {
@@ -423,6 +425,7 @@ func (c *contentScan) file(relative string, size int64, r io.Reader) (FileEviden
 	}
 	if data != nil {
 		c.rules.add(c.rulesCtx, record.SHA256, record.Path, data)
+		c.licenses.observe(record.Path, data)
 	}
 	if c.address != "" {
 		if data == nil {
@@ -487,7 +490,13 @@ func (c *contentScan) stages() []assessments.Stage {
 }
 
 func (e Engine) inspectContent(ctx, rulesCtx context.Context, root string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
+	return e.inspectContentWith(ctx, rulesCtx, root, nil)
+}
+
+// inspectContentWith also feeds every file read to a licence collector.
+func (e Engine) inspectContentWith(ctx, rulesCtx context.Context, root string, licenses *licenseCollector) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
 	scan := e.newContentScan(ctx, rulesCtx, false, filepath.Dir(root))
+	scan.licenses = licenses
 	files := []FileEvidence{}
 	index := map[string]int{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {

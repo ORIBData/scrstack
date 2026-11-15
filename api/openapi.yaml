@@ -82,6 +82,10 @@ tags:
     description: Maintenance, inbound event log and retention (admin).
   - name: E2E QA
     description: Karate API, integration, UI and load testing of each assessed repository against its deployed environment, with API coverage, report-only findings and LLM-drafted tests.
+  - name: Licences
+    description: Licence inventory, normalisation, categories and policy by distribution model, third-party notices. A policy aid, not legal advice.
+  - name: Compliance reports
+    description: OWASP Top 10, CWE Top 25 and PCI DSS evidence reports from framework packs. Evidence for assessors, not certification.
   - name: LLM providers
     description: Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests (admin).
 paths:
@@ -778,14 +782,12 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentSBOM
-      summary: CycloneDX SBOM
-      description: CycloneDX 1.6 JSON, integrity-checked against the stored digest (`ETag`). Push it to Dependency-Track or other SBOM tools. Scope `read`, `write` or `trigger` (own).
-      parameters: [{name: format, in: query, schema: {type: string, enum: [cyclonedx-json]}}]
+      summary: SBOM (CycloneDX or SPDX)
+      description: 'The assessment''s SBOM (SBM-011). `cyclonedx-json` (default) is the stored CycloneDX 1.6 document SCRS generated from its component model, integrity-checked against `sbom_sha256` (`ETag`); `cyclonedx-xml` is the same document as XML; `spdx-json` is SPDX 2.3 generated from the same components (SBM-010), with declared and concluded licences, so both formats list the same packages. Documents name the SCRS version and generation time (also in `X-SCRS-Version` and `X-SCRS-Generated-At`). Scope `read`, `write` or `trigger` (own).'
+      parameters: [{$ref: '#/components/parameters/SBOMFormat'}]
       responses:
-        '200':
-          description: SBOM
-          headers: {ETag: {schema: {type: string}, description: SHA-256 of the SBOM}}
-          content: {application/vnd.cyclonedx+json: {schema: {type: object}}}
+        '200': {$ref: '#/components/responses/SBOM'}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '409': {description: 'SBOM not available (failed, partial or imported assessment)', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -2043,6 +2045,323 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Licences (M8)
+  /policies/gate:
+    get:
+      tags: [Licences]
+      operationId: getGatePolicy
+      summary: Default gate rules
+      description: The fixed verdict rules (TRG-006) as text. The gate is not configurable in this release; licence entries follow the licence policy. Scope `read` or `write`.
+      responses:
+        '200': {description: Gate rules, content: {application/json: {schema: {type: object, properties: {kind: {const: gate}, builtin: {type: boolean}, policy: {type: object}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /policies/license:
+    get:
+      tags: [Licences]
+      operationId: getLicensePolicy
+      summary: Active licence policy
+      description: The licence policy applied to every assessment (LIC-004, LIC-005). Until an admin stores one it is the built-in `corporate-default` at revision 0. Licence data is a policy aid, not legal advice; counsel reviews the default before it is made enforcing. Scope `read` or `write`.
+      responses:
+        '200':
+          description: Policy and revision
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/LicensePolicyRecord'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Licences]
+      operationId: setLicensePolicy
+      summary: Replace the licence policy
+      description: Stores a policy validated against `GET /schemas/license-policy`. `If-Match` must carry the current revision (0 for corporate-default). Set `enforcing` to true only after counsel review; until then licence entries cap the verdict at `warn`. Audited as `license_policy.updated`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/LicensePolicy'}}}}
+      responses:
+        '200':
+          description: Stored policy
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/LicensePolicyRecord'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /policies/license:evaluate:
+    post:
+      tags: [Licences]
+      operationId: evaluateLicense
+      summary: Try a licence against the policy
+      description: Normalises licence text to an SPDX expression (LIC-002) and decides it under the active policy for a distribution model, without recording anything. Useful when counsel reviews rules. Scope `read` or `write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                expression: {type: string, maxLength: 2000, examples: ['Apache License, Version 2.0', 'MIT OR AGPL-3.0-only']}
+                distribution: {$ref: '#/components/schemas/Distribution'}
+                asset_id: {type: string, format: uuid}
+                purl: {type: string, maxLength: 512}
+                path: {type: string, maxLength: 512}
+                dev: {type: boolean}
+      responses:
+        '200':
+          description: Normalised expression and decision
+          content: {application/json: {schema: {type: object, properties: {normalized: {$ref: '#/components/schemas/NormalizedLicense'}, policy: {type: string}, policy_revision: {type: integer}, enforcing: {type: boolean}, decision: {$ref: '#/components/schemas/LicenseDecision'}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /licenses/categories:
+    get:
+      tags: [Licences]
+      operationId: getLicenseCategories
+      summary: Licence categories
+      description: Category of every SPDX License List licence and SCRS LicenseRef (LIC-003), with operator overrides and the override revision. Categories are permissive, public_domain, weak_copyleft, strong_copyleft, network_copyleft, source_available_restricted, non_commercial, proprietary and unknown. Scope `read` or `write`.
+      responses:
+        '200':
+          description: Category mapping
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/LicenseCategories'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Licences]
+      operationId: setLicenseCategories
+      summary: Replace category overrides
+      description: Stores a new revision of the overrides (SPDX id or LicenseRef to category); the shipped mapping applies to every id not overridden. Versioned and audited as `license_categories.updated` with each change. Requires `If-Match` with the current revision. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [overrides]
+              properties:
+                overrides: {type: object, maxProperties: 2000, additionalProperties: {$ref: '#/components/schemas/LicenseCategory'}}
+                note: {type: string, maxLength: 500}
+      responses:
+        '200':
+          description: New revision
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {type: object, properties: {version: {type: string}, revision: {type: integer}, overrides: {type: object, additionalProperties: {type: string}}, counts: {type: object, additionalProperties: {type: integer}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /licenses/categories/history:
+    get:
+      tags: [Licences]
+      operationId: listLicenseCategoryHistory
+      summary: Category override history
+      description: Stored override revisions, newest first (up to 100). Scope `read` or `write`.
+      responses:
+        '200': {description: Revisions, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {type: object, properties: {revision: {type: integer}, overrides: {type: object, additionalProperties: {type: string}}, note: {type: string}, created_by: {type: string, format: uuid}, created_at: {type: string, format: date-time}}}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/licenses:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Licences]
+      operationId: assetLicenses
+      summary: Asset licence inventory
+      description: Components of the asset's newest successful assessment (of `ref`, when given) with licence expression, category, source (`declared`, `detected`, `metadata`, `none` or `unresolved`), confidence, the current policy result and the register status and waiver of each licence entry (LIC-006, LIC-007). Scope `read` or `write`.
+      parameters: [{name: ref, in: query, schema: {type: string}}]
+      responses:
+        '200': {description: Inventory, content: {application/json: {schema: {$ref: '#/components/schemas/LicenseInventory'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/licenses/notices:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Licences]
+      operationId: assetLicenseNotices
+      summary: Third-party notices file
+      description: A THIRD-PARTY-NOTICES text file (LIC-009) for the asset's newest assessed revision, with each component's licence, the copyright lines SCRS recorded and links to the licence texts. Development-only dependencies are omitted unless `include_dev=true`. A starting point, not legal advice. Scope `read` or `write`.
+      parameters:
+        - {name: ref, in: query, schema: {type: string}}
+        - {name: include_dev, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200': {description: Notices, content: {text/plain: {schema: {type: string}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /reports/licenses:
+    get:
+      tags: [Licences]
+      operationId: licenseReport
+      summary: Licence report
+      description: Licence inventory of one asset (`asset_id`) or of every assessed asset, as JSON, CSV (one row per component; cells that start with a formula character are quoted) or Markdown (LIC-007). Scope `read` or `write`.
+      parameters:
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}}
+        - {name: format, in: query, schema: {type: string, enum: [json, csv, md], default: json}}
+      responses:
+        '200':
+          description: Report
+          content:
+            application/json: {schema: {type: object, properties: {generated_at: {type: string, format: date-time}, scrs_version: {type: string}, statement: {type: string}, assets: {type: array, items: {$ref: '#/components/schemas/LicenseInventory'}}}}}
+            text/csv: {schema: {type: string}}
+            text/markdown: {schema: {type: string}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /sboms/{id}/download:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}, description: 'SBOM SHA-256 (`sbom_sha256` of an assessment) or the assessment id'}
+    get:
+      tags: [Assessment results]
+      operationId: downloadSBOM
+      summary: Download an SBOM
+      description: The same export as `GET /assessments/{id}/sbom` (SBM-011), addressed by SBOM digest so a pipeline can fetch the document it recorded. Scope `read` or `write`.
+      parameters: [{$ref: '#/components/parameters/SBOMFormat'}]
+      responses:
+        '200': {$ref: '#/components/responses/SBOM'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: SBOM not available, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- Compliance reports (M8)
+  /reports/frameworks:
+    get:
+      tags: [Compliance reports]
+      operationId: listFrameworks
+      summary: List framework packs
+      description: Shipped packs (OWASP Top 10 2021 and 2025, CWE Top 25 2024 and 2025, PCI DSS v4.0.1 requirement 6.3) and uploaded CWE-mapping packs (CMP-001). Each pack names the source of its mapping. Scope `read` or `write`.
+      responses:
+        '200': {description: Packs, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/FrameworkPack'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Compliance reports]
+      operationId: uploadFramework
+      summary: Upload a framework pack
+      description: Stores or replaces a custom `cwe_mapping` pack validated against `GET /schemas/framework-pack` (CMP-005). Shipped pack ids are reserved. Audited. Scope `admin`.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FrameworkPack'}}}}
+      responses:
+        '201': {description: Stored pack, content: {application/json: {schema: {$ref: '#/components/schemas/FrameworkPack'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /frameworks/{id}:
+    parameters: [{name: id, in: path, required: true, schema: {type: string}}]
+    get:
+      tags: [Compliance reports]
+      operationId: getFramework
+      summary: Get a framework pack
+      description: One shipped or uploaded pack with its categories and CWE ids. Scope `read` or `write`.
+      responses:
+        '200': {description: Pack, content: {application/json: {schema: {$ref: '#/components/schemas/FrameworkPack'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [Compliance reports]
+      operationId: deleteFramework
+      summary: Delete an uploaded pack
+      description: Removes an uploaded pack; shipped packs cannot be deleted. Audited. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /reports:
+    get:
+      tags: [Compliance reports]
+      operationId: listReports
+      summary: List evidence reports
+      description: Report jobs newest first, 50 per page. Scope `read` or `write`.
+      parameters: [{$ref: '#/components/parameters/Cursor'}]
+      responses:
+        '200': {description: Reports, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/ReportJob'}}, next_cursor: {type: string}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Compliance reports]
+      operationId: createReport
+      summary: Request an evidence report
+      description: Queues a framework evidence report for one asset, one owner's assets or the portfolio over a window of at most 366 days (default the last 90), as JSON, CSV or Markdown (CMP-006). The worker records the data time, SCRS version, scope, advisory feed freshness and the file's SHA-256, and stores the file in S3 under the `reports` retention class. Reports list assets lacking a recent SBOM, count unmapped findings and contain no compliance verdict. Poll `GET /reports/{id}`. Scope `write`.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReportRequest'}}}}
+      responses:
+        '202':
+          description: Queued
+          headers: {Location: {schema: {type: string}}, Retry-After: {schema: {type: integer}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/ReportJob'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /reports/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Compliance reports]
+      operationId: getReport
+      summary: Get a report job
+      description: Status, data time, SCRS version, feed freshness, summary counts and SHA-256 of one report. `Retry-After` is set while it is queued or running. Scope `read` or `write`.
+      responses:
+        '200': {description: Report job, content: {application/json: {schema: {$ref: '#/components/schemas/ReportJob'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /reports/{id}/download:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Compliance reports]
+      operationId: downloadReport
+      summary: Download a report
+      description: The report file, integrity-checked against its stored SHA-256 (also in `ETag` and `X-SCRS-Report-SHA256`). Scope `read` or `write`.
+      responses:
+        '200':
+          description: Report file
+          headers: {ETag: {schema: {type: string}}, X-SCRS-Report-SHA256: {schema: {type: string}}}
+          content:
+            application/json: {schema: {$ref: '#/components/schemas/EvidenceReport'}}
+            text/csv: {schema: {type: string}}
+            text/markdown: {schema: {type: string}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {description: Report not ready, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /schemas/{name}:
+    parameters:
+      - {name: name, in: path, required: true, schema: {type: string, enum: [license-policy, framework-pack]}}
+    get:
+      tags: [Licences]
+      operationId: getDocumentSchema
+      summary: Policy and pack JSON Schemas
+      description: JSON Schema (draft 2020-12) of the licence policy (`license-policy`, LIC-004) or of an uploaded framework pack (`framework-pack`, CMP-005). Scope `read`, `write` or `trigger`.
+      responses:
+        '200': {description: JSON Schema, content: {application/schema+json: {schema: {type: object}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /audit:
     get:
       tags: [Operations]
@@ -2609,6 +2928,7 @@ components:
     Limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500, default: 100}}
     IfMatch: {name: If-Match, in: header, required: true, schema: {type: string}, description: 'ETag revision, for example "3"'}
     IdempotencyKey: {name: Idempotency-Key, in: header, schema: {type: string, maxLength: 128}, description: Replays within 24 h return the original result}
+    SBOMFormat: {name: format, in: query, schema: {type: string, enum: [cyclonedx-json, cyclonedx-xml, spdx-json], default: cyclonedx-json}}
     GitHubEvent: {name: X-GitHub-Event, in: header, required: true, schema: {type: string}}
     GitHubDelivery: {name: X-GitHub-Delivery, in: header, required: true, schema: {type: string, format: uuid}}
     GitHubSignature: {name: X-Hub-Signature-256, in: header, schema: {type: string}, description: 'sha256=<hex HMAC of the body> (required in direct mode)'}
@@ -2619,6 +2939,16 @@ components:
     NotFound: {description: Not found or not visible to this token, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     Conflict: {description: Conflicts with current state or revision, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
     PreconditionRequired: {description: If-Match header required, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+    SBOM:
+      description: SBOM document
+      headers:
+        ETag: {schema: {type: string}, description: SHA-256 of the stored CycloneDX JSON document}
+        X-SCRS-Version: {schema: {type: string}}
+        X-SCRS-Generated-At: {schema: {type: string, format: date-time}}
+      content:
+        application/vnd.cyclonedx+json: {schema: {type: object}}
+        application/vnd.cyclonedx+xml: {schema: {type: string}}
+        application/spdx+json: {schema: {type: object}}
     RateLimited:
       description: Rate or capacity limit; retry after the given seconds
       headers: {Retry-After: {schema: {type: integer}}}
@@ -2901,6 +3231,7 @@ components:
         exposure: {type: string, enum: ['', internet, internal, offline]}
         labels: {type: object, additionalProperties: {type: string}}
         legal_hold: {type: boolean, description: Excluded from every retention class and from asset_findings resets}
+        distribution: {$ref: '#/components/schemas/Distribution'}
         revision: {type: integer}
     AssetPage:
       type: object
@@ -2917,6 +3248,7 @@ components:
         exposure: {type: string, enum: ['', internet, internal, offline]}
         labels: {type: object, maxProperties: 50, additionalProperties: {type: string, maxLength: 256}}
         legal_hold: {type: boolean, description: Needs admin scope}
+        distribution: {$ref: '#/components/schemas/Distribution', description: Needs admin scope; selects the licence policy column}
     OwnerInput:
       type: object
       additionalProperties: false
@@ -3037,6 +3369,205 @@ components:
         ecosystem: {type: string}
         purl: {type: string}
         path: {type: string}
+        dependency_groups: {type: array, items: {type: string}, description: 'Lockfile dependency groups, such as dev'}
+        license: {$ref: '#/components/schemas/ComponentLicense'}
+    Distribution:
+      type: string
+      enum: [internal, saas, distributed]
+      description: How the asset reaches users (LIC-005); selects the licence policy column. Default `saas`.
+    LicenseCategory:
+      type: string
+      enum: [permissive, public_domain, weak_copyleft, strong_copyleft, network_copyleft, source_available_restricted, non_commercial, proprietary, unknown]
+    LicenseEffect:
+      type: string
+      enum: [allow, review, deny]
+    ComponentLicense:
+      type: object
+      description: A component's licence and where SCRS found it (LIC-001).
+      properties:
+        expression: {type: string, description: Normalised SPDX license expression or NOASSERTION, examples: ['MIT OR Apache-2.0']}
+        source: {type: string, enum: [declared, detected, metadata, none], description: 'declared: lockfile, manifest or OS package database; detected: licence file text; metadata: deps.dev; none: nothing found'}
+        declared: {type: string, description: Licence text as found, when it differs from the expression}
+        confidence: {type: number, minimum: 0, maximum: 1, description: For detected licences}
+        evidence: {type: string, description: File the licence came from, or deps.dev}
+        copyright: {type: array, items: {type: string}}
+        refs: {type: object, additionalProperties: {type: string}, description: Original text of each LicenseRef-scrs-<hash> in the expression}
+    NormalizedLicense:
+      type: object
+      properties:
+        expression: {type: string}
+        refs: {type: object, additionalProperties: {type: string}}
+        exact: {type: boolean, description: The input was already a valid SPDX expression}
+    LicenseRule:
+      type: object
+      additionalProperties: false
+      required: [effect]
+      description: Matches by licence id, category or package URL prefix, optionally narrowed by paths, scope (dev or runtime), assets and distributions. Rules apply in order; the first match decides a licence.
+      properties:
+        effect: {$ref: '#/components/schemas/LicenseEffect'}
+        licenses: {type: array, maxItems: 200, items: {type: string}}
+        categories: {type: array, maxItems: 9, items: {$ref: '#/components/schemas/LicenseCategory'}}
+        packages: {type: array, maxItems: 200, items: {type: string, pattern: '^pkg:'}}
+        paths: {type: array, maxItems: 50, items: {type: string}}
+        scope: {type: string, enum: [dev, runtime]}
+        assets: {type: array, maxItems: 200, items: {type: string, format: uuid}}
+        distributions: {type: array, items: {$ref: '#/components/schemas/Distribution'}}
+        reason: {type: string, maxLength: 500}
+    LicensePolicy:
+      type: object
+      additionalProperties: false
+      required: [name, default, matrix]
+      description: Licence policy (LIC-004). Full schema at `GET /schemas/license-policy`. AND takes the strictest result of its licences, OR the most lenient.
+      properties:
+        name: {type: string, pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'}
+        description: {type: string, maxLength: 1000}
+        enforcing: {type: boolean, description: 'false: deny warns, review does not gate. true: deny fails, review warns (LIC-008)'}
+        default: {$ref: '#/components/schemas/LicenseEffect'}
+        severity: {type: object, properties: {deny: {type: string}, review: {type: string}}}
+        matrix: {type: object, description: Category to distribution to effect, additionalProperties: {type: object, additionalProperties: {$ref: '#/components/schemas/LicenseEffect'}}}
+        rules: {type: array, maxItems: 500, items: {$ref: '#/components/schemas/LicenseRule'}}
+    LicensePolicyRecord:
+      type: object
+      properties:
+        kind: {const: license}
+        policy: {$ref: '#/components/schemas/LicensePolicy'}
+        revision: {type: integer, description: 0 while corporate-default applies}
+        builtin: {type: boolean}
+        updated_at: {type: string, format: date-time}
+        updated_by: {type: string, format: uuid}
+    LicenseDecision:
+      type: object
+      properties:
+        effect: {$ref: '#/components/schemas/LicenseEffect'}
+        expression: {type: string}
+        category: {$ref: '#/components/schemas/LicenseCategory'}
+        basis: {type: string, description: '`rule:<n>`, `matrix:<category>/<distribution>` or `default`'}
+        reason: {type: string}
+        licenses: {type: array, items: {type: string}, description: The licences that decided the outcome}
+    LicenseCategories:
+      type: object
+      properties:
+        version: {type: string, description: Shipped mapping version}
+        source: {type: string}
+        spdx_license_list_version: {type: string}
+        revision: {type: integer, description: Override revision (0 for none)}
+        updated_at: {type: [string, 'null'], format: date-time}
+        counts: {type: object, additionalProperties: {type: integer}}
+        categories: {type: object, additionalProperties: {$ref: '#/components/schemas/LicenseCategory'}}
+        overrides: {type: object, additionalProperties: {$ref: '#/components/schemas/LicenseCategory'}}
+        builtin_refs: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}}}}
+        category_names: {type: array, items: {$ref: '#/components/schemas/LicenseCategory'}}
+    LicenseRow:
+      type: object
+      properties:
+        asset_id: {type: string, format: uuid}
+        asset: {type: string}
+        assessment_id: {type: string, format: uuid}
+        name: {type: string}
+        version: {type: string}
+        ecosystem: {type: string}
+        purl: {type: string}
+        path: {type: string}
+        dev: {type: boolean}
+        expression: {type: string}
+        category: {$ref: '#/components/schemas/LicenseCategory'}
+        source: {type: string, enum: [declared, detected, metadata, none, unresolved]}
+        confidence: {type: number}
+        policy_result: {$ref: '#/components/schemas/LicenseEffect'}
+        policy_basis: {type: string}
+        finding_id: {type: string, format: uuid}
+        status: {type: string}
+        waiver_until: {type: string, format: date-time}
+        license: {$ref: '#/components/schemas/ComponentLicense'}
+    LicenseInventory:
+      type: object
+      properties:
+        asset_id: {type: string, format: uuid}
+        asset: {type: string}
+        distribution: {$ref: '#/components/schemas/Distribution'}
+        assessment_id: {type: [string, 'null'], format: uuid}
+        revision: {type: string}
+        ref: {type: string}
+        assessed_at: {type: string, format: date-time}
+        policy: {type: string}
+        enforcing: {type: boolean}
+        counts: {type: object, additionalProperties: {type: integer}, description: By policy result and by category}
+        distribution_hint: {type: string}
+        items: {type: array, items: {$ref: '#/components/schemas/LicenseRow'}}
+    FrameworkPack:
+      type: object
+      description: A versioned framework data pack (CMP-001). Uploads use kind `cwe_mapping`; schema at `GET /schemas/framework-pack`.
+      required: [id, name, version, kind]
+      properties:
+        id: {type: string, examples: [owasp-top10-2025]}
+        name: {type: string}
+        version: {type: string}
+        kind: {type: string, enum: [cwe_mapping, pci_dss]}
+        source: {type: string, description: Where the mapping comes from}
+        url: {type: string}
+        builtin: {type: boolean, readOnly: true}
+        categories: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}, cwes: {type: array, items: {type: integer}}}}}
+        type_categories: {type: object, additionalProperties: {type: string}, description: Finding types without a CWE of their own (vulnerable or malicious dependency, integrity, secret, misconfiguration) mapped to a category}
+        type_categories_note: {type: string}
+        requirements: {type: array, items: {type: object, properties: {id: {type: string}, title: {type: string}, evidence: {type: string}}}}
+    ReportScope:
+      type: object
+      required: [kind]
+      properties:
+        kind: {type: string, enum: [asset, owner, portfolio]}
+        id: {type: string, format: uuid, description: Asset or owner id; omit for the portfolio}
+        name: {type: string, readOnly: true}
+    ReportRequest:
+      type: object
+      additionalProperties: false
+      required: [framework, scope]
+      properties:
+        framework: {type: string, examples: [owasp-top10-2025, pci-dss-4.0.1]}
+        scope: {$ref: '#/components/schemas/ReportScope'}
+        since: {type: string, format: date-time, description: Default 90 days before until}
+        until: {type: string, format: date-time, description: Default now}
+        format: {type: string, enum: [json, csv, md], default: json}
+        params:
+          type: object
+          additionalProperties: false
+          properties:
+            sbom_max_age_days: {type: integer, minimum: 0, maximum: 3650, description: An asset without an SBOM this recent is a gap (default 30)}
+            sla_critical_days: {type: integer, minimum: 0, maximum: 3650, description: PCI DSS 6.3.3 patch window for critical (default 30)}
+            sla_high_days: {type: integer, minimum: 0, maximum: 3650, description: Patch window for high (default 90)}
+    ReportJob:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        framework: {type: string}
+        scope: {$ref: '#/components/schemas/ReportScope'}
+        since: {type: string, format: date-time}
+        until: {type: string, format: date-time}
+        format: {type: string, enum: [json, csv, md]}
+        params: {type: object}
+        status: {type: string, enum: [queued, running, succeeded, failed]}
+        sha256: {type: string}
+        size: {type: integer}
+        data_as_of: {type: string, format: date-time}
+        scrs_version: {type: string}
+        feed_freshness: {type: array, items: {type: object, properties: {key: {type: string}, name: {type: string}, last_success_at: {type: [string, 'null'], format: date-time}, stale: {type: boolean}}}}
+        summary: {type: object, description: 'assets, gaps, findings_considered, open, unmapped counts'}
+        error: {type: string}
+        requested_by: {type: string, format: uuid}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: string, format: date-time}
+    EvidenceReport:
+      type: object
+      description: A built evidence report. `statement` says it is not a certification; there is no verdict field.
+      properties:
+        report: {type: object, description: 'id, framework, scope, since, until, data_as_of, scrs_version, format, params'}
+        statement: {type: string}
+        feed_freshness: {type: array, items: {type: object}}
+        assets: {type: array, items: {type: object}}
+        gaps: {type: array, items: {type: object, properties: {asset_id: {type: string, format: uuid}, locator: {type: string}, reason: {type: string}}}}
+        totals: {type: object}
+        categories: {type: array, items: {type: object}, description: Per category open, opened and closed in window, by severity, CWE counts and weekly trend}
+        unmapped: {type: object, properties: {no_cwe: {type: integer}, cwe_outside_pack: {type: integer}, top_outside_pack: {type: array, items: {type: object}}}}
+        requirements: {type: array, items: {type: object}, description: PCI DSS 6.3.1, 6.3.2 and 6.3.3 evidence metrics}
     Finding:
       type: object
       properties:
@@ -3044,7 +3575,7 @@ components:
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate'}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns'}
         advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
         severity: {type: string, enum: [critical, high, medium, low, info, unknown]}
@@ -3052,7 +3583,7 @@ components:
         status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}
         component: {$ref: '#/components/schemas/Component'}
         evidence: {type: object}
-        guidance: {type: object, description: 'summary, fixed_versions, reference, kev, epss'}
+        guidance: {type: object, description: 'summary, reference, kev, epss; for vulnerabilities fixed_versions, safe_versions (ascending, at most ten), smallest_safe_upgrade, latest_safe and safe_basis (advisories checked, whether the full local mirror set was used, and whether registry version lists or only advisory fixes were candidates) (VUL-008)'}
         first_seen: {type: string, format: date-time}
         last_seen: {type: string, format: date-time}
         waiver_until: {type: string, format: date-time}
@@ -3171,7 +3702,7 @@ components:
           items:
             type: object
             properties:
-              class: {type: string, enum: [inbound_events, webhook_deliveries, closed_findings, scan_artifacts, sbom_documents, source_snapshots, remediation_plans, qa_reports, expired_indicators, audit_log]}
+              class: {type: string, enum: [inbound_events, webhook_deliveries, closed_findings, scan_artifacts, sbom_documents, source_snapshots, remediation_plans, qa_reports, reports, expired_indicators, audit_log]}
               description: {type: string}
               guard: {type: string, description: What the class never purges}
               days: {type: [integer, 'null']}

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/versions"
 )
 
 type Engine struct {
@@ -43,8 +44,15 @@ type Output struct {
 	Files      []FileEvidence          `json:"files"`
 	Components []assessments.Component `json:"components"`
 	Findings   []assessments.Finding   `json:"findings"`
-	SBOM       json.RawMessage         `json:"sbom"`
-	Stages     []assessments.Stage     `json:"stages"`
+	// SBOM is no longer produced by the scanner; the worker generates it
+	// from Components. Kept for readers of older scanner responses.
+	SBOM   json.RawMessage     `json:"sbom,omitempty"`
+	Stages []assessments.Stage `json:"stages"`
+	// Packages holds every advisory the local OSV mirror has for each
+	// vulnerable package, for safe-version computation (VUL-008).
+	Packages []versions.Package `json:"package_advisories,omitempty"`
+	// ProjectLicense is the repository's own licence file, when detected.
+	ProjectLicense *assessments.ComponentLicense `json:"project_license,omitempty"`
 }
 type cappedBuffer struct {
 	bytes.Buffer
@@ -155,7 +163,8 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 	contentCtx, done := context.WithTimeout(ctx, 90*time.Second)
 	// YARA-X gets the request budget: compiling a new pack and scanning take
 	// longer than the in-process content rules.
-	files, findings, stages := e.inspectContent(contentCtx, ctx, source)
+	licenses := newLicenseCollector(false)
+	files, findings, stages := e.inspectContentWith(contentCtx, ctx, source, licenses)
 	done()
 	out.Files = files
 	out.Findings = findings
@@ -233,12 +242,12 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 	if len(out.Components) == 0 || len(out.Components) > 20000 || len(out.Findings) > 10000 {
 		return out, errors.New("inventory empty or exceeded limits")
 	}
-	out.SBOM, err = run("cyclonedx-1-6")
-	if err != nil {
-		return out, err
-	}
-	// Never expose ephemeral filesystem paths from the scanner's document.
-	out.SBOM = bytes.ReplaceAll(out.SBOM, []byte(source+string(os.PathSeparator)), []byte(""))
+	// The worker generates the SBOM from this component model (with
+	// licences and metadata) rather than OSV-Scanner's CycloneDX output,
+	// which drops OS packages it cannot give a package URL.
+	licenses.apply(out.Components)
+	out.ProjectLicense = licenses.project
+	out.Packages = packageAdvisories(database, out.Components, out.Findings)
 	enrichStage := assessments.Stage{Name: "enrich", Status: "skipped", Detail: "KEV and EPSS feeds not available in this snapshot"}
 	if enrich != nil {
 		enrichStage.Status, enrichStage.Detail = "ok", fmt.Sprintf("CISA KEV (%d) and EPSS (%d) exploitation context", len(enrich.kev), len(enrich.epss))
@@ -246,8 +255,7 @@ func (e Engine) Run(ctx context.Context, archive []byte) (out Output, err error)
 			enrichStage.Status = "partial"
 		}
 	}
-	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "sbom", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}, enrichStage}
-
+	out.Stages = []assessments.Stage{{Name: "inventory", Status: "ok"}, {Name: "match_vuln", Status: "ok"}, {Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}, enrichStage}
 	return out, nil
 }
 

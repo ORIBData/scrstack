@@ -313,3 +313,23 @@ Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
 
 **Outbound access** from `scrs-worker` also includes
 `services.nvd.nist.gov` and `cveawg.mitre.org`.
+
+## Licences, SBOM exports and compliance reports (M8)
+
+Tables `policies`, `license_category_versions`, `package_metadata`,
+`package_versions`, `reports` and `framework_packs`, plus `assets.distribution`
+(default `saas`), are created by `scrs-storage-init`. All changes are additive.
+`scrs-feed-sync` now also writes a package index (`index.json`) next to each
+ecosystem archive; scans of snapshots synced before it fall back to matched
+advisories for safe versions.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_DEPSDEV_ENABLED` | worker | Licence metadata and version lists from deps.dev (default true; false evaluates packages without a declared or detected licence as "no licence found") |
+| `SCRS_DEPSDEV_URL`, `SCRS_DEPSDEV_PRIVATE_HOSTS` | worker | A deps.dev API mirror and its hostnames allowed to resolve to private addresses |
+| `SCRS_DEPSDEV_MAX_LOOKUPS` | worker | Licence lookups per assessment (default 2000); the rest are left unresolved and retried next time |
+| `SCRS_REPORT_POLL_SECONDS` | worker | How often queued compliance reports are built (default 30; 0 disables) |
+| `SCRS_RETENTION_DEFAULT_REPORTS_DAYS` | API, worker | Retention default for compliance report files |
+
+**Outbound access** from `scrs-worker` also includes `api.deps.dev`. Report files are
+stored in the existing bucket under `reports/`. See [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md).

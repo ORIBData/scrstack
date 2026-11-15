@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://scrs.local/schemas/license-policy/1",
+  "title": "SCRS licence policy",
+  "description": "Licence policy (LIC-004). Rules apply in order and the first match decides a licence; otherwise the category x distribution matrix decides, then default. AND takes the strictest result of its licences, OR the most lenient.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "default", "matrix"],
+  "$defs": {
+    "effect": {"enum": ["allow", "review", "deny"]},
+    "category": {"enum": ["permissive", "public_domain", "weak_copyleft", "strong_copyleft", "network_copyleft", "source_available_restricted", "non_commercial", "proprietary", "unknown"]},
+    "distribution": {"enum": ["internal", "saas", "distributed"]},
+    "row": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "internal": {"$ref": "#/$defs/effect"},
+        "saas": {"$ref": "#/$defs/effect"},
+        "distributed": {"$ref": "#/$defs/effect"}
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effect"],
+      "anyOf": [{"required": ["licenses"]}, {"required": ["categories"]}, {"required": ["packages"]}],
+      "properties": {
+        "effect": {"$ref": "#/$defs/effect"},
+        "licenses": {"type": "array", "maxItems": 200, "items": {"type": "string", "minLength": 1, "maxLength": 128}},
+        "categories": {"type": "array", "maxItems": 9, "items": {"$ref": "#/$defs/category"}},
+        "packages": {"type": "array", "maxItems": 200, "description": "Package URL prefixes, such as pkg:npm/left-pad or pkg:golang/github.com/acme/", "items": {"type": "string", "pattern": "^pkg:", "maxLength": 512}},
+        "paths": {"type": "array", "maxItems": 50, "description": "Glob patterns on the manifest or file path; ** matches any directories", "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+        "scope": {"enum": ["dev", "runtime"], "description": "dev matches only development dependencies, runtime only the rest"},
+        "assets": {"type": "array", "maxItems": 200, "items": {"type": "string", "format": "uuid"}},
+        "distributions": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/distribution"}},
+        "reason": {"type": "string", "maxLength": 500}
+      }
+    }
+  },
+  "properties": {
+    "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"},
+    "description": {"type": "string", "maxLength": 1000},
+    "enforcing": {"type": "boolean", "description": "false: licence entries are report-only and cap the verdict at warn. true: deny fails the verdict and review warns (LIC-008)."},
+    "default": {"$ref": "#/$defs/effect"},
+    "severity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "deny": {"enum": ["critical", "high", "medium", "low"]},
+        "review": {"enum": ["high", "medium", "low"]}
+      }
+    },
+    "matrix": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "permissive": {"$ref": "#/$defs/row"},
+        "public_domain": {"$ref": "#/$defs/row"},
+        "weak_copyleft": {"$ref": "#/$defs/row"},
+        "strong_copyleft": {"$ref": "#/$defs/row"},
+        "network_copyleft": {"$ref": "#/$defs/row"},
+        "source_available_restricted": {"$ref": "#/$defs/row"},
+        "non_commercial": {"$ref": "#/$defs/row"},
+        "proprietary": {"$ref": "#/$defs/row"},
+        "unknown": {"$ref": "#/$defs/row"}
+      }
+    },
+    "rules": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/rule"}}
+  }
+}

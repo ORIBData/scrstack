@@ -33,6 +33,9 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-022 | One LLM adapter over three wire protocols | Accepted |
 | ADR-023 | Inbound webhook secrets belong to connections | Accepted |
 | ADR-024 | Report-only gates for hunt, QA and vendor statements | Accepted |
+| ADR-025 | Licence data: declared, then detected, then deps.dev metadata | Accepted |
+| ADR-026 | SCRS generates its SBOMs from its own component model | Accepted |
+| ADR-027 | Framework packs as versioned data with recorded mapping sources | Accepted |
 
 ## ADR-001 Go module
 
@@ -227,3 +230,38 @@ Each has a per-provider key and inference URL, uses the netguard dialer and is r
 - vendor (VEX) statements.
 
 They are shown and counted. Promotion to enforcement (`alert`, `block`) is an explicit admin action.
+
+## ADR-025 Licence data
+
+**Decision:** each component's licence comes from the first of:
+- **declared** data the scan already reads: npm lockfiles and installed manifests, Python metadata, Composer locks, and the Alpine and Debian package databases;
+- **detected** licence files next to the package, matched with `google/licensecheck`;
+- **metadata** from deps.dev, fetched once per package version through the netguard dialer and cached in PostgreSQL.
+
+Expressions are normalised to SPDX. Categories ship as editable, versioned data. The policy evaluates category by distribution model.
+
+**Why:** declared data is authoritative and free, detection covers vendored code and image layers, and deps.dev covers registries whose lockfiles carry no licence (Go, Maven, PyPI requirements). A failed lookup stays *unresolved* rather than "unknown", so an outage never manufactures licence entries.
+
+**Consequences:** the licence gate is report-only until an admin makes the policy enforcing after counsel review (PRD Q24). Pub, SwiftPM and CocoaPods have no metadata source and report "no licence found" unless a licence file is present.
+
+## ADR-026 SBOM generation
+
+**Decision:** the worker generates the stored CycloneDX 1.6 document from SCRS's component model with `cyclonedx-go`. SPDX 2.3 JSON is generated from the same model on export. The scanner no longer runs OSV-Scanner's CycloneDX output.
+
+**Why:**
+- OSV-Scanner's CycloneDX drops OS packages it cannot give a package URL; the Debian images in the Trivy parity run produced documents with no components.
+- A single model makes CycloneDX and SPDX list the same packages (AT-26) and carry licences.
+- It also saves a second OSV-Scanner run per scan.
+
+**Evidence:** `internal/sbom` validates both formats against the official schemas.
+
+## ADR-027 Framework packs
+
+**Decision:** compliance mappings are JSON data packs embedded in the release (`internal/compliance/packs`). Each records the source of its mapping:
+- MITRE CWE views for OWASP 2021 and the CWE Top 25;
+- OWASP's own 2025 category pages, because MITRE has only the release candidate.
+
+Finding types without a CWE (vulnerable and malicious dependencies, integrity, secrets, misconfiguration) map through `type_categories`. Admins can upload `cwe_mapping` packs; PCI DSS views are code-defined evidence.
+
+**Consequences:** reports state the pack version and source, count unmapped findings, and never compute a compliance verdict.
+

@@ -78,6 +78,8 @@ On `debian:bookworm-slim`, the first run marked inventory as **failed** ("image 
 - SCRS treats any stderr line containing "error" as a coverage problem.
 - The package name `libgpg-error` contains "error", so that line tripped the check.
 
+**Follow-up (M8):** the same notices showed that OSV-Scanner's CycloneDX output had no components for these Debian images. SCRS now generates the SBOM from its own component model and no longer runs OSV-Scanner's CycloneDX writer (ADR-026).
+
 **Fix:** `internal/scanner/scanner.go` now treats that notice as benign, like the progress lines that echo repository paths. A real error on the next line still marks coverage partial. `TestScannerProgressPathsAreNotProblems` covers both cases.
 
 ## Conclusion

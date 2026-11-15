@@ -71,7 +71,14 @@ func SyncFeeds(ctx context.Context, root string, ecosystems []string) error {
 		if copyErr != nil || closeErr != nil || n > 512<<20 {
 			return errors.New("feed download failed or exceeded limit")
 		}
-		if err := validateFeed(destination); err != nil {
+		index, err := validateFeed(destination)
+		if err != nil {
+			return err
+		}
+		// The package index lets scans read every advisory for a vulnerable
+		// package without decoding the whole archive (VUL-008).
+		raw, _ := json.Marshal(index)
+		if err := os.WriteFile(filepath.Join(directory, "index.json"), raw, 0644); err != nil {
 			return err
 		}
 	}
@@ -109,16 +116,19 @@ func SyncFeeds(ctx context.Context, root string, ecosystems []string) error {
 
 const maxFeedEntries = 1_000_000
 
-func validateFeed(filename string) error {
+// validateFeed checks every record of an ecosystem archive and returns an
+// index from lower-cased affected package name to archive entry names.
+func validateFeed(filename string) (map[string][]string, error) {
 	archive, err := zip.OpenReader(filename)
 	if err != nil {
-		return errors.New("invalid feed archive")
+		return nil, errors.New("invalid feed archive")
 	}
 	defer archive.Close()
+	index := map[string][]string{}
 	// The npm archive alone held ~232k records in Nov 2026 (mostly MAL- reports),
 	// so the cap leaves growth headroom; size limits below bound the expansion.
 	if len(archive.File) == 0 || len(archive.File) > maxFeedEntries {
-		return errors.New("feed entry count exceeded")
+		return nil, errors.New("feed entry count exceeded")
 	}
 	var total uint64
 	for _, entry := range archive.File {
@@ -127,26 +137,39 @@ func validateFeed(filename string) error {
 		}
 		total += entry.UncompressedSize64
 		if entry.UncompressedSize64 > 2<<20 || total > 2<<30 {
-			return errors.New("feed expansion limit exceeded")
+			return nil, errors.New("feed expansion limit exceeded")
 		}
 		reader, err := entry.Open()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		data, err := io.ReadAll(io.LimitReader(reader, (2<<20)+1))
 		reader.Close()
 		if err != nil || len(data) > 2<<20 {
-			return errors.New("invalid feed record")
+			return nil, errors.New("invalid feed record")
 		}
 		var record struct {
 			ID       string    `json:"id"`
 			Modified time.Time `json:"modified"`
+			Affected []struct {
+				Package struct {
+					Name string `json:"name"`
+				} `json:"package"`
+			} `json:"affected"`
 		}
 		if json.Unmarshal(data, &record) != nil || record.ID == "" || record.Modified.IsZero() {
-			return errors.New("invalid OSV record")
+			return nil, errors.New("invalid OSV record")
+		}
+		seen := map[string]bool{}
+		for _, a := range record.Affected {
+			name := strings.ToLower(a.Package.Name)
+			if name != "" && !seen[name] {
+				seen[name] = true
+				index[name] = append(index[name], entry.Name)
+			}
 		}
 	}
-	return nil
+	return index, nil
 }
 func pinnedFeed(root string) (string, error) {
 	directory, err := filepath.EvalSymlinks(root)

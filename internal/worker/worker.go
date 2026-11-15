@@ -16,6 +16,7 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/depsdev"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/scanner"
@@ -82,6 +83,13 @@ type Worker struct {
 	// sources' API URLs (tests, mirrors); AdvisoryPace overrides pacing.
 	NVDAPIKey, NVDURL, CVEURL string
 	AdvisoryPace              time.Duration
+	// DepsDev supplies licence metadata and version lists; nil disables
+	// lookups (SCRS_DEPSDEV_ENABLED=false). DepsDevMaxLookups bounds the
+	// licence lookups of one assessment.
+	DepsDev           *depsdev.Client
+	DepsDevMaxLookups int
+	// Reports stores compliance evidence reports (CMP-006).
+	Reports ReportStore
 }
 
 // RunMirrors processes queued mirror requests one at a time. A bundle streams
@@ -417,15 +425,13 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if json.Unmarshal(data, &output) != nil {
 		return errors.New("invalid scanner result")
 	}
-	var key, digest string
-	if len(output.SBOM) > 0 {
-		key, digest, err = w.Artifacts.PutSBOM(ctx, output.SBOM)
-		if err != nil {
-			return err
-		}
-	}
 	stages := []assessments.Stage{{Name: "resolve", Status: "ok"}, {Name: "fetch", Status: "ok"}}
 	stages = append(stages, output.Stages...)
+	extra, key, digest, err := w.enrich(ctx, *a, &output, commit)
+	if err != nil {
+		return err
+	}
+	stages = append(stages, extra...)
 	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
 }
 
@@ -611,12 +617,11 @@ func (w Worker) runImage(ctx context.Context, a *assessments.Assessment, c conne
 		return err
 	}
 	a.Commit = result.digest
-	var key, sbomDigest string
-	if len(output.SBOM) > 0 {
-		if key, sbomDigest, err = w.Artifacts.PutSBOM(ctx, output.SBOM); err != nil {
-			return err
-		}
-	}
 	stages := append([]assessments.Stage{{Name: "resolve", Status: "ok", Detail: "Tag resolved to platform manifest digest"}, {Name: "fetch", Status: "ok"}}, output.Stages...)
+	extra, key, sbomDigest, err := w.enrich(ctx, *a, &output, result.digest)
+	if err != nil {
+		return err
+	}
+	stages = append(stages, extra...)
 	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: result.digest, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: sbomDigest, Complete: true})
 }

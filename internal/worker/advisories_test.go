@@ -93,7 +93,10 @@ func TestPostgresEventsAdvisorySyncAndObjectRetention(t *testing.T) {
 		}
 		mu.Lock()
 		sbom++
-		out := scanner.Output{SBOM: json.RawMessage(fmt.Sprintf(`{"bomFormat":"CycloneDX","specVersion":"1.6","serialNumber":"urn:uuid:%d"}`, sbom)), Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}}, Findings: []assessments.Finding{
+		// The worker generates the SBOM from these components; the version
+		// differs per scan so each document has its own digest.
+		components := []assessments.Component{{Name: "log4j-core", Version: fmt.Sprintf("2.14.%d", sbom), Ecosystem: "Maven", PURL: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", Path: "pom.xml"}}
+		out := scanner.Output{Components: components, Stages: []assessments.Stage{{Name: "inventory", Status: "ok"}}, Findings: []assessments.Finding{
 			{Type: "vulnerability", AdvisoryID: "GHSA-jfh8-c2jp-5v3q", Title: "log4j", Severity: severity, Score: map[string]int{"high": 45, "critical": 60}[severity], Component: assessments.Component{Name: "log4j-core", PURL: "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", Path: "pom.xml"}, Evidence: json.RawMessage(`{}`), Guidance: json.RawMessage(`{"aliases":["CVE-2021-44228"]}`)},
 			{Type: "malicious_dependency", AdvisoryID: "MAL-2026-1", Title: "evil", Severity: "critical", Score: 100, Component: assessments.Component{Name: "evil", PURL: "pkg:npm/evil@1.0.0", Path: "package-lock.json"}, Evidence: json.RawMessage(`{}`), Guidance: json.RawMessage(`{}`)},
 		}}
