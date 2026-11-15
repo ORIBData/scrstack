@@ -1,5 +1,7 @@
 # SCRS production gate status — 2026-11-12
 
+> **Historical record (2026-11-12).** The milestone status below is out of date: M2–M7 have since been delivered. Current status and remaining work are in the README roadmap and [PRODUCTION_READINESS_AUDIT.md](PRODUCTION_READINESS_AUDIT.md).
+
 **Latest implementation status:** see [PRD expansion audit](PRD_EXPANSION_AUDIT.md).
 It supersedes this report for malware, IOC, workflow ingress, retention and active
 automatic remediation. The evidence below records the earlier baseline.
@@ -97,7 +99,7 @@ response/error OpenAPI schemas also need fuller typing and contract acceptance.
 | M5 Retention/maintenance/outbound | Not implemented. Developer image cleanup is not product retention. |
 | M6 Images/registries | Docker Hub/GAR discovery only; digest pull/assessment/layer attribution and remaining adapters absent. |
 | M7 Remediation/hardening | Opt-in npm in-place advice adapter, job persistence, artifact retrieval and isolated egress implemented; actual fix/provider acceptance, Maven, VEX and resilience gates remain. |
-| M8 Licences/compliance | Not implemented. |
+| M8 Licences/compliance | Implemented 2026-11-14: see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). STIG and PDF reports remain P2. |
 | M9 SAST/reachability | Not implemented. |
 
 These are engineering deliverables, not items that can be closed through deployment

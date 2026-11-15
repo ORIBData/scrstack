@@ -1,0 +1,185 @@
+{
+ "id": "cwe-top25-2024",
+ "name": "CWE Top 25 Most Dangerous Software Weaknesses",
+ "version": "2024",
+ "kind": "cwe_mapping",
+ "source": "MITRE CWE view 1430, CWE List 5.0; categories in rank order",
+ "url": "https://cwe.mitre.org/top25/",
+ "categories": [
+  {
+   "id": "#1",
+   "name": "CWE-79 Improper Neutralization of Input During Web Page Generation",
+   "cwes": [
+    79
+   ]
+  },
+  {
+   "id": "#2",
+   "name": "CWE-787 Out-of-bounds Write",
+   "cwes": [
+    787
+   ]
+  },
+  {
+   "id": "#3",
+   "name": "CWE-89 Improper Neutralization of Special Elements used in an SQL Command",
+   "cwes": [
+    89
+   ]
+  },
+  {
+   "id": "#4",
+   "name": "CWE-352 Cross-Site Request Forgery",
+   "cwes": [
+    352
+   ]
+  },
+  {
+   "id": "#5",
+   "name": "CWE-22 Improper Limitation of a Pathname to a Restricted Directory",
+   "cwes": [
+    22
+   ]
+  },
+  {
+   "id": "#6",
+   "name": "CWE-125 Out-of-bounds Read",
+   "cwes": [
+    125
+   ]
+  },
+  {
+   "id": "#7",
+   "name": "CWE-78 Improper Neutralization of Special Elements used in an OS Command",
+   "cwes": [
+    78
+   ]
+  },
+  {
+   "id": "#8",
+   "name": "CWE-416 Use After Free",
+   "cwes": [
+    416
+   ]
+  },
+  {
+   "id": "#9",
+   "name": "CWE-862 Missing Authorization",
+   "cwes": [
+    862
+   ]
+  },
+  {
+   "id": "#10",
+   "name": "CWE-434 Unrestricted Upload of File with Dangerous Type",
+   "cwes": [
+    434
+   ]
+  },
+  {
+   "id": "#11",
+   "name": "CWE-94 Improper Control of Generation of Code",
+   "cwes": [
+    94
+   ]
+  },
+  {
+   "id": "#12",
+   "name": "CWE-20 Improper Input Validation",
+   "cwes": [
+    20
+   ]
+  },
+  {
+   "id": "#13",
+   "name": "CWE-77 Improper Neutralization of Special Elements used in a Command",
+   "cwes": [
+    77
+   ]
+  },
+  {
+   "id": "#14",
+   "name": "CWE-287 Improper Authentication",
+   "cwes": [
+    287
+   ]
+  },
+  {
+   "id": "#15",
+   "name": "CWE-269 Improper Privilege Management",
+   "cwes": [
+    269
+   ]
+  },
+  {
+   "id": "#16",
+   "name": "CWE-502 Deserialization of Untrusted Data",
+   "cwes": [
+    502
+   ]
+  },
+  {
+   "id": "#17",
+   "name": "CWE-200 Exposure of Sensitive Information to an Unauthorized Actor",
+   "cwes": [
+    200
+   ]
+  },
+  {
+   "id": "#18",
+   "name": "CWE-863 Incorrect Authorization",
+   "cwes": [
+    863
+   ]
+  },
+  {
+   "id": "#19",
+   "name": "CWE-918 Server-Side Request Forgery",
+   "cwes": [
+    918
+   ]
+  },
+  {
+   "id": "#20",
+   "name": "CWE-119 Improper Restriction of Operations within the Bounds of a Memory Buffer",
+   "cwes": [
+    119
+   ]
+  },
+  {
+   "id": "#21",
+   "name": "CWE-476 NULL Pointer Dereference",
+   "cwes": [
+    476
+   ]
+  },
+  {
+   "id": "#22",
+   "name": "CWE-798 Use of Hard-coded Credentials",
+   "cwes": [
+    798
+   ]
+  },
+  {
+   "id": "#23",
+   "name": "CWE-190 Integer Overflow or Wraparound",
+   "cwes": [
+    190
+   ]
+  },
+  {
+   "id": "#24",
+   "name": "CWE-400 Uncontrolled Resource Consumption",
+   "cwes": [
+    400
+   ]
+  },
+  {
+   "id": "#25",
+   "name": "CWE-306 Missing Authentication for Critical Functionality",
+   "cwes": [
+    306
+   ]
+  }
+ ]
+}

@@ -2,7 +2,6 @@ package scanner
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -35,14 +34,17 @@ func (e Engine) RunImage(ctx context.Context, archivePath string) (Output, error
 		stages   []assessments.Stage
 	}
 	layers := make(chan content, 1)
+	licenses := newLicenseCollector(true)
 	go func() {
 		layerCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 		defer cancel()
-		files, findings, stages := e.scanLayers(layerCtx, archivePath)
+		files, findings, stages := e.scanLayersWith(layerCtx, archivePath, licenses)
 		layers <- content{files, findings, stages}
 	}()
 	out, err := e.inventoryImage(ctx, archivePath)
 	c := <-layers
+	// The layer walk has finished: its licence evidence is complete.
+	licenses.apply(out.Components)
 	out.Files = c.files
 	out.Findings = append(c.findings, out.Findings...)
 	out.Stages = append(c.stages, out.Stages...)
@@ -58,7 +60,14 @@ func (e Engine) RunImage(ctx context.Context, archivePath string) (Output, error
 // Only files with a malware verdict other than clean, or with findings, are
 // recorded as evidence; whole-image inventories exceed the evidence budget.
 func (e Engine) scanLayers(ctx context.Context, archivePath string) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
+	return e.scanLayersWith(ctx, archivePath, nil)
+}
+
+// scanLayersWith also feeds every layer file read to a licence collector.
+// A later layer's file replaces an earlier one's evidence for the same path.
+func (e Engine) scanLayersWith(ctx context.Context, archivePath string, licenses *licenseCollector) ([]FileEvidence, []assessments.Finding, []assessments.Stage) {
 	scan := e.newContentScan(ctx, ctx, true, filepath.Dir(archivePath))
+	scan.licenses = licenses
 	files := []FileEvidence{}
 	image, err := tarball.ImageFromPath(archivePath, nil)
 	if err != nil {
@@ -220,15 +229,12 @@ func (e Engine) inventoryImage(ctx context.Context, archivePath string) (Output,
 	if err != nil || len(components) == 0 || len(components) > 20000 || len(findings) > 10000 {
 		return failed("Image inventory empty, invalid or over limits")
 	}
-	if out.SBOM, err = run("cyclonedx-1-6"); err != nil {
-		return failed(err.Error())
-	}
-	out.SBOM = bytes.ReplaceAll(out.SBOM, []byte(archivePath), []byte("image"))
+	out.Packages = packageAdvisories(database, out.Components, out.Findings)
 	enrichStage := assessments.Stage{Name: "enrich", Status: "skipped", Detail: "KEV and EPSS feeds not available in this snapshot"}
 	if enrich != nil {
 		enrichStage = assessments.Stage{Name: "enrich", Status: "ok", Detail: fmt.Sprintf("CISA KEV (%d) and EPSS (%d) exploitation context", len(enrich.kev), len(enrich.epss))}
 	}
-	out.Stages = append(out.Stages, assessments.Stage{Name: "inventory", Status: "ok", Detail: "OS and language packages from image layers"}, assessments.Stage{Name: "sbom", Status: "ok"}, assessments.Stage{Name: "match_vuln", Status: "ok"}, assessments.Stage{Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}, enrichStage)
+	out.Stages = append(out.Stages, assessments.Stage{Name: "inventory", Status: "ok", Detail: "OS and language packages from image layers"}, assessments.Stage{Name: "match_vuln", Status: "ok"}, assessments.Stage{Name: "match_malicious", Status: "ok", Detail: "OSV records in configured feeds"}, enrichStage)
 	return out, nil
 }
 

@@ -139,6 +139,10 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	} else if missing != nil && len(r.Findings) < 10000 {
 		r.Findings = append(r.Findings, *missing)
 	}
+	// Licence entries for review and deny results (LIC-004 to LIC-008).
+	if err := s.licenseFindings(ctx, tx, a, &r); err != nil {
+		return err
+	}
 	files, err := json.Marshal(r.Files)
 	if err != nil {
 		return ErrInput
@@ -179,8 +183,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	for i, f := range unique {
 		fingerprints[i] = f.Fingerprint
 	}
-	// Register entries that did not exist before this scan drive finding.created.
-	registered, err := stringSet(ctx, tx, `SELECT fingerprint FROM `+s.schema+`.findings WHERE fingerprint=ANY($1)`, fingerprints)
+	// Register entries that did not exist before this scan drive finding.created;
+	// existing entries whose severity or score changes drive finding.rescored.
+	registered, previous, err := s.registeredScores(ctx, tx, fingerprints)
 	if err != nil {
 		return err
 	}
@@ -280,6 +285,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		return err
 	}
 	if err := s.emitCompletion(ctx, tx, done, created); err != nil {
+		return err
+	}
+	if err := s.emitRescored(ctx, tx, done, unique, previous); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -429,7 +437,7 @@ func (s *Store) Transition(ctx context.Context, id, actor uuid.UUID, status, rea
 	if _, err = tx.Exec(ctx, `UPDATE `+s.schema+`.findings SET status=$2,waiver_until=$3,revision=revision+1 WHERE id=$1`, id, status, until); err != nil {
 		return err
 	}
-	if _, err := notify.Emit(ctx, tx, s.schema, "finding.status_changed", map[string]any{"finding_id": id, "asset_id": asset, "previous_status": previous, "status": status, "waiver_until": until, "actor_id": actor, "link": notify.Link("/register/" + id.String() + "/events")}, nil); err != nil {
+	if _, err := notify.EmitScoped(ctx, tx, s.schema, "finding.status_changed", map[string]any{"finding_id": id, "asset_id": asset, "previous_status": previous, "status": status, "waiver_until": until, "actor_id": actor, "link": notify.Link("/register/" + id.String() + "/events")}, nil, notify.Scope{Asset: asset}); err != nil {
 		return err
 	}
 	details, _ := json.Marshal(map[string]any{"status": status, "reason": reason, "expires_at": until, "actor_id": actor})

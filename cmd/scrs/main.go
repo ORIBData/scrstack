@@ -117,6 +117,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "artifact store unavailable")
 		os.Exit(1)
 	}
+	assessmentStore.UseObjects(artifacts)
 	events, err := notify.Open(context.Background(), cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "notification store unavailable")

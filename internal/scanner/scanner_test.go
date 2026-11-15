@@ -65,13 +65,25 @@ func TestOfflineOSVDetectsSyntheticVulnerability(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, _ = entry.Write([]byte(`{"id":"GHSA-xxxx-yyyy-zzzz","modified":"2026-11-01T00:00:00Z","published":"2026-11-01T00:00:00Z","summary":"Synthetic critical advisory","database_specific":{"severity":"CRITICAL"},"affected":[{"package":{"name":"bad-package","ecosystem":"npm"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.1"}]}]}]}`))
+	// A second advisory affects the first fix but not the installed version:
+	// only the package index reveals it (VUL-008).
+	later, _ := z.Create("GHSA-later.json")
+	_, _ = later.Write([]byte(`{"id":"GHSA-later","modified":"2026-11-02T00:00:00Z","summary":"Regression","affected":[{"package":{"name":"bad-package","ecosystem":"npm"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.1"},{"fixed":"1.0.3"}]}]}]}`))
 	_ = z.Close()
 	_ = file.Close()
+	index, err := validateFeed(filepath.Join(directory, "all.zip"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(index)
+	if err := os.WriteFile(filepath.Join(directory, "index.json"), raw, 0644); err != nil {
+		t.Fatal(err)
+	}
 	manifest, _ := json.Marshal(FeedManifest{FetchedAt: time.Now(), Ecosystems: []string{"npm"}})
 	if err := os.WriteFile(filepath.Join(db, "manifest.json"), manifest, 0644); err != nil {
 		t.Fatal(err)
 	}
-	lock := `{"name":"fixture","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture","version":"1.0.0"},"node_modules/bad-package":{"version":"1.0.0","resolved":"https://registry.npmjs.org/bad-package/-/bad-package-1.0.0.tgz"}}}`
+	lock := `{"name":"fixture","version":"1.0.0","lockfileVersion":3,"packages":{"":{"name":"fixture","version":"1.0.0"},"node_modules/bad-package":{"version":"1.0.0","resolved":"https://registry.npmjs.org/bad-package/-/bad-package-1.0.0.tgz","license":"Apache License, Version 2.0"}}}`
 	engine := Engine{Binary: binary, WorkRoot: t.TempDir(), Database: db}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -92,15 +104,16 @@ func TestOfflineOSVDetectsSyntheticVulnerability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Findings) != 1 || result.Findings[0].Severity != "critical" || !json.Valid(result.SBOM) {
+	if len(result.Findings) != 1 || result.Findings[0].Severity != "critical" {
 		t.Fatalf("unexpected result: components=%d findings=%v", len(result.Components), result.Findings)
 	}
-	var sbom struct {
-		Format  string `json:"bomFormat"`
-		Version string `json:"specVersion"`
+	// The scanner no longer emits OSV-Scanner's CycloneDX; the worker builds
+	// the SBOM from these components and their licences.
+	if l := result.Components[0].License; l == nil || l.Expression != "Apache-2.0" || l.Source != "declared" || l.Declared != "Apache License, Version 2.0" || l.Evidence != "package-lock.json" {
+		t.Fatalf("declared licence: %+v", result.Components[0].License)
 	}
-	if json.Unmarshal(result.SBOM, &sbom) != nil || sbom.Format != "CycloneDX" || sbom.Version != "1.6" {
-		t.Fatal("invalid CycloneDX output")
+	if len(result.Packages) != 1 || !result.Packages[0].Complete || len(result.Packages[0].Advisories) != 2 {
+		t.Fatalf("package advisories: %+v", result.Packages)
 	}
 }
 
@@ -141,11 +154,11 @@ func TestFeedFreshness(t *testing.T) {
 	}
 }
 func TestScannerProgressPathsAreNotProblems(t *testing.T) {
-	benign := "Scanning dir /work/scrs-scan-1/checkout\nScanned /work/scrs-scan-1/checkout/packages/error-pages/package-lock.json file and found 12 packages\nScanned /work/x/warnings/go.mod file and found 1 package\n"
+	benign := "Scanning dir /work/scrs-scan-1/checkout\nScanned /work/scrs-scan-1/checkout/packages/error-pages/package-lock.json file and found 12 packages\nScanned /work/x/warnings/go.mod file and found 1 package\nFailed to parse package URL: unable to determine purl type of libgpg-error@1.46-1 (Debian:12)\n"
 	if reportsProblem(benign) {
 		t.Fatal("repository path text treated as scanner problem")
 	}
-	for _, bad := range []string{benign + "Error during extraction of yarn.lock\n", "Warning: lockfile could not be parsed\n"} {
+	for _, bad := range []string{benign + "Error during extraction of yarn.lock\n", "Warning: lockfile could not be parsed\n", "Failed to parse package URL: unable to determine purl type of x (Debian:12)\nerror: layer truncated\n"} {
 		if !reportsProblem(bad) {
 			t.Fatalf("scanner problem ignored: %q", bad)
 		}
@@ -159,7 +172,11 @@ func TestRealFeedArchiveValidates(t *testing.T) {
 	if archive == "" {
 		t.Skip("set SCRS_TEST_OSV_FEED_ZIP to a downloaded OSV all.zip")
 	}
-	if err := validateFeed(archive); err != nil {
+	index, err := validateFeed(archive)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(index) == 0 {
+		t.Fatal("feed index empty")
 	}
 }

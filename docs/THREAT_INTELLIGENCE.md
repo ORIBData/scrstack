@@ -14,6 +14,9 @@ sources, which can be uploaded as STIX 2.1 or polled over TAXII 2.1.
 | YARA rulesets (`/intel/yara-rulesets`) | Available; run with YARA-X | Repositories, image layers |
 | STIX 2.1 upload (`:import-stix`) | Available | Repositories, image layers, GitHub events |
 | TAXII 2.1 polling (`kind: taxii`) | Available | Repositories, image layers, GitHub events |
+| CSV import (`:import-csv`) | Available; manual sources | Repositories, image layers |
+| Vulnerability sources (`/intel/vulnerability-sources`): OSV, malicious packages, KEV, EPSS, NVD, CVE Program | Available | Vulnerability findings (enrichment and health) |
+| Vendor statements (`/intel/vex-documents`): OpenVEX, CycloneDX VEX, CSAF | Available; report-only | Vulnerability findings |
 
 ## YARA rulesets
 
@@ -107,15 +110,15 @@ optional `confidence` from 0 to 100.
 | Type | Matched against |
 | --- | --- |
 | `sha256`, `sha1`, `md5` | File contents. SHA-1 and MD5 are computed only while such indicators are loaded. |
-| `domain`, `ipv4`, `url` | Text files up to 1 MiB |
+| `domain`, `ipv4`, `ipv6`, `url` | Text files up to 1 MiB. IPv6 addresses are compared in canonical form (`2001:0DB8::0001` matches `2001:db8::1`) |
 | `file_content_regex` | Text files up to 1 MiB |
 | `file_path_regex` | File paths, and paths in GitHub push events |
 | `purl` | Packages in the SBOM |
 | `workflow_step_name` | GitHub Actions workflow step names |
 | `git_branch_regex`, `commit_message_regex`, `pr_title_regex` | GitHub events |
 
-Defanged values are accepted: `evil[.]example`, `1.2.3[.]4` and
-`hxxps://...`. URLs match exactly once normalized: the scheme and host are
+Defanged values are accepted: `evil[.]example`, `1.2.3[.]4`, `2001:db8[:]:1`
+and `hxxps://...`. URLs match exactly once normalized: the scheme and host are
 lower-cased, the default port and fragment dropped, and an empty path becomes
 `/`. Path and query keep their case.
 
@@ -310,8 +313,76 @@ A client certificate (`cert_pem` and `key_pem`) can be added to any
   OpenCTI on the same network, list its hostname in
   `SCRS_TAXII_PRIVATE_HOSTS` on the API and worker.
 
+## CSV import
+
+`POST /intel/indicator-sources/{id}:import-csv` loads a vendor or analyst CSV
+export into a manual source (TIF-005). The body is CSV with a header row
+(`text/csv`; `delimiter=tab` or `semicolon` for other exports).
+
+| Query | Default | Meaning |
+| --- | --- | --- |
+| `value_column` | `value` | Header of the indicator value |
+| `type_column` | `type` | Header of the type; common vendor names are understood (`ip-dst`, `hostname`, `filehash-sha256`, `uri`) |
+| `type` | detect | Type for rows without one; otherwise MD5, SHA-1, SHA-256, IPv4, IPv6, URL, purl or domain is detected from the value |
+| `first_seen_column`, `valid_until_column` | `first_seen`, `valid_until` | Dates (RFC 3339 or `YYYY-MM-DD`); expiry is first seen (or now) plus `valid_days` when a row has none |
+| `confidence_column` | `confidence` | 0 to 100 |
+| `label_column` | `label` | Campaign or report name; it becomes part of the indicator ID, and so of the finding's advisory ID |
+| `valid_days` | 180 | 1 to 3650 |
+| `merge` | false | `true` keeps the source's other indicators; otherwise the CSV replaces them |
+
+Rows that do not parse (bad hash, unknown type, event-only types) are skipped
+and reported with row numbers (first 50); the rest import. The same limits and
+permissions as bundle imports apply.
+
+## Vulnerability sources
+
+`GET /intel/vulnerability-sources` lists every advisory source with its
+licence and terms, schedule, last sync and success, record count, lag and
+failures (VUL-001).
+
+| Source | Fetched by | What it adds |
+| --- | --- | --- |
+| `osv` | `scrs-feed-sync`, every 6 h | OSV.dev ecosystem dumps: what vulnerability matching uses |
+| `malicious_packages` | inside the OSV dumps | OpenSSF `MAL-` reports |
+| `kev`, `epss` | `scrs-feed-sync` | Known-exploited and exploit-probability context on findings |
+| `nvd` | worker | NVD CVE API 2.0: NVD CVSS vectors and scores, CWE, references |
+| `cve_program` | worker | CVE Services API: the CNA's own description, CWE, scores, affected ranges, plus ADP scores |
+| `vex` | operator imports | Vendor and maintainer statements |
+
+How the NVD and CVE Program sync works:
+- **Targeted, not a full mirror.** The worker fetches the CVEs that open register entries reference, as the advisory or an alias. The NVD source then reads the NVD's modified-CVE window on each run and refreshes only records SCRS holds.
+- **Pacing.** The NVD's published limits apply (one request per 6 s without a key, 0.7 s with `SCRS_NVD_API_KEY`). A rate-limit answer ends the run early, and the next run continues.
+- **Storage.** Records are stored in OSV schema with `origin` `nvd` or `cve5`, the original kept verbatim (VUL-002). Rejected CVEs are marked withdrawn.
+- **Read them** with `GET /intel/vulnerabilities/{id}`: every record, all CVSS vectors and scores with their sources (`severity_sources`), CWEs and vendor statements.
+
+Health: a source with no success within twice its schedule is marked `stale`
+and raises `feed.stale` once (VUL-010). OSV's own alert stays as before. The
+worker reads the OSV, KEV and EPSS freshness from the scanner's `/feeds`.
+Worker sources can be disabled or rescheduled
+(`PATCH /intel/vulnerability-sources/{key}`, admin, audited). A source whose
+licence restricts use needs `acknowledge_terms` to be enabled (VUL-011).
+
+## Vendor statements (VEX)
+
+`POST /intel/vex-documents` imports OpenVEX, CycloneDX VEX or CSAF 2.0
+documents (VUL-009). Each becomes one statement per vulnerability and product:
+- `not_affected`, `affected`, `fixed` or `under_investigation`;
+- the justification, impact and action;
+- the publisher.
+
+A statement whose product purl has no version applies to every version of the
+package. Statements are attributed inputs, shown with
+`GET /intel/vulnerabilities/{id}?purl=` and `GET /intel/vex-statements`. They
+never close or waive a finding; triage stays a person's decision in the
+register. The same document imported twice is refused.
+
 ## Roadmap
 
-The threat-intelligence module (YARA-X rulesets, indicator sources, STIX 2.1
-upload and TAXII 2.1 polling) is complete. Next is milestone M8: licences,
-SPDX export and compliance evidence reports.
+The threat-intelligence module is complete:
+- YARA-X rulesets;
+- indicator sources (manual, CSV, STIX 2.1, TAXII 2.1);
+- IPv6 indicators;
+- the vulnerability-source registry with NVD and CVE Program records;
+- VEX import.
+
+M8 (licences, SBOM exports, safe versions and compliance evidence reports) is done; see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). Next is M9: SAST analyzers and reachability.

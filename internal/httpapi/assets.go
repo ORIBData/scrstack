@@ -133,6 +133,14 @@ func (h assetHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !readBody(w, r, &change) {
 		return
 	}
+	if change.Distribution != nil && !actor.Allows("admin") {
+		writeError(w, 403, "distribution needs admin scope: it selects the licence policy")
+		return
+	}
+	if change.LegalHold != nil && !actor.Allows("admin") {
+		writeError(w, 403, "legal_hold needs admin scope")
+		return
+	}
 	a, err := h.store.UpdateAsset(ctx, id, revision, change, actor.ID)
 	if err != nil {
 		assetStoreError(w, err)

@@ -281,3 +281,111 @@ Two bugs were found and fixed during this verification:
 - **Jobs share a kernel.** They are isolated by user and directory, not by VM. Rebuild the runner host periodically, and keep its outbound firewall tight.
 - **Real hosted providers are untested.** Generation was tested against fake OpenAI-compatible, Anthropic and Gemini servers, not with real keys. Check each provider with `POST /llm/providers/{id}:test` after adding it.
 - **Source code leaves your network** to the LLM provider when `allow_source_upload` is enabled for unit-test generation.
+
+## 2026-11-14 per-connection webhooks, scoped subscriptions and the runner in the stack
+
+**Inbound webhooks belong to connections.**
+- **Secrets.** Every GitHub, GitLab, Harbor, Docker Hub, GAR and OCI connection has its own webhook secret (`POST /connections/{id}:webhook`).
+  - It is sealed apart from the provider credential (AAD `connection-webhook:<id>`).
+  - Rotating it re-scopes nothing.
+- **Receivers.** Each connection has its own receiver: `/ingest/github/<name>`, `/ingest/gitlab/<name>` or `/ingest/registry/<provider>/<name>`.
+  - Unsigned requests are refused before any lookup.
+  - Unknown, disabled or unconfigured connections answer `401` like a bad signature.
+  - Accepted events resolve only to that connection's assets.
+- **Registry receivers** take the connection secret instead of an API token, so they no longer depend on `SCRS_RELAY_ENABLED`. Docker Hub and GAR send it in the URL; SCRS logs only paths, and the docs warn about proxy access logs.
+- **GitHub delivery check.** Hook URLs are per connection.
+- **Legacy.** The shared secrets and receivers remain for existing hooks.
+
+**Outbound subscriptions can be scoped to connections.**
+- Events carry their connection, directly or through the asset. These are assessments, findings, QA runs, integrity alerts and `connection.degraded`.
+- A scoped subscription receives only those connections' events plus platform events.
+
+**Runner in the Dokploy stack.**
+- `scrs-qa-runner` is its own image with its own Traefik router and hostname, behind an IP allowlist that defaults to nobody and the token.
+- SCRS reaches it over an internal `qa` network.
+- It shares the host kernel with SCRS. It can reach other containers on `dokploy-network` and the host's published ports, as described in DOKPLOY.md. A separate VM remains the stronger option.
+
+**Verified:** `TestPostgresConnectionWebhooksAndScopedSubscriptions` covered:
+- GitHub, GitLab, Harbor and Docker Hub receivers;
+- rotation and stale secrets;
+- cross-connection isolation;
+- hook URLs;
+- scoped versus unscoped delivery.
+
+The deployment test asserts the runner's labels, networks and lack of secrets. `make qa` and `make database-test` pass.
+
+## 2026-11-14 M0, M4, M5 and M6 completion
+
+**M4:**
+- **CSV indicator import** (TIF-005) with column mapping, type detection, defanging, labels, merge and per-row reports.
+- **IPv6 indicators**, canonical-form matching in text files, and STIX `ipv6-addr`.
+- **The vulnerability-source registry** (VUL-001, VUL-010, VUL-011): licences, schedules, health, stale alerts once, and admin-only changes, with terms acknowledgement for restricted sources.
+- **NVD API 2.0 and CVE Program records** (VUL-002, VUL-006) for the CVEs the register references. They are paced to the NVD's limits, refreshed from the modified-CVE window, and stored in OSV schema with originals.
+- **OpenVEX, CycloneDX VEX and CSAF import** (VUL-009) as attributed, report-only vendor statements.
+
+**M5:**
+- **Retention by data class** (RET-001 to RET-007), with environment defaults, `legal_hold` (RET-006), the 365-day audit floor, batched purges, explicit S3 deletion and per-class audit.
+- **Maintenance actions:** reset (feed state, a source's indicators, an asset's findings), rebuild, sensor update, schedule and versions (MNT-001 to MNT-006).
+- **New events:** `finding.rescored` and `malicious_dependency.reported` (OUT-001, OUT-010), plus JSON Schemas for every event (OUT-008).
+- **`GET /audit`** (OBS-002).
+
+**M0:** [ADR.md](ADR.md) records ADR-001 to ADR-024, and [SPIKES.md](SPIKES.md) records S1–S13 with evidence levels.
+
+**M6:** a Trivy parity run on three sample images, recorded in [TRIVY_PARITY.md](TRIVY_PARITY.md). Source packages match in full, and vulnerability matches agree on 97% or more; the remaining differences come from the data sources. The run found a false "incomplete coverage" result on Debian images: a purl notice naming `libgpg-error` matched the stderr error check. It is fixed and covered by a test.
+
+**Decisions and safeguards:**
+- **Retention is opt-in.** Every class defaults to keep forever. Open entries, current revisions and legal-hold assets are never candidates. S3 objects are deleted only when no retained row references them.
+- **Resets need care.** They need `confirm` equal to the scope, refuse legal-hold assets and are audited.
+- **Vendor statements never close or waive findings** (ADR-024).
+- **A source that never synced is stale only after twice its schedule from when SCRS started tracking it.** This avoids alerts on a fresh deploy before feed-sync's first run.
+
+**Verified:**
+- `TestPostgresAdvisoriesRetentionAndMaintenance` and `TestPostgresEventsAdvisorySyncAndObjectRetention` against PostgreSQL;
+- NVD 2.0 and CVE JSON 5 parsing and VEX parsing in `internal/advisory`;
+- CSV and IPv6 unit tests;
+- event payloads validated against their schemas;
+- `make qa`, `make database-test`.
+
+**Not verified:** sync against the live NVD and CVE Services APIs, which the tests replace with servers shaped like their published responses.
+
+## Addendum 2026-11-14: M8
+
+**Delivered** (details in [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md)):
+- **Licences** (LIC-001 to LIC-009): declared, detected and deps.dev licence data; SPDX normalisation; 740 SPDX licences categorised with versioned overrides; policy by asset distribution with `corporate-default`; licence entries, the gate and waivers; inventory, report and third-party notices.
+- **SBOMs** (SBM-001, SBM-010, SBM-011): generated by SCRS from its component model as CycloneDX 1.6 JSON and XML and SPDX 2.3 JSON, by assessment or SBOM digest.
+- **Safe versions** (VUL-008): from every advisory the local mirror holds for the package and registry version lists.
+- **Compliance** (CMP-001 to CMP-003, CMP-005, CMP-006): OWASP Top 10 2021 and 2025, CWE Top 25 2024 and 2025, and PCI DSS 6.3.1–6.3.3 evidence reports with custom packs, stored under the new `reports` retention class.
+
+**Decisions and safeguards:**
+- **The licence gate is report-only until enforcing.** A deny warns; enforcing, deny fails and review warns.
+- **Failed lookups stay unresolved, not unknown.** Under an enforcing policy they make the assessment incomplete.
+- **Distribution is admin-only**, because it selects the policy column.
+- **Licence CSV cells are formula-neutralised.**
+- **Reports carry no verdict field**, and record data time, feed freshness and their SHA-256.
+
+**Fixed along the way:**
+- OSV-Scanner's CycloneDX output had no components for Debian images. SCRS now builds the SBOM itself (ADR-026).
+- Trivy and SARIF imports now keep CWE ids.
+
+**Verified:**
+- unit tests in `internal/license`, `internal/sbom` (official schema validation), `internal/versions` and `internal/compliance`;
+- `make scanner-test` with the real OSV-Scanner;
+- `TestPostgresLicencesSafeVersionsSBOMAndReports` (AT-25, AT-26, AT-30 through the worker);
+- `TestPostgresLicenceAndComplianceAPI` (every new endpoint).
+
+**Not verified:** live deps.dev at volume, and counsel review of `corporate-default`.
+
+## Current status and remaining work (2026-11-14)
+
+Delivered: M0–M8, the threat-intelligence module, and E2E QA (Karate). Remaining:
+
+1. **M9 (next):** SAST analyzers (gosec, Bandit, Bearer), Go reachability and taint traces (spikes S10–S12).
+2. **P2:** Dependency-Track push, CPE matching (VUL-007), server-sent events, STIG (CMP-004) and PDF reports, outbound licence compatibility (LIC-005).
+3. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
+4. **Acceptance:**
+   - live Dokploy deployment with TLS;
+   - real provider, registry, TAXII, NVD and LLM accounts;
+   - the runner on the VPS;
+   - backup and restore drills;
+   - signed release manifests;
+   - the ClamAV image CVE review.

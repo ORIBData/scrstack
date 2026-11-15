@@ -127,6 +127,9 @@ type AssetChange struct {
 	Criticality *int               `json:"criticality"`
 	Exposure    *string            `json:"exposure"`
 	Labels      *map[string]string `json:"labels"`
+	// LegalHold and Distribution are admin-only; the API checks the scope.
+	LegalHold    *bool   `json:"legal_hold"`
+	Distribution *string `json:"distribution"`
 }
 
 func (s *Store) UpdateAsset(ctx context.Context, id uuid.UUID, expected int64, c AssetChange, actor uuid.UUID) (Asset, error) {
@@ -189,10 +192,19 @@ func (s *Store) UpdateAsset(ctx context.Context, id uuid.UUID, expected int64, c
 		}
 		a.Labels, _ = json.Marshal(*c.Labels)
 	}
-	if err := tx.QueryRow(ctx, `UPDATE `+s.schema+`.assets SET owner_id=$2,environment=$3,criticality=$4,exposure=$5,labels=$6,revision=revision+1 WHERE id=$1 RETURNING revision`, id, a.OwnerID, a.Environment, a.Criticality, a.Exposure, a.Labels).Scan(&a.Revision); err != nil {
+	if c.LegalHold != nil {
+		a.LegalHold = *c.LegalHold
+	}
+	if c.Distribution != nil {
+		if d := *c.Distribution; d != "internal" && d != "saas" && d != "distributed" {
+			return Asset{}, ErrInvalidChange
+		}
+		a.Distribution = *c.Distribution
+	}
+	if err := tx.QueryRow(ctx, `UPDATE `+s.schema+`.assets SET owner_id=$2,environment=$3,criticality=$4,exposure=$5,labels=$6,legal_hold=$7,distribution=$8,revision=revision+1 WHERE id=$1 RETURNING revision`, id, a.OwnerID, a.Environment, a.Criticality, a.Exposure, a.Labels, a.LegalHold, a.Distribution).Scan(&a.Revision); err != nil {
 		return Asset{}, err
 	}
-	details, _ := json.Marshal(map[string]any{"owner_id": a.OwnerID, "environment": a.Environment, "criticality": a.Criticality, "exposure": a.Exposure})
+	details, _ := json.Marshal(map[string]any{"owner_id": a.OwnerID, "environment": a.Environment, "criticality": a.Criticality, "exposure": a.Exposure, "legal_hold": a.LegalHold, "distribution": a.Distribution})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES('asset.changed',$1,$2)`, id, auditDetails(WithActor(ctx, actor), details)); err != nil {
 		return Asset{}, err
 	}

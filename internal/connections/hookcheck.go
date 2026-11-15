@@ -72,16 +72,17 @@ func (s *Store) CheckGitHubHooks(ctx context.Context, api HookAPI, hookURL strin
 	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtext($1))`, s.schema+".github_hook_check").Scan(&ran); err != nil || !ran {
 		return nil, false, err
 	}
-	rows, err := tx.Query(ctx, `SELECT name,webhook_check FROM `+s.schema+`.connections WHERE provider='github' AND enabled ORDER BY name`)
+	rows, err := tx.Query(ctx, `SELECT name,webhook_check,webhook_url FROM `+s.schema+`.connections WHERE provider='github' AND enabled ORDER BY name`)
 	if err != nil {
 		return nil, true, err
 	}
 	previous := map[string]HookCheck{}
+	urls := map[string]string{}
 	var names []string
 	for rows.Next() {
-		var name string
+		var name, own string
 		var raw []byte
-		if err := rows.Scan(&name, &raw); err != nil {
+		if err := rows.Scan(&name, &raw, &own); err != nil {
 			rows.Close()
 			return nil, true, err
 		}
@@ -89,6 +90,11 @@ func (s *Store) CheckGitHubHooks(ctx context.Context, api HookAPI, hookURL strin
 		_ = json.Unmarshal(raw, &p)
 		previous[name] = p
 		names = append(names, name)
+		// The connection's own hook URL wins over the deployment-wide one.
+		urls[name] = hookURL
+		if own != "" {
+			urls[name] = own
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -98,7 +104,7 @@ func (s *Store) CheckGitHubHooks(ctx context.Context, api HookAPI, hookURL strin
 		c, secret, err := s.Get(ctx, name)
 		check, abandoned := HookCheck{ConnectionID: c.ID, Connection: name, State: "failed", CheckedAt: now, LastSuccess: previous[name].LastSuccess, Problems: []string{clipProblem(fmt.Sprint(err))}}, []abandonedDelivery(nil)
 		if err == nil {
-			if check, abandoned, err = s.checkConnection(ctx, tx, api, c, secret, hookURL, previous[name], now); err != nil {
+			if check, abandoned, err = s.checkConnection(ctx, tx, api, c, secret, urls[name], previous[name], now); err != nil {
 				return nil, true, err
 			}
 		}
@@ -286,7 +292,7 @@ func (s *Store) recordHookCheck(ctx context.Context, tx pgx.Tx, c Connection, ch
 	worsened := check.State != "ok" && (prev.State == "" || prev.State == "ok" || prev.State == "unchecked")
 	if worsened || len(abandoned) > 0 || check.Rejected > 0 {
 		data := map[string]any{"connection_id": c.ID, "name": c.Name, "provider": c.Provider, "check": "github_webhook_deliveries", "state": check.State, "problems": check.Problems, "abandoned": abandoned, "link": notify.Link("/system/github-webhooks")}
-		if _, err := notify.Emit(ctx, tx, s.schema, "connection.degraded", data, nil); err != nil {
+		if _, err := notify.EmitScoped(ctx, tx, s.schema, "connection.degraded", data, nil, notify.Scope{Connection: c.ID}); err != nil {
 			return err
 		}
 	}
@@ -321,7 +327,7 @@ func (s *Store) GitHubHookChecks(ctx context.Context) ([]HookCheck, error) {
 func rejectionHint(code int) string {
 	switch code {
 	case 401:
-		return "the webhook secret in GitHub does not match SCRS_GITHUB_WEBHOOK_SECRET"
+		return "the webhook secret in GitHub does not match the connection's webhook secret"
 	case 413:
 		return "the payload exceeded the 1 MiB receiver limit"
 	case 400:

@@ -53,3 +53,19 @@ release acceptance steps not executed by the local QA workflow.
 The inherited upstream workflow that automatically pushed `clamav-rest` images has
 been archived. SCRS CI builds/tests the API without publishing; release remains an
 explicit operator action through Make.
+
+## Karate runner image
+
+The E2E QA runner is a second image built from `deploy/karate-runner/Dockerfile`
+(karate-cli 0.1.9, Karate 2.1.4 and karate-gatling, all pinned and checksum-verified;
+headless Chromium; Java 21). It follows the same tag rules:
+
+```sh
+make qa-runner-image                       # local build
+make qa-runner-image-test                  # API, UI and load runs in a hardened container
+make release-qa-runner SCRS_QA_RUNNER_IMAGE=organization/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256} PLATFORMS=linux/amd64,linux/arm64
+```
+
+Set the resolved reference as `SCRS_QA_RUNNER_IMAGE` in Dokploy. Bump
+`KARATE_VERSION`, `KARATE_SHA256` and the karate-cli digests in the Dockerfile
+together, from `https://karate.sh/manifest.json`.

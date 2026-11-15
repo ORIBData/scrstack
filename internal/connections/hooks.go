@@ -118,13 +118,17 @@ func (a NativeAdapters) hookBearer(ctx context.Context, cfg githubAccess) (strin
 }
 
 // pointsAtSCRS matches the configured public hook URL exactly or, when none
-// is configured, either SCRS GitHub receiver path.
-func pointsAtSCRS(raw, expected string) bool {
+// is configured, the connection's receiver path or a legacy shared one.
+func pointsAtSCRS(raw, expected, name string) bool {
 	if expected != "" {
 		return strings.TrimSuffix(raw, "/") == strings.TrimSuffix(expected, "/")
 	}
 	u, err := url.Parse(raw)
-	return err == nil && (strings.HasSuffix(u.Path, "/scrs/v1/webhooks/github") || strings.HasSuffix(u.Path, "/scrs/v1/ingest/github"))
+	if err != nil {
+		return false
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	return strings.HasSuffix(p, WebhookPath("github", name)) || strings.HasSuffix(p, "/scrs/v1/webhooks/github") || strings.HasSuffix(p, "/scrs/v1/ingest/github")
 }
 
 type hookConfig struct {
@@ -179,7 +183,7 @@ func (a NativeAdapters) GitHubHooks(ctx context.Context, c Connection, secret js
 		if data, err = a.request(ctx, http.MethodGet, base+"/app", bearer, nil); err != nil || json.Unmarshal(data, &app) != nil {
 			return nil, errors.New("GitHub App events unavailable")
 		}
-		if !pointsAtSCRS(config.URL, hookURL) {
+		if !pointsAtSCRS(config.URL, hookURL, c.Name) {
 			return []GitHubHook{{Source: "app", Problems: []string{"GitHub App webhook URL does not point at SCRS"}}}, nil
 		}
 		hooks = append(hooks, GitHubHook{Source: "app", ID: 1, Problems: config.problems(app.Events, true)})
@@ -198,7 +202,7 @@ func (a NativeAdapters) GitHubHooks(ctx context.Context, c Connection, secret js
 			return nil, errors.New("organization webhooks response invalid")
 		}
 		for _, h := range listed {
-			if h.ID > 0 && pointsAtSCRS(h.Config.URL, hookURL) {
+			if h.ID > 0 && pointsAtSCRS(h.Config.URL, hookURL, c.Name) {
 				hooks = append(hooks, GitHubHook{Source: "org", ID: h.ID, Problems: h.Config.problems(h.Events, h.Active)})
 			}
 		}

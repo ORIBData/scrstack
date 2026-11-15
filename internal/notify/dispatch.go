@@ -172,8 +172,8 @@ func (d *Dispatcher) send(ctx context.Context, c claimed) (int, string) {
 	s := d.Store
 	var sub Subscription
 	var ciphertext []byte
-	var events []byte
-	err := s.pool.QueryRow(ctx, `SELECT `+subscriptionColumns+`,secret_ciphertext FROM `+s.schema+`.webhook_subscriptions WHERE id=$1`, c.subscription).Scan(&sub.ID, &sub.Name, &sub.URL, &events, &sub.Profile, &sub.EgressAck, &sub.IncludeContacts, &sub.Enabled, &sub.Revision, &sub.CreatedAt, &sub.UpdatedAt, &ciphertext)
+	var events, scope []byte
+	err := s.pool.QueryRow(ctx, `SELECT `+subscriptionColumns+`,secret_ciphertext FROM `+s.schema+`.webhook_subscriptions WHERE id=$1`, c.subscription).Scan(&sub.ID, &sub.Name, &sub.URL, &events, &sub.Profile, &sub.EgressAck, &sub.IncludeContacts, &sub.Enabled, &sub.Revision, &sub.CreatedAt, &sub.UpdatedAt, &scope, &ciphertext)
 	if err != nil {
 		return 0, "subscription unavailable"
 	}

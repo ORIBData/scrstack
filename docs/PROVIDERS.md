@@ -179,9 +179,10 @@ include a path prefix. Put a group or project access token with `read_api` and
 `read_repository` in `credential.token`.
 
 Assessments fetch `repository/archive.tar.gz` for the resolved commit from the
-same origin with redirects refused. Webhooks: point the group webhook at
-`/scrs/v1/ingest/gitlab` with the secret token `SCRS_GITLAB_WEBHOOK_SECRET`,
-or relay through n8n. When GitHub and GitLab both hold the same path, pass
+same origin with redirects refused. Webhooks: give the connection a webhook secret
+(`POST /scrs/v1/connections/{id}:webhook`) and point the group webhook at
+`/scrs/v1/ingest/gitlab/<connection>` with that secret as the Secret token, or
+relay through n8n. When GitHub and GitLab both hold the same path, pass
 `"provider": "gitlab"` in the assessment target.
 
 ```json
@@ -195,9 +196,10 @@ Set `config.url` (HTTPS), `config.project` and `config.username` (a robot
 account such as `robot$scrs`), and put the robot secret in
 `credential.token`. Give the robot `list repository` and `pull artifact`
 permissions only. Discovery uses Harbor's v2 API; image pulls use the same
-robot account. For push events, add a project webhook "Artifact pushed"
-pointing at `/scrs/v1/ingest/registry/harbor` with Auth Header
-`Bearer <ingest:relay token>`.
+robot account. For push events, give the connection a webhook secret
+(`POST /scrs/v1/connections/{id}:webhook`) and add a project webhook "Artifact
+pushed" pointing at `/scrs/v1/ingest/registry/harbor/<connection>` with Auth Header
+`Bearer <webhook secret>`. See [Inbound webhooks per connection](#inbound-webhooks-per-connection).
 
 ## Generic OCI registry
 
@@ -226,3 +228,70 @@ Registries must serve HTTPS.
   networks by design, for self-hosted installs. Only admins create connections.
 - Discovery alone does not scan. Assessments, webhooks, imports and mirrors use
   these connections; see `ASSESSMENT_PIPELINE.md`.
+
+## Inbound webhooks per connection
+
+Webhook authentication belongs to each connection, not to the deployment. Every
+GitHub, GitLab, Harbor, Docker Hub, GAR and OCI connection has its own receiver
+and secret. A connection added at runtime needs no environment change, and rotating
+one connection's secret leaves the others working.
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $ADMIN" \
+  https://scrs.example.com/scrs/v1/connections/<id>:webhook
+# {"receiver_url":".../scrs/v1/ingest/github/acme-github","webhook_secret":"<shown once>","setup":"...","connection":{...}}
+```
+
+- **Secret.**
+  - SCRS generates a 64-character secret by default, or stores yours (`{"secret":"..."}`, 32–256 characters).
+  - The secret is sealed with `SCRS_MASTER_KEY` apart from the provider credential, so rotating it never re-scopes assets or invalidates assessments.
+  - Calling the endpoint again rotates it. The old secret stops working at once.
+- **Scope.** A receiver only reaches its own connection's repositories or images. Events for anything else are acknowledged as `ignored_out_of_scope`.
+- **Unknown connections.** An unknown, disabled or unconfigured connection answers `401`, like a bad signature, so the receiver doesn't reveal which connections exist.
+
+| Provider | Receiver | Where the secret goes |
+| --- | --- | --- |
+| GitHub | `/scrs/v1/ingest/github/<connection>` | Org webhook or GitHub App: Secret (`X-Hub-Signature-256`), content type `application/json` |
+| GitLab | `/scrs/v1/ingest/gitlab/<connection>` | Group webhook: Secret token (`X-Gitlab-Token`) |
+| Harbor | `/scrs/v1/ingest/registry/harbor/<connection>` | Webhook policy Auth Header: `Bearer <secret>` |
+| OCI (Distribution, Zot, Nexus) | `/scrs/v1/ingest/registry/oci/<connection>` | Notification endpoint header `Authorization: Bearer <secret>` |
+| Docker Hub | `/scrs/v1/ingest/registry/dockerhub/<connection>?token=<secret>` | In the URL, since Docker Hub cannot send headers |
+| GAR (Pub/Sub push) | `/scrs/v1/ingest/registry/gar/<connection>?token=<secret>` | In the push endpoint URL |
+
+For senders that put the secret in the URL (Docker Hub, GAR), keep Traefik and
+other proxy access logs from recording query strings. SCRS's own access log
+records only the path.
+
+**GitHub delivery check.** The check finds the connection's hook by its receiver
+path. When GitHub calls a relay instead, set the relay's public URL on the
+connection: `POST /connections/{id}:webhook` with
+`{"hook_url":"https://relay.example.com/...","rotate_secret":false}`.
+
+**Relays.** n8n and similar relays post to the same per-connection receivers with a
+bearer token (scope `ingest:relay`). A forwarded provider signature is checked
+against the connection's secret.
+
+**Legacy.** The shared receivers `/ingest/github`, `/webhooks/github` and
+`/ingest/gitlab` still accept `SCRS_GITHUB_WEBHOOK_SECRET` and
+`SCRS_GITLAB_WEBHOOK_SECRET`. The shared registry receiver
+`/ingest/registry/<provider>` still accepts relay tokens. Move each org, group and
+registry to its connection's receiver, then clear the shared secrets.
+
+## Outbound subscriptions per connection
+
+Each webhook subscription already has its own signing secret (`X-SCRS-Signature`,
+`X-SCRS-Auth`). Set `connections` on a subscription (`POST /webhooks`, or `PATCH`
+with `If-Match`) to deliver only events about those connections:
+- their assessments and findings;
+- QA runs of their repositories;
+- integrity alerts on their assets;
+- their own `connection.degraded` events.
+
+Platform events without a connection, such as `feed.stale` and
+`maintenance.completed`, still arrive. An empty list receives every connection's
+events.
+
+```json
+{"name":"harbor-team","url":"https://n8n.example.com/webhook/harbor","events":["assessment.completed","finding.created"],
+ "connections":["<harbor connection id>"]}
+```

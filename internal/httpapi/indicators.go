@@ -257,6 +257,8 @@ func (h sourceHandler) item(ctx context.Context, w http.ResponseWriter, r *http.
 		writeJSON(w, 200, updated)
 	case action == "import-stix" && r.Method == http.MethodPost:
 		h.importSTIX(ctx, w, r, principal, id, same)
+	case action == "import-csv" && r.Method == http.MethodPost:
+		h.importCSV(ctx, w, r, principal, id, same)
 	case action == "hunt" && r.Method == http.MethodPost:
 		// Retro-hunt: rescan the default branch of every in-scope repository
 		// so the source's indicators are checked against current code.
@@ -357,3 +359,71 @@ func (h sourceHandler) acquire() bool {
 }
 
 func (h sourceHandler) release() { <-h.compiles }
+
+// importCSV loads indicators from CSV into a manual source (TIF-005). Query
+// parameters map columns (value_column, type_column, first_seen_column,
+// confidence_column, label_column, valid_until_column), set a default type,
+// valid_days (default 180) and delimiter (comma, tab or semicolon).
+// merge=true keeps the source's other indicators; otherwise the CSV
+// replaces them.
+func (h sourceHandler) importCSV(ctx context.Context, w http.ResponseWriter, r *http.Request, principal connections.Token, id uuid.UUID, allowed func(assessments.IndicatorSource) error) {
+	query := r.URL.Query()
+	o := intelligence.CSVOptions{Mapping: intelligence.CSVMapping{Value: query.Get("value_column"), Type: query.Get("type_column"), FirstSeen: query.Get("first_seen_column"), Confidence: query.Get("confidence_column"), Label: query.Get("label_column"), ValidUntil: query.Get("valid_until_column")}, DefaultType: query.Get("type"), ValidDays: 180}
+	if v := query.Get("valid_days"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 3650 {
+			writeError(w, 400, "valid_days is 1 to 3650")
+			return
+		}
+		o.ValidDays = n
+	}
+	switch query.Get("delimiter") {
+	case "", "comma":
+	case "tab":
+		o.Comma = '\t'
+	case "semicolon":
+		o.Comma = ';'
+	default:
+		writeError(w, 400, "delimiter is comma, tab or semicolon")
+		return
+	}
+	merge := query.Get("merge") == "true"
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, intelligence.MaxImportBytes))
+	if err != nil {
+		writeError(w, 413, "CSV is over 16 MiB")
+		return
+	}
+	bundle, report, err := intelligence.ParseCSV(body, o)
+	if err != nil {
+		writeError(w, 400, "invalid CSV: "+err.Error())
+		return
+	}
+	if merge {
+		existing, err := h.store.SourceIndicators(ctx, id)
+		if err != nil {
+			sourceError(w, err)
+			return
+		}
+		replaced := map[string]bool{}
+		for _, i := range bundle.Indicators {
+			replaced[i.ID] = true
+		}
+		for _, i := range existing.Indicators {
+			if !replaced[i.ID] {
+				i.Source, i.Mode, i.Severity = "", "", ""
+				bundle.Indicators = append(bundle.Indicators, i)
+			}
+		}
+		if len(bundle.Indicators) > intelligence.MaxImportIndicators {
+			writeError(w, 422, "the merged source would hold more than 50000 indicators")
+			return
+		}
+	}
+	updated, err := h.store.ImportSourceIndicators(ctx, id, bundle, principal.ID, allowed)
+	if err != nil {
+		sourceError(w, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf(`"%d"`, updated.Revision))
+	writeJSON(w, 200, map[string]any{"source": updated, "report": report, "merged": merge})
+}

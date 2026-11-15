@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/buildinfo"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/sbom"
 	"github.com/google/uuid"
 )
 
@@ -402,27 +404,7 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+a.Commit+`.tar.gz"`)
 		_, _ = w.Write(data)
 	case "sbom":
-		if a.SBOMKey == "" {
-			writeError(w, 409, "SBOM not available")
-			return
-		}
-		if format := r.URL.Query().Get("format"); format != "" && format != "cyclonedx-json" {
-			writeError(w, 400, "supported format: cyclonedx-json")
-			return
-		}
-		if h.artifacts == nil {
-			writeError(w, 503, "artifact storage unavailable")
-			return
-		}
-		data, err := h.artifacts.GetSBOM(ctx, a.SBOMKey)
-		if err != nil {
-			writeError(w, 502, "SBOM retrieval failed")
-			return
-		}
-		w.Header().Set("Content-Type", "application/vnd.cyclonedx+json")
-		w.Header().Set("ETag", `"`+a.SBOMSHA256+`"`)
-		w.WriteHeader(200)
-		_, _ = w.Write(data)
+		h.sbom(ctx, w, r, a)
 	case "report":
 		if r.URL.Query().Get("format") == "md" {
 			w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
@@ -628,4 +610,113 @@ func (s *statusRecorder) message() string {
 	}
 	_ = json.Unmarshal(s.body, &v)
 	return v.Error
+}
+
+// sbom serves one assessment's SBOM in the requested format (SBM-011):
+// the stored CycloneDX JSON document, its XML form, or SPDX 2.3 JSON
+// generated from the same component model (SBM-010).
+func (h assessmentHandler) sbom(ctx context.Context, w http.ResponseWriter, r *http.Request, a assessments.Assessment) {
+	format := r.URL.Query().Get("format")
+	if format == "" {
+		format = "cyclonedx-json"
+	}
+	if format != "cyclonedx-json" && format != "cyclonedx-xml" && format != "spdx-json" {
+		writeError(w, 400, "format must be cyclonedx-json, cyclonedx-xml or spdx-json")
+		return
+	}
+	w.Header().Set("X-SCRS-Version", buildinfo.Version())
+	if format == "spdx-json" {
+		if a.Status != "succeeded" {
+			writeError(w, 409, "SBOM not available")
+			return
+		}
+		components, err := h.store.AllComponents(ctx, a.ID)
+		if err != nil {
+			assessmentError(w, err)
+			return
+		}
+		if len(components) == 0 {
+			writeError(w, 409, "SBOM not available")
+			return
+		}
+		generated := time.Now().UTC()
+		doc, err := sbom.SPDX(sbomMeta(a, generated), components)
+		if err != nil {
+			writeError(w, 500, "SPDX generation failed")
+			return
+		}
+		w.Header().Set("Content-Type", sbom.ContentType(format))
+		w.Header().Set("X-SCRS-Generated-At", generated.Format(time.RFC3339))
+		w.Header().Set("Content-Disposition", `attachment; filename="`+sbomFilename(a, "spdx.json")+`"`)
+		_, _ = w.Write(doc)
+		return
+	}
+	if a.SBOMKey == "" {
+		writeError(w, 409, "SBOM not available")
+		return
+	}
+	if h.artifacts == nil {
+		writeError(w, 503, "artifact storage unavailable")
+		return
+	}
+	data, err := h.artifacts.GetSBOM(ctx, a.SBOMKey)
+	if err != nil {
+		writeError(w, 502, "SBOM retrieval failed")
+		return
+	}
+	if a.CompletedAt != nil {
+		w.Header().Set("X-SCRS-Generated-At", a.CompletedAt.UTC().Format(time.RFC3339))
+	}
+	name := sbomFilename(a, "cdx.json")
+	if format == "cyclonedx-xml" {
+		if data, err = sbom.ToXML(data); err != nil {
+			writeError(w, 502, err.Error())
+			return
+		}
+		name = sbomFilename(a, "cdx.xml")
+	} else {
+		w.Header().Set("ETag", `"`+a.SBOMSHA256+`"`)
+	}
+	w.Header().Set("Content-Type", sbom.ContentType(format))
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.WriteHeader(200)
+	_, _ = w.Write(data)
+}
+
+func sbomMeta(a assessments.Assessment, generated time.Time) sbom.Meta {
+	kind := "git"
+	if a.Request.Target.Type == "image" {
+		kind = "image"
+	}
+	return sbom.Meta{AssessmentID: a.ID, Asset: a.Request.Target.Repository, Kind: kind, Revision: a.Commit, Ref: a.Request.Target.Ref, Version: buildinfo.Version(), Generated: generated}
+}
+
+var filenameUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+func sbomFilename(a assessments.Assessment, extension string) string {
+	revision := a.Commit
+	if len(revision) > 19 {
+		revision = strings.TrimPrefix(revision, "sha256:")[:12]
+	}
+	return filenameUnsafe.ReplaceAllString(a.Request.Target.Repository+"-"+revision, "_") + "." + extension
+}
+
+// sbomDownload serves GET /sboms/{id}/download, where id is an SBOM's
+// SHA-256 or the assessment id.
+func (h assessmentHandler) sbomDownload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	id := r.PathValue("id")
+	var a assessments.Assessment
+	var err error
+	if parsed, parseErr := uuid.Parse(id); parseErr == nil {
+		a, err = h.store.Get(ctx, parsed)
+	} else {
+		a, err = h.store.AssessmentBySBOM(ctx, strings.ToLower(id))
+	}
+	if err != nil {
+		assessmentError(w, err)
+		return
+	}
+	h.sbom(ctx, w, r, a)
 }

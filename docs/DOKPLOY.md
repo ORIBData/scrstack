@@ -1,6 +1,7 @@
 # Dokploy deployment contract
 
-Use `deploy/compose.dokploy.yaml` with a concrete published `SCRS_IMAGE`. Run
+Use `deploy/compose.dokploy.yaml` with concrete published `SCRS_IMAGE` and
+`SCRS_QA_RUNNER_IMAGE` references (see [RELEASING.md](RELEASING.md)). Run
 `make image-reference` before building/releasing, then copy the resolved value
 into Dokploy. The date/hash placeholders are a Make template, not Compose syntax.
 
@@ -145,7 +146,7 @@ outages never block scanning; the previous copy is carried forward.
 
 | Variable | Service | Purpose |
 | --- | --- | --- |
-| `SCRS_RELAY_ENABLED` | API | Accept n8n relay deliveries on `/scrs/v1/ingest/github` |
+| `SCRS_RELAY_ENABLED` | API | Accept n8n relay deliveries (bearer `ingest:relay` token) on the GitHub, GitLab and shared registry receivers. Per-connection registry receivers do not need it |
 | `SCRS_PUBLIC_BASE_URL` | API, worker | Absolute links in webhook payloads; deployment acceptance |
 | `SCRS_WEBHOOK_PRIVATE_HOSTS` | API, worker | Hostnames allowed as http or private-address webhook targets |
 | `SCRS_TAXII_PRIVATE_HOSTS` | API, worker | TAXII server hostnames allowed to resolve to private addresses, such as an OpenCTI on the same network |
@@ -199,11 +200,11 @@ for n8n Header Auth.
 
 | Variable | Service | Purpose |
 | --- | --- | --- |
-| `SCRS_GITLAB_WEBHOOK_SECRET` | API | GitLab webhook secret token (32+ characters); also verifies relayed GitLab events |
+| `SCRS_GITLAB_WEBHOOK_SECRET` | API | Legacy: shared GitLab secret for the shared `/ingest/gitlab` receiver. Connections now have their own secrets (`POST /connections/{id}:webhook`) |
 | `SCRS_YARA_BINARY` | API, scanner | YARA-X CLI used to validate and run YARA rulesets (default `/usr/local/bin/yr`, shipped in the image) |
 | `SCRS_GITHUB_HOOK_CHECK_MINUTES` | worker | GitHub webhook delivery check interval (default 5; 0 disables). GitHub never retries a failed delivery, so the worker reads SCRS's webhook delivery log, requests redelivery of missed events and reports hook misconfiguration at `GET /system/github-webhooks` |
 | `SCRS_TAXII_POLL_SECONDS` | worker | How often the worker checks for due TAXII feeds (default 60; 0 disables polling). Each feed has its own `interval_minutes` |
-| `SCRS_GITHUB_HOOK_URL` | worker | Public URL of the GitHub webhook when it is not an SCRS path (for example an n8n relay); by default any hook ending in `/scrs/v1/webhooks/github` or `/scrs/v1/ingest/github` is checked |
+| `SCRS_GITHUB_HOOK_URL` | worker | Legacy default hook URL for the delivery check; set `hook_url` per connection instead. By default the check matches the connection's receiver `/scrs/v1/ingest/github/<connection>` or the shared paths is checked |
 | `SCRS_MIRRORS_ENABLED` | worker | Run the mirror queue (default `true`) |
 | `SCRS_MIRROR_INTERVAL_HOURS` | worker | Mirror assets labelled `mirror=true` on this interval; 0 = on demand only |
 | `SCRS_MIRROR_MAX_BYTES` | worker | Largest bundle (default 2 GiB) |
@@ -294,3 +295,41 @@ providers you add, such as `api.openai.com`, `api.anthropic.com` and
 `generativelanguage.googleapis.com`. The API calls a provider too when an admin runs
 `POST /llm/providers/{id}:test`. Report archives are stored in the existing bucket
 under `qa/`. See [QA_TESTING.md](QA_TESTING.md).
+
+## Advisory sources, retention and maintenance additions
+
+Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
+`vendor_statements`, `scheduler_runs` and `retention_classes`, plus
+`assets.legal_hold`, are created by `scrs-storage-init`. All changes are additive.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_ADVISORY_SYNC_SECONDS` | worker | How often due NVD and CVE Program syncs are checked (default 60; 0 disables) |
+| `SCRS_NVD_API_KEY` | worker | Optional NVD API key: one request per 0.7 s instead of 6 s |
+| `SCRS_NVD_API_URL`, `SCRS_CVE_API_URL` | worker | Override the NVD and CVE Services URLs (mirrors, tests) |
+| `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS` | API, worker | Retention default for a class the policy leaves not set (0 or empty keeps forever; `AUDIT_LOG` at least 365) |
+| `SCRS_RELEASE_FEED_URL` | API | Optional https JSON release feed for `GET /maintenance/versions` |
+| `SCRS_VERSION` | API | Optional version label for `GET /maintenance/versions` |
+
+**Outbound access** from `scrs-worker` also includes
+`services.nvd.nist.gov` and `cveawg.mitre.org`.
+
+## Licences, SBOM exports and compliance reports (M8)
+
+Tables `policies`, `license_category_versions`, `package_metadata`,
+`package_versions`, `reports` and `framework_packs`, plus `assets.distribution`
+(default `saas`), are created by `scrs-storage-init`. All changes are additive.
+`scrs-feed-sync` now also writes a package index (`index.json`) next to each
+ecosystem archive; scans of snapshots synced before it fall back to matched
+advisories for safe versions.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_DEPSDEV_ENABLED` | worker | Licence metadata and version lists from deps.dev (default true; false evaluates packages without a declared or detected licence as "no licence found") |
+| `SCRS_DEPSDEV_URL`, `SCRS_DEPSDEV_PRIVATE_HOSTS` | worker | A deps.dev API mirror and its hostnames allowed to resolve to private addresses |
+| `SCRS_DEPSDEV_MAX_LOOKUPS` | worker | Licence lookups per assessment (default 2000); the rest are left unresolved and retried next time |
+| `SCRS_REPORT_POLL_SECONDS` | worker | How often queued compliance reports are built (default 30; 0 disables) |
+| `SCRS_RETENTION_DEFAULT_REPORTS_DAYS` | API, worker | Retention default for compliance report files |
+
+**Outbound access** from `scrs-worker` also includes `api.deps.dev`. Report files are
+stored in the existing bucket under `reports/`. See [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md).

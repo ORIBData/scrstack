@@ -1,8 +1,11 @@
 package assessments
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
+
+	"github.com/ORIBData/scrstack/internal/license"
 )
 
 func TestVerdictGate(t *testing.T) {
@@ -37,6 +40,11 @@ func TestVerdictGate(t *testing.T) {
 		{"ioc hunt never gates", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_hunt", Severity: "critical", Change: "new"}}}, nil, "pass"},
 		{"new critical ioc alert fails", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "critical", Change: "new"}}}, nil, "fail"},
 		{"existing ioc alert high does not gate", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "high", Change: "existing"}}}, nil, "pass"},
+		{"report-only licence deny warns", Result{Complete: true, Findings: []Finding{licenseEntry("l", "deny", false)}}, nil, "warn"},
+		{"report-only licence review does not gate", Result{Complete: true, Findings: []Finding{licenseEntry("l", "review", false)}}, nil, "pass"},
+		{"enforcing licence deny fails, existing too", Result{Complete: true, Findings: []Finding{withChange(licenseEntry("l", "deny", true), "existing")}}, nil, "fail"},
+		{"enforcing licence review warns", Result{Complete: true, Findings: []Finding{licenseEntry("l", "review", true)}}, nil, "warn"},
+		{"waived enforcing licence deny passes", Result{Complete: true, Findings: []Finding{licenseEntry("l", "deny", true)}}, map[string]bool{"l": true}, "pass"},
 	} {
 		if got, _ := verdict(tc.result, tc.waived); got != tc.expected {
 			t.Errorf("%s: got %s, want %s", tc.name, got, tc.expected)
@@ -64,4 +72,9 @@ func TestClosableTypesRequireProducingStages(t *testing.T) {
 	if got := closableTypes(stages[2:]); len(got) != 0 {
 		t.Fatal("closure allowed without resolve and fetch")
 	}
+}
+
+func licenseEntry(fingerprint, effect string, enforcing bool) Finding {
+	evidence, _ := json.Marshal(licenseEvidence{Enforcing: enforcing, Decision: license.Decision{Effect: effect}})
+	return Finding{Fingerprint: fingerprint, Type: "license", Severity: "high", Change: "new", Evidence: evidence}
 }

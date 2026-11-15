@@ -1,6 +1,7 @@
 package intelligence
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -101,4 +102,74 @@ func TestScanBundleSources(t *testing.T) {
 	if _, err := Parse([]byte(merged)); err == nil {
 		t.Fatal("uploads cannot set source fields")
 	}
+}
+
+func TestIPv6Indicators(t *testing.T) {
+	b, err := Parse([]byte(`{"version":"v","indicators":[
+{"id":"a","type":"ipv6","value":"2001:DB8:0:0:0:0:0:1","valid_until":"2099-01-01T00:00:00Z"},
+{"id":"b","type":"ipv6","value":"[2001:db8::dead[:]beef]","valid_until":"2099-01-01T00:00:00Z"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.Indicators[0].Value != "2001:db8::1" || b.Indicators[1].Value != "2001:db8::dead:beef" {
+		t.Fatal("IPv6 not canonical", b.Indicators)
+	}
+	for _, bad := range []string{"1.2.3.4", "::ffff:1.2.3.4", "fe80::1%eth0", "gggg::1"} {
+		if _, err := Parse([]byte(`{"version":"v","indicators":[{"id":"x","type":"ipv6","value":"` + bad + `","valid_until":"2099-01-01T00:00:00Z"}]}`)); err == nil {
+			t.Error("invalid ipv6 accepted", bad)
+		}
+	}
+}
+
+func TestParseCSV(t *testing.T) {
+	csvText := "\xef\xbb\xbfIndicator,Kind,Seen,Score,Campaign\n" +
+		"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,,2026-11-01,90,Wfx Loot\n" +
+		"evil[.]example,domain,,,\n" +
+		"2001:db8::1,ip,,,\n" +
+		"198.51.100.7,ip-dst,2026-01-01T00:00:00Z,,\n" +
+		"hxxps://drop[.]example/x.sh,uri,,,\n" +
+		"not a value,md5,,,\n" +
+		"x,commit_message_regex,,,\n" +
+		"evil.example,domain,,150,\n" +
+		",domain,,,\n"
+	now := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+	b, report, err := ParseCSV([]byte(csvText), CSVOptions{Mapping: CSVMapping{Value: "indicator", Type: "kind", FirstSeen: "seen", Confidence: "score", Label: "campaign"}, ValidDays: 30, Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Rows != 9 || report.Accepted != 5 || report.Skipped != 4 || len(report.Problems) != 4 {
+		t.Fatalf("report %+v", report)
+	}
+	got := map[string]Indicator{}
+	for _, i := range b.Indicators {
+		got[i.Type] = i
+	}
+	sha := got["sha256"]
+	if sha.Confidence == nil || *sha.Confidence != 90 || !strings.HasPrefix(sha.ID, "wfx-loot-") || !sha.ValidUntil.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("sha256 row %+v", sha)
+	}
+	if got["domain"].Value != "evil.example" || got["ipv6"].Value != "2001:db8::1" || got["ipv4"].Value != "198.51.100.7" || got["url"].Value != "https://drop.example/x.sh" {
+		t.Fatalf("rows %+v", got)
+	}
+	if _, err := Parse(mustJSON(t, b)); err != nil {
+		t.Fatal("CSV bundle is not a valid import bundle", err)
+	}
+	if _, _, err := ParseCSV([]byte("a,b\n1,2\n"), CSVOptions{}); err == nil {
+		t.Fatal("missing value column accepted")
+	}
+	if _, report, err := ParseCSV([]byte("value\n1.2.3.4\n"), CSVOptions{DefaultType: "sha256"}); err != nil || report.Skipped != 1 {
+		t.Fatal("default type not applied", report, err)
+	}
+	if DetectType("d41d8cd98f00b204e9800998ecf8427e") != "md5" || DetectType("pkg:npm/x@1") != "purl" || DetectType("a.example") != "domain" {
+		t.Fatal("DetectType")
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
 }

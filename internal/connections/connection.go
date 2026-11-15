@@ -29,6 +29,8 @@ type Connection struct {
 	UpdatedAt             time.Time       `json:"-"`
 	Revision              int64           `json:"-"`
 	Enabled               bool            `json:"enabled"`
+	// Webhook is the inbound webhook state of providers that send them.
+	Webhook *Webhook `json:"webhook,omitempty"`
 }
 
 type Scope struct {
@@ -209,13 +211,17 @@ func (s *Store) NameByID(ctx context.Context, id uuid.UUID) (string, error) {
 func (s *Store) PublicByID(ctx context.Context, id uuid.UUID) (Connection, error) {
 	var c Connection
 	var rawScope []byte
-	if err := s.pool.QueryRow(ctx, `SELECT id,provider,name,config,scope,status,enabled FROM `+s.schema+`.connections WHERE id=$1`, id).
-		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled); err != nil {
+	var configured bool
+	var hookURL string
+	var rotated *time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT id,provider,name,config,scope,status,enabled,webhook_secret_ciphertext IS NOT NULL,webhook_url,webhook_rotated_at FROM `+s.schema+`.connections WHERE id=$1`, id).
+		Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled, &configured, &hookURL, &rotated); err != nil {
 		return c, errors.New("connection not found")
 	}
 	if err := json.Unmarshal(rawScope, &c.Scope); err != nil {
 		return c, errors.New("connection scope invalid")
 	}
+	c.Webhook = webhookView(c.Provider, c.Name, configured, hookURL, rotated)
 	return c, nil
 }
 
@@ -244,7 +250,7 @@ func (s *Store) ListPage(ctx context.Context, after string, limit int) ([]Connec
 	return s.listConnections(ctx, after, limit)
 }
 func (s *Store) listConnections(ctx context.Context, after string, limit int) ([]Connection, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status, enabled FROM `+s.schema+`.connections WHERE name>$1 ORDER BY name LIMIT $2`, after, limit)
+	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status, enabled, webhook_secret_ciphertext IS NOT NULL, webhook_url, webhook_rotated_at FROM `+s.schema+`.connections WHERE name>$1 ORDER BY name LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, errors.New("connection list failed")
 	}
@@ -253,12 +259,16 @@ func (s *Store) listConnections(ctx context.Context, after string, limit int) ([
 	for rows.Next() {
 		var c Connection
 		var rawScope []byte
-		if err := rows.Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled); err != nil {
+		var configured bool
+		var hookURL string
+		var rotated *time.Time
+		if err := rows.Scan(&c.ID, &c.Provider, &c.Name, &c.Config, &rawScope, &c.Status, &c.Enabled, &configured, &hookURL, &rotated); err != nil {
 			return nil, errors.New("connection list scan failed")
 		}
 		if err := json.Unmarshal(rawScope, &c.Scope); err != nil {
 			return nil, errors.New("connection scope invalid in database")
 		}
+		c.Webhook = webhookView(c.Provider, c.Name, configured, hookURL, rotated)
 		result = append(result, c)
 	}
 	if len(result) > 10000 {
@@ -305,14 +315,19 @@ type Asset struct {
 	Criticality  int             `json:"criticality"`
 	Exposure     string          `json:"exposure"`
 	Labels       json.RawMessage `json:"labels"`
-	Revision     int64           `json:"revision"`
+	// LegalHold excludes the asset from every retention class (RET-006).
+	LegalHold bool `json:"legal_hold"`
+	// Distribution is how the asset reaches users (LIC-005): internal,
+	// saas or distributed. It selects the licence policy column.
+	Distribution string `json:"distribution"`
+	Revision     int64  `json:"revision"`
 }
 
-const assetColumns = `id,type,locator,connection_id,flags,owner_id,environment,criticality,exposure,labels,revision`
+const assetColumns = `id,type,locator,connection_id,flags,owner_id,environment,criticality,exposure,labels,legal_hold,distribution,revision`
 
 func scanAsset(row pgx.Row) (Asset, error) {
 	var a Asset
-	err := row.Scan(&a.ID, &a.Type, &a.Locator, &a.ConnectionID, &a.Flags, &a.OwnerID, &a.Environment, &a.Criticality, &a.Exposure, &a.Labels, &a.Revision)
+	err := row.Scan(&a.ID, &a.Type, &a.Locator, &a.ConnectionID, &a.Flags, &a.OwnerID, &a.Environment, &a.Criticality, &a.Exposure, &a.Labels, &a.LegalHold, &a.Distribution, &a.Revision)
 	return a, err
 }
 
@@ -378,7 +393,7 @@ func (s *Store) recordCheck(ctx context.Context, c Connection, action string, st
 		State string `json:"state"`
 	}
 	if json.Unmarshal(status, &state) == nil && state.State == "failed" {
-		if _, err := notify.Emit(ctx, tx, s.schema, "connection.degraded", map[string]any{"connection_id": c.ID, "name": c.Name, "provider": c.Provider, "check": action, "link": notify.Link("/connections/" + c.ID.String())}, nil); err != nil {
+		if _, err := notify.EmitScoped(ctx, tx, s.schema, "connection.degraded", map[string]any{"connection_id": c.ID, "name": c.Name, "provider": c.Provider, "check": action, "link": notify.Link("/connections/" + c.ID.String())}, nil, notify.Scope{Connection: c.ID}); err != nil {
 			return errors.New("connection event failed")
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -71,13 +72,14 @@ func parseTrivy(report []byte) (ImportSource, []Component, []Finding, error) {
 				} `json:"Identifier"`
 			} `json:"Packages"`
 			Vulnerabilities []struct {
-				ID         string `json:"VulnerabilityID"`
-				PkgName    string `json:"PkgName"`
-				Installed  string `json:"InstalledVersion"`
-				Fixed      string `json:"FixedVersion"`
-				Severity   string `json:"Severity"`
-				Title      string `json:"Title"`
-				PrimaryURL string `json:"PrimaryURL"`
+				ID         string   `json:"VulnerabilityID"`
+				PkgName    string   `json:"PkgName"`
+				Installed  string   `json:"InstalledVersion"`
+				Fixed      string   `json:"FixedVersion"`
+				Severity   string   `json:"Severity"`
+				Title      string   `json:"Title"`
+				PrimaryURL string   `json:"PrimaryURL"`
+				CweIDs     []string `json:"CweIDs"`
 				Identifier struct {
 					PURL string `json:"PURL"`
 				} `json:"PkgIdentifier"`
@@ -123,7 +125,7 @@ func parseTrivy(report []byte) (ImportSource, []Component, []Finding, error) {
 			c := Component{Name: clip(v.PkgName, 256), Version: clip(v.Installed, 128), Ecosystem: res.Type, PURL: clip(v.Identifier.PURL, 512), Path: target}
 			addComponent(c)
 			severity := normalizeSeverity(v.Severity)
-			evidence, _ := json.Marshal(map[string]any{"source": "trivy", "installed_version": v.Installed, "fixed_version": v.Fixed, "target": target})
+			evidence, _ := json.Marshal(map[string]any{"source": "trivy", "installed_version": v.Installed, "fixed_version": v.Fixed, "target": target, "cwe": CWEs(v.CweIDs...)})
 			fixed := []string{}
 			if v.Fixed != "" {
 				fixed = strings.Split(v.Fixed, ", ")
@@ -171,7 +173,9 @@ func parseSARIF(report []byte) (ImportSource, []Component, []Finding, error) {
 		ID               string  `json:"id"`
 		ShortDescription message `json:"shortDescription"`
 		Properties       struct {
-			SecuritySeverity string `json:"security-severity"`
+			SecuritySeverity string   `json:"security-severity"`
+			Tags             []string `json:"tags"`
+			CWE              any      `json:"cwe"`
 		} `json:"properties"`
 		DefaultConfiguration struct {
 			Level string `json:"level"`
@@ -223,7 +227,20 @@ func parseSARIF(report []byte) (ImportSource, []Component, []Finding, error) {
 				path, line = res.Locations[0].Physical.Artifact.URI, res.Locations[0].Physical.Region.StartLine
 			}
 			path = clip(strings.TrimPrefix(path, "file://"), 512)
-			evidence, _ := json.Marshal(map[string]any{"source": "sarif", "tool": run.Tool.Driver.Name, "path": path, "line": line, "message": clip(res.Message.Text, 512)})
+			// CodeQL tags rules "external/cwe/cwe-079"; Semgrep and others put
+			// "CWE-79: ..." in tags or a cwe property (CMP-003).
+			cweText := append([]string{}, ru.Properties.Tags...)
+			switch v := ru.Properties.CWE.(type) {
+			case string:
+				cweText = append(cweText, v)
+			case []any:
+				for _, x := range v {
+					if s, ok := x.(string); ok {
+						cweText = append(cweText, s)
+					}
+				}
+			}
+			evidence, _ := json.Marshal(map[string]any{"source": "sarif", "tool": run.Tool.Driver.Name, "path": path, "line": line, "message": clip(res.Message.Text, 512), "cwe": CWEs(cweText...)})
 			guidance, _ := json.Marshal(map[string]any{"summary": "Review the flagged code against the rule documentation and fix or suppress with justification.", "reference": ru.HelpURI, "automatic_changes": false})
 			title := firstOf(ru.ShortDescription.Text, res.Message.Text, res.RuleID)
 			findings = append(findings, Finding{Type: "code", AdvisoryID: clip(firstOf(res.RuleID, "unnamed-rule"), 128), Title: clip(title, 512), Severity: severity, Score: severityScore[severity], Component: Component{Path: path + ":" + strconv.Itoa(line)}, Evidence: evidence, Guidance: guidance})
@@ -295,4 +312,23 @@ func (s *Store) Import(ctx context.Context, request Request, actor uuid.UUID, na
 	}
 	a, err = s.Get(ctx, a.ID)
 	return a, false, err
+}
+
+var cwePattern = regexp.MustCompile(`(?i)\bcwe[-_/:]?0*([1-9][0-9]{0,4})\b`)
+
+// CWEs extracts distinct CWE ids ("CWE-79") from tags and labels such as
+// "external/cwe/cwe-079" or "CWE-79: Improper Neutralization".
+func CWEs(texts ...string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, t := range texts {
+		for _, m := range cwePattern.FindAllStringSubmatch(t, -1) {
+			id := "CWE-" + m[1]
+			if !seen[id] && len(out) < 20 {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	return out
 }

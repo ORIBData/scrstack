@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 )
 
@@ -162,6 +163,10 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if (action == "" && (r.Method == http.MethodPatch || r.Method == http.MethodDelete)) || (action == "rotate-credential" && r.Method == http.MethodPost) {
 		h.change(ctx, w, r, id, action)
+		return
+	}
+	if action == "webhook" && r.Method == http.MethodPost {
+		h.webhook(ctx, w, r, id)
 		return
 	}
 	if r.Method != http.MethodPost || (action != "test" && action != "discover") {
@@ -320,4 +325,78 @@ func (h connectionHandler) change(ctx context.Context, w http.ResponseWriter, r 
 		return
 	}
 	writeJSON(w, 200, c)
+}
+
+// webhookStore manages per-connection inbound webhooks.
+type webhookStore interface {
+	SetWebhook(context.Context, uuid.UUID, *string, *string) (connections.Connection, error)
+	WebhookSecret(context.Context, string, string) (connections.Connection, string, error)
+}
+
+// webhookSetup tells the operator where each provider puts the secret.
+var webhookSetup = map[string]string{
+	"github":    "Set Payload URL to receiver_url, Content type application/json and Secret to webhook_secret on the organization webhook or GitHub App.",
+	"gitlab":    "Set URL to receiver_url and Secret token to webhook_secret on the group webhook.",
+	"harbor":    "Set Endpoint URL to receiver_url and Auth Header to \"Bearer <webhook_secret>\" on the project webhook policy.",
+	"oci":       "Add the header Authorization: Bearer <webhook_secret> to the registry notification endpoint pointing at receiver_url.",
+	"dockerhub": "Docker Hub cannot send headers: use receiver_url with ?token=<webhook_secret> appended as the webhook URL.",
+	"gar":       "Pub/Sub push cannot send headers: use receiver_url with ?token=<webhook_secret> appended as the push endpoint.",
+}
+
+// webhook rotates a connection's inbound webhook secret, or sets the
+// GitHub hook URL. A new secret is returned once.
+func (h connectionHandler) webhook(ctx context.Context, w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	hooks, ok := h.store.(webhookStore)
+	if !ok {
+		writeError(w, 501, "connection webhooks unavailable")
+		return
+	}
+	var input struct {
+		Rotate  *bool   `json:"rotate_secret"`
+		Secret  *string `json:"secret"`
+		HookURL *string `json:"hook_url"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&input); (err != nil && err != io.EOF) || decoder.Decode(new(any)) != io.EOF {
+		writeError(w, 400, "invalid webhook request")
+		return
+	}
+	current, err := h.store.PublicByID(ctx, id)
+	if err != nil {
+		writeError(w, 404, "connection not found")
+		return
+	}
+	// Rotation is the default unless only the hook URL changes on a
+	// connection that already has a secret.
+	rotate := input.Secret != nil || input.Rotate == nil && (input.HookURL == nil || current.Webhook == nil || !current.Webhook.Configured)
+	if input.Rotate != nil {
+		rotate = *input.Rotate || input.Secret != nil
+	}
+	var secret *string
+	if rotate {
+		value := ""
+		if input.Secret != nil {
+			value = *input.Secret
+		} else if value, err = connections.NewWebhookSecret(); err != nil {
+			writeError(w, 500, "secret generation failed")
+			return
+		}
+		secret = &value
+	}
+	c, err := hooks.SetWebhook(ctx, id, secret, input.HookURL)
+	if err != nil {
+		if errors.Is(err, connections.ErrWebhookInput) {
+			lines := strings.Split(err.Error(), "\n")
+			writeError(w, 400, lines[len(lines)-1])
+			return
+		}
+		writeError(w, 500, "webhook update failed")
+		return
+	}
+	out := map[string]any{"connection": c, "receiver_url": notify.Link(strings.TrimPrefix(c.Webhook.Path, BasePath)), "setup": webhookSetup[c.Provider]}
+	if secret != nil {
+		out["webhook_secret"] = *secret
+	}
+	writeJSON(w, 200, out)
 }

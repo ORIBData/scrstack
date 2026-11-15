@@ -44,6 +44,8 @@ func TestSTIXPatterns(t *testing.T) {
 		{`[file:name = 'a.exe' AND file:size = 10]`, nil, false, SkipConditions},
 		{`[file:hashes.'SHA-512' = 'abc']`, nil, false, SkipHash},
 		{`[ipv4-addr:value = '198.51.100.0/24']`, nil, false, SkipValue},
+		{`[ipv6-addr:value = '2001:DB8::7/128']`, []string{"ipv6=2001:db8::7"}, false, ""},
+		{`[ipv6-addr:value = '2001:db8::/32']`, nil, false, SkipValue},
 		{`[file:extensions.'windows-pebinary-ext'.sections[*].entropy > 7.5]`, nil, false, SkipObject},
 		{`[file:hashes.MD5 = 'd41d8cd98f00b204e9800998ecf8427e'`, nil, false, SkipInvalid},
 		{`[domain-name:value = 'unterminated]`, nil, false, SkipInvalid},

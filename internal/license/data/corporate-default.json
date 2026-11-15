@@ -1,0 +1,19 @@
+{
+  "name": "corporate-default",
+  "description": "SCRS default licence policy by distribution model. A policy aid, not legal advice: counsel reviews it before it is made enforcing (PRD Q24).",
+  "enforcing": false,
+  "default": "review",
+  "severity": {"deny": "high", "review": "medium"},
+  "matrix": {
+    "permissive": {"internal": "allow", "saas": "allow", "distributed": "allow"},
+    "public_domain": {"internal": "allow", "saas": "allow", "distributed": "allow"},
+    "weak_copyleft": {"internal": "allow", "saas": "allow", "distributed": "review"},
+    "strong_copyleft": {"internal": "allow", "saas": "allow", "distributed": "review"},
+    "network_copyleft": {"internal": "review", "saas": "deny", "distributed": "review"},
+    "source_available_restricted": {"internal": "review", "saas": "deny", "distributed": "review"},
+    "non_commercial": {"internal": "deny", "saas": "deny", "distributed": "deny"},
+    "proprietary": {"internal": "review", "saas": "review", "distributed": "review"},
+    "unknown": {"internal": "review", "saas": "review", "distributed": "review"}
+  },
+  "rules": []
+}

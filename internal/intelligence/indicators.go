@@ -135,6 +135,13 @@ func normalize(kind, value string) (string, error) {
 			return "", errors.New("invalid ipv4")
 		}
 		return addr.String(), nil
+	case "ipv6":
+		// Compared in canonical RFC 5952 form; reports defang with [:] too.
+		addr, err := netip.ParseAddr(strings.Trim(strings.ReplaceAll(value, "[:]", ":"), "[]"))
+		if err != nil || !addr.Is6() || addr.Is4In6() || addr.Zone() != "" {
+			return "", errors.New("invalid ipv6")
+		}
+		return addr.String(), nil
 	case "url":
 		normalized, ok := NormalizeURL(value)
 		if !ok {

@@ -115,19 +115,24 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 			mux.Handle(BasePath+path, security.protect("admin", retentionHandler(security.Assessments)))
 		}
 		ingest := newGitHubIngest(security.Assessments, security.GitHubWebhookSecret, security.RemediationEnabled, security.RelayEnabled)
+		hooks, _ := store.(webhookStore)
+		ingest.hooks = hooks
 		mux.Handle("POST "+BasePath+"/webhooks/github", ingest.direct("github"))
 		// ING-001/TRG-002: one provider endpoint, two entry modes. A bearer
 		// token selects relay mode (which also verifies a forwarded provider
 		// signature); otherwise the provider's own authentication applies.
+		// /ingest/<provider>/<connection> uses that connection's secret.
 		for _, provider := range []string{"github", "gitlab"} {
 			direct, relay := ingest.direct(provider), security.protect("ingest:relay", ingest.relay(provider))
-			mux.Handle("POST "+BasePath+"/ingest/"+provider, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			both := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "" {
 					relay.ServeHTTP(w, r)
 					return
 				}
 				direct.ServeHTTP(w, r)
-			}))
+			})
+			mux.Handle("POST "+BasePath+"/ingest/"+provider, both)
+			mux.Handle("POST "+BasePath+"/ingest/"+provider+"/{connection}", both)
 		}
 		validate := security.ValidateRules
 		if validate == nil {
@@ -145,7 +150,13 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		sources := security.protect("read|write", sourceHandler{store: security.Assessments, validate: validate, compiles: compiles, secrets: secrets, taxiiHosts: security.TAXIIPrivateHosts})
 		mux.Handle(BasePath+"/intel/indicator-sources", sources)
 		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
+		vulns := security.protect("read|write", vulnHandler{security.Assessments})
+		for _, path := range []string{"/intel/vulnerability-sources", "/intel/vulnerability-sources/", "/intel/vulnerabilities/", "/intel/vex-documents", "/intel/vex-documents/", "/intel/vex-statements"} {
+			mux.Handle(BasePath+path, vulns)
+		}
 		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}", security.protect("ingest:relay", registryIngest{store: security.Assessments, relayEnabled: security.RelayEnabled}))
+		// A registry connection's own receiver, authenticated by its webhook secret.
+		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}/{connection}", registryIngest{store: security.Assessments, hooks: hooks})
 		mux.Handle(BasePath+"/feeds/indicators", security.protect("admin", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 			defer cancel()
@@ -179,7 +190,34 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 			}
 			writeJSON(w, 201, map[string]string{"version": version})
 		})))
-		maintenance := security.protect("admin", maintenanceHandler{security.Assessments, security.Notify})
+		// M8: licences, SBOM exports and compliance evidence reports.
+		licenses := security.protect("read|write", licenseHandler{security.Assessments})
+		mux.Handle("GET "+BasePath+"/policies/gate", licenses)
+		mux.Handle("GET "+BasePath+"/policies/license", licenses)
+		mux.Handle("PUT "+BasePath+"/policies/license", licenses)
+		mux.Handle("POST "+BasePath+"/policies/license:evaluate", licenses)
+		mux.Handle("GET "+BasePath+"/licenses/categories", licenses)
+		mux.Handle("PUT "+BasePath+"/licenses/categories", licenses)
+		mux.Handle("GET "+BasePath+"/licenses/categories/history", licenses)
+		mux.Handle("GET "+BasePath+"/reports/licenses", licenses)
+		mux.Handle("GET "+BasePath+"/assets/{id}/licenses", licenses)
+		mux.Handle("GET "+BasePath+"/assets/{id}/licenses/notices", licenses)
+		reports := security.protect("read|write", reportHandler{store: security.Assessments, artifacts: security.Artifacts})
+		mux.Handle("GET "+BasePath+"/reports/frameworks", reports)
+		mux.Handle("POST "+BasePath+"/reports/frameworks", reports)
+		mux.Handle("GET "+BasePath+"/frameworks/{id}", reports)
+		mux.Handle("DELETE "+BasePath+"/frameworks/{id}", reports)
+		mux.Handle("GET "+BasePath+"/reports", reports)
+		mux.Handle("POST "+BasePath+"/reports", reports)
+		mux.Handle("GET "+BasePath+"/reports/{id}", reports)
+		mux.Handle("GET "+BasePath+"/reports/{id}/download", reports)
+		mux.Handle("GET "+BasePath+"/schemas/{name}", security.protect("read|write|trigger", http.HandlerFunc(schemaDocuments)))
+		sboms := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts}
+		mux.Handle("GET "+BasePath+"/sboms/{id}/download", security.protect("read|write", http.HandlerFunc(sboms.sbomDownload)))
+		mux.Handle("GET "+BasePath+"/audit", security.protect("admin", auditHandler{security.Assessments}))
+		mux.Handle("GET "+BasePath+"/schemas/events", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))
+		mux.Handle("GET "+BasePath+"/schemas/events/{type}/{version}", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))
+		maintenance := security.protect("admin", maintenanceHandler{security.Assessments, security.Notify, security.QARunner})
 		mux.Handle(BasePath+"/maintenance/", maintenance)
 		mux.Handle(BasePath+"/events/inbound", maintenance)
 		mux.Handle(BasePath+"/events/inbound/", maintenance)

@@ -30,17 +30,19 @@ const SchemaVersion = 1
 
 // Events lists every event type a subscription may select.
 var Events = map[string]bool{
-	"assessment.completed":   true,
-	"assessment.failed":      true,
-	"finding.created":        true,
-	"finding.status_changed": true,
-	"integrity.alert":        true,
-	"feed.stale":             true,
-	"connection.degraded":    true,
-	"maintenance.completed":  true,
-	"qa.completed":           true,
-	"qa.failed":              true,
-	"ping":                   true,
+	"assessment.completed":          true,
+	"assessment.failed":             true,
+	"finding.created":               true,
+	"finding.status_changed":        true,
+	"finding.rescored":              true,
+	"malicious_dependency.reported": true,
+	"integrity.alert":               true,
+	"feed.stale":                    true,
+	"connection.degraded":           true,
+	"maintenance.completed":         true,
+	"qa.completed":                  true,
+	"qa.failed":                     true,
+	"ping":                          true,
 }
 
 var (
@@ -57,6 +59,9 @@ func Schema(s string) []string {
 		`CREATE INDEX IF NOT EXISTS webhook_deliveries_due_idx ON ` + s + `.webhook_deliveries(next_attempt_at) WHERE status IN ('pending','sending')`,
 		`CREATE INDEX IF NOT EXISTS webhook_deliveries_subscription_idx ON ` + s + `.webhook_deliveries(subscription_id,id)`,
 		`CREATE INDEX IF NOT EXISTS webhook_deliveries_age_idx ON ` + s + `.webhook_deliveries(created_at) WHERE status IN ('delivered','dead')`,
+		// Connection scope: a subscription with connection IDs receives only
+		// events about those connections (and connection-less platform events).
+		`ALTER TABLE ` + s + `.webhook_subscriptions ADD COLUMN IF NOT EXISTS connections jsonb NOT NULL DEFAULT '[]'`,
 	}
 }
 
@@ -66,10 +71,23 @@ var publicBase = strings.TrimSuffix(strings.TrimSuffix(os.Getenv("SCRS_PUBLIC_BA
 // Link returns an absolute link when SCRS_PUBLIC_BASE_URL is set.
 func Link(path string) string { return publicBase + "/scrs/v1" + path }
 
-// Emit fans an event out to every enabled subscription selecting its type,
-// inside the caller's transaction. A non-empty only list restricts delivery
-// to those subscription names (TRG-008 notify).
+// Scope ties an event to a connection, directly or through an asset, so
+// connection-scoped subscriptions receive only their connections' events.
+// A zero Scope is a platform event, delivered to every matching subscription.
+type Scope struct {
+	Connection uuid.UUID
+	Asset      uuid.UUID
+}
+
+// Emit records an unscoped event for every subscribed endpoint, inside the
+// caller's transaction. A non-empty only list restricts delivery to those
+// subscription names (TRG-008 notify).
 func Emit(ctx context.Context, tx pgx.Tx, schema, eventType string, data any, only []string) (uuid.UUID, error) {
+	return EmitScoped(ctx, tx, schema, eventType, data, only, Scope{})
+}
+
+// EmitScoped is Emit for an event about one connection or asset.
+func EmitScoped(ctx context.Context, tx pgx.Tx, schema, eventType string, data any, only []string, scope Scope) (uuid.UUID, error) {
 	if !Events[eventType] {
 		return uuid.Nil, ErrInput
 	}
@@ -84,7 +102,7 @@ func Emit(ctx context.Context, tx pgx.Tx, schema, eventType string, data any, on
 	if only == nil {
 		only = []string{}
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO `+schema+`.webhook_deliveries(id,subscription_id,event_id,event_type,payload) SELECT gen_random_uuid(),s.id,$1,$2,$3 FROM `+schema+`.webhook_subscriptions s WHERE s.enabled AND s.events ? $2 AND (cardinality($4::text[])=0 OR s.name=ANY($4::text[]))`, id, eventType, payload, only)
+	_, err = tx.Exec(ctx, `WITH scope AS (SELECT COALESCE(NULLIF($5::uuid,'00000000-0000-0000-0000-000000000000'),(SELECT a.connection_id FROM `+schema+`.assets a WHERE a.id=NULLIF($6::uuid,'00000000-0000-0000-0000-000000000000')))::text AS connection) INSERT INTO `+schema+`.webhook_deliveries(id,subscription_id,event_id,event_type,payload) SELECT gen_random_uuid(),s.id,$1,$2,$3 FROM `+schema+`.webhook_subscriptions s,scope WHERE s.enabled AND s.events ? $2 AND (cardinality($4::text[])=0 OR s.name=ANY($4::text[])) AND (s.connections='[]'::jsonb OR scope.connection IS NULL OR s.connections ? scope.connection)`, id, eventType, payload, only, scope.Connection, scope.Asset)
 	return id, err
 }
 
@@ -96,10 +114,13 @@ type Subscription struct {
 	Profile         string    `json:"profile"`
 	EgressAck       bool      `json:"egress_ack"`
 	IncludeContacts bool      `json:"include_contacts"`
-	Enabled         bool      `json:"enabled"`
-	Revision        int64     `json:"revision"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	// Connections limits delivery to events about these connections; empty
+	// receives events from every connection.
+	Connections []uuid.UUID `json:"connections"`
+	Enabled     bool        `json:"enabled"`
+	Revision    int64       `json:"revision"`
+	CreatedAt   time.Time   `json:"created_at"`
+	UpdatedAt   time.Time   `json:"updated_at"`
 }
 
 type Delivery struct {
@@ -202,6 +223,27 @@ func validEvents(events []string) bool {
 	return true
 }
 
+// validConnections checks a subscription's connection scope: at most 50
+// existing connections, no duplicates.
+func validConnections(ctx context.Context, tx pgx.Tx, schema string, ids []uuid.UUID) (bool, error) {
+	if len(ids) > 50 {
+		return false, nil
+	}
+	seen := map[uuid.UUID]bool{}
+	for _, id := range ids {
+		if seen[id] {
+			return false, nil
+		}
+		seen[id] = true
+	}
+	if len(ids) == 0 {
+		return true, nil
+	}
+	var found int
+	err := tx.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.connections WHERE id=ANY($1)`, ids).Scan(&found)
+	return found == len(ids), err
+}
+
 func newSecret() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -254,12 +296,22 @@ func (s *Store) Create(ctx context.Context, in Subscription, actor uuid.UUID) (S
 		return Subscription{}, "", err
 	}
 	events, _ := json.Marshal(in.Events)
+	if in.Connections == nil {
+		in.Connections = []uuid.UUID{}
+	}
+	scope, _ := json.Marshal(in.Connections)
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return Subscription{}, "", err
 	}
 	defer tx.Rollback(ctx)
-	err = tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.webhook_subscriptions(id,name,url,secret_ciphertext,events,profile,egress_ack,include_contacts) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(name) DO NOTHING RETURNING enabled,revision,created_at,updated_at`, in.ID, in.Name, in.URL, sealed, events, in.Profile, in.EgressAck, in.IncludeContacts).Scan(&in.Enabled, &in.Revision, &in.CreatedAt, &in.UpdatedAt)
+	if ok, err := validConnections(ctx, tx, s.schema, in.Connections); err != nil || !ok {
+		if err == nil {
+			err = ErrInput
+		}
+		return Subscription{}, "", err
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.webhook_subscriptions(id,name,url,secret_ciphertext,events,profile,egress_ack,include_contacts,connections) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(name) DO NOTHING RETURNING enabled,revision,created_at,updated_at`, in.ID, in.Name, in.URL, sealed, events, in.Profile, in.EgressAck, in.IncludeContacts, scope).Scan(&in.Enabled, &in.Revision, &in.CreatedAt, &in.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Subscription{}, "", ErrConflict
 	}
@@ -267,22 +319,25 @@ func (s *Store) Create(ctx context.Context, in Subscription, actor uuid.UUID) (S
 		return Subscription{}, "", err
 	}
 	u, _ := url.Parse(in.URL)
-	if err := audit(ctx, tx, s.schema, "webhook.subscription_created", in.ID, map[string]any{"actor_id": actor, "host": u.Hostname(), "events": in.Events, "profile": in.Profile}); err != nil {
+	if err := audit(ctx, tx, s.schema, "webhook.subscription_created", in.ID, map[string]any{"actor_id": actor, "host": u.Hostname(), "events": in.Events, "profile": in.Profile, "connections": in.Connections}); err != nil {
 		return Subscription{}, "", err
 	}
 	return in, secret, tx.Commit(ctx)
 }
 
-const subscriptionColumns = `id,name,url,events,profile,egress_ack,include_contacts,enabled,revision,created_at,updated_at`
+const subscriptionColumns = `id,name,url,events,profile,egress_ack,include_contacts,enabled,revision,created_at,updated_at,connections`
 
 func scanSubscription(row pgx.Row) (Subscription, error) {
 	var sub Subscription
-	var events []byte
-	err := row.Scan(&sub.ID, &sub.Name, &sub.URL, &events, &sub.Profile, &sub.EgressAck, &sub.IncludeContacts, &sub.Enabled, &sub.Revision, &sub.CreatedAt, &sub.UpdatedAt)
+	var events, scope []byte
+	err := row.Scan(&sub.ID, &sub.Name, &sub.URL, &events, &sub.Profile, &sub.EgressAck, &sub.IncludeContacts, &sub.Enabled, &sub.Revision, &sub.CreatedAt, &sub.UpdatedAt, &scope)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return sub, ErrNotFound
 	}
 	if err != nil {
+		return sub, err
+	}
+	if err := json.Unmarshal(scope, &sub.Connections); err != nil {
 		return sub, err
 	}
 	return sub, json.Unmarshal(events, &sub.Events)
@@ -316,6 +371,8 @@ type Change struct {
 	EgressAck       *bool     `json:"egress_ack"`
 	IncludeContacts *bool     `json:"include_contacts"`
 	Enabled         *bool     `json:"enabled"`
+	// Connections replaces the connection scope; an empty list removes it.
+	Connections *[]uuid.UUID `json:"connections"`
 }
 
 // Update applies a partial change under an optimistic revision check.
@@ -350,15 +407,25 @@ func (s *Store) Update(ctx context.Context, id uuid.UUID, expected int64, c Chan
 	if c.Enabled != nil {
 		sub.Enabled = *c.Enabled
 	}
+	if c.Connections != nil {
+		sub.Connections = *c.Connections
+		if ok, err := validConnections(ctx, tx, s.schema, sub.Connections); err != nil || !ok {
+			if err == nil {
+				err = ErrInput
+			}
+			return Subscription{}, err
+		}
+	}
 	if !s.validURL(sub.URL) || !validEvents(sub.Events) || (sub.Profile != "summary" && sub.Profile != "full" && sub.Profile != "agent") || (sub.Profile == "agent" && !sub.EgressAck) {
 		return Subscription{}, ErrInput
 	}
 	events, _ := json.Marshal(sub.Events)
-	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.webhook_subscriptions SET url=$2,events=$3,profile=$4,egress_ack=$5,include_contacts=$6,enabled=$7,revision=revision+1,updated_at=clock_timestamp() WHERE id=$1`, id, sub.URL, events, sub.Profile, sub.EgressAck, sub.IncludeContacts, sub.Enabled); err != nil {
+	scope, _ := json.Marshal(sub.Connections)
+	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.webhook_subscriptions SET url=$2,events=$3,profile=$4,egress_ack=$5,include_contacts=$6,enabled=$7,connections=$8,revision=revision+1,updated_at=clock_timestamp() WHERE id=$1`, id, sub.URL, events, sub.Profile, sub.EgressAck, sub.IncludeContacts, sub.Enabled, scope); err != nil {
 		return Subscription{}, err
 	}
 	u, _ := url.Parse(sub.URL)
-	if err := audit(ctx, tx, s.schema, "webhook.subscription_changed", id, map[string]any{"actor_id": actor, "host": u.Hostname(), "events": sub.Events, "profile": sub.Profile, "enabled": sub.Enabled}); err != nil {
+	if err := audit(ctx, tx, s.schema, "webhook.subscription_changed", id, map[string]any{"actor_id": actor, "host": u.Hostname(), "events": sub.Events, "profile": sub.Profile, "enabled": sub.Enabled, "connections": sub.Connections}); err != nil {
 		return Subscription{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
