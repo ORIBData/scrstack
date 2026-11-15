@@ -38,6 +38,10 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-027 | Framework packs as versioned data with recorded mapping sources | Accepted |
 | ADR-028 | Go reachability with govulncheck on SCRS's own advisory feed | Accepted |
 | ADR-029 | Internal-use analyzer licences (Bearer, OpenGrep rules) | Accepted |
+| ADR-030 | Live events from PostgreSQL NOTIFY, not Redis Pub/Sub | Accepted |
+| ADR-031 | STIG by owner-uploaded XCCDF with an SCRS starter mapping | Accepted |
+| ADR-032 | PDF reports from a built-in, deterministic writer | Accepted |
+| ADR-033 | Dependency-Track export through a transactional upload queue | Accepted |
 
 ## ADR-001 Go module
 
@@ -229,6 +233,8 @@ OpenGrep was added to the PRD's set because it is the only bundled analyzer for 
 
 **Amendment:** there is no separate alias-graph table yet; findings carry OSV aliases.
 
+**Amendment (2026-11-15):** CPE matching (VUL-007) would be the first matcher outside OSV. It is deferred: SCRS has no inventory of software without a package URL (OSV-Scanner drops it, and image binaries are not identified), and the NVD sync stores no CPE applicability. Spike S14 decides it.
+
 ## ADR-021 E2E QA runner
 
 **Decision:** Karate tests run on an operator-hosted runner (`scrs-qa-runner`). SCRS pushes jobs to it and polls, and the runner never calls SCRS. The runner:
@@ -297,3 +303,52 @@ Finding types without a CWE (vulnerable and malicious dependencies, integrity, s
 
 **Consequences:** reports state the pack version and source, count unmapped findings, and never compute a compliance verdict.
 
+## ADR-030 Live events
+
+**Decision:** `GET /events` streams server-sent events (OUT-004).
+- Every emitted event is also announced with `pg_notify` inside the transaction that records it.
+- Each API instance listens on one dedicated PostgreSQL connection and fans notices out to its streams.
+- The PRD named Redis Pub/Sub for this.
+
+**Why:**
+- A NOTIFY is delivered only after commit and never for a rolled-back change, so a stream cannot announce an assessment that does not exist.
+- Events are emitted inside transactions in both the API and the worker. Publishing to Redis after commit would mean changing every emitting call site.
+
+**Consequences:**
+- Delivery is fire-and-forget. Clients reload state on connect and on `resync`; webhooks remain the guaranteed path.
+- Notices carry ids only, within NOTIFY's 8000-byte limit.
+- Transactions that notify serialise briefly at commit, which is negligible at SCRS's event rate.
+- Streams are bounded per instance and per token, end after 10 minutes, and drop slow readers.
+- The schema-specific channel requires a direct PostgreSQL connection: a transaction-pooling proxy would break LISTEN.
+
+## ADR-031 STIG
+
+**Decision:** CMP-004 targets the DISA Application Security and Development STIG (answering PRD Q23).
+- An admin uploads DISA's XCCDF benchmark, and every rule becomes a category keyed by its STIG id.
+- SCRS ships a starter mapping of CWEs and finding types for the rules its scans can evidence. Admins edit the resulting pack.
+
+**Why:** SCRS bundles no DISA content, and STIG ids stay stable across releases. Starter entries missing from a release are reported, not silently ignored.
+
+**Consequences:** reports give each rule an evidence value (open findings, no open findings, not evidenced) and never a checklist status such as "Not a Finding".
+
+## ADR-032 PDF reports
+
+**Decision:** PDF is rendered in-process by a small writer in `internal/compliance` (PDF 1.4, standard Helvetica, Flate-compressed pages). It does not use a third-party library or a headless browser.
+
+**Why:**
+- No new dependency or container, and no network or file access.
+- No timestamps, so reports stay content-addressed: the same report gives the same SHA-256.
+
+**Consequences:** plain tabular layout, and Latin-1 text only (other characters print as `?`).
+
+## ADR-033 Dependency-Track export
+
+**Decision:**
+- When the export is enabled, `Complete` inserts a `dtrack_uploads` row in its own transaction (an outbox).
+- The worker leases uploads with `SKIP LOCKED` and pushes them with `PUT /api/v1/bom` through the netguard dialer, without following redirects.
+- 429, 5xx and network errors retry with exponential backoff, at most 12 attempts. Other 4xx answers fail at once.
+- The API key is sealed with the master key and is write-only.
+
+**Why:** a crash between completion and upload cannot lose a push, and Dependency-Track being down never affects an assessment (section 15).
+
+**Consequences:** uploads are visible and retryable through the API, and finished rows are pruned after 90 days.

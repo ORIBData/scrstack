@@ -57,6 +57,11 @@ services:
       SCRS_REACHABILITY_ENABLED: ${SCRS_REACHABILITY_ENABLED:-false}
       SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
       SCRS_LLM_PRIVATE_HOSTS: ${SCRS_LLM_PRIVATE_HOSTS:-}
+      # P2: live event streams per instance and per token; Dependency-Track
+      # hosts allowed to resolve privately (settings checks).
+      SCRS_EVENTS_MAX_STREAMS: ${SCRS_EVENTS_MAX_STREAMS:-200}
+      SCRS_EVENTS_STREAMS_PER_TOKEN: ${SCRS_EVENTS_STREAMS_PER_TOKEN:-5}
+      SCRS_DTRACK_PRIVATE_HOSTS: ${SCRS_DTRACK_PRIVATE_HOSTS:-}
       SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
       SCRS_EVENT_FIELD_MAX: ${SCRS_EVENT_FIELD_MAX:-512}
       SCRS_EVENT_REDACT: ${SCRS_EVENT_REDACT:-}
@@ -141,6 +146,9 @@ services:
       # NVD and CVE Program advisory sync (0 disables); retention defaults.
       SCRS_ADVISORY_SYNC_SECONDS: ${SCRS_ADVISORY_SYNC_SECONDS:-60}
       SCRS_NVD_API_KEY: ${SCRS_NVD_API_KEY:-}
+      # Dependency-Track SBOM export, configured through the API (0 disables pushing).
+      SCRS_DTRACK_PUSH_SECONDS: ${SCRS_DTRACK_PUSH_SECONDS:-30}
+      SCRS_DTRACK_PRIVATE_HOSTS: ${SCRS_DTRACK_PRIVATE_HOSTS:-}
       SCRS_RETENTION_DEFAULT_CLOSED_FINDINGS_DAYS: ${SCRS_RETENTION_DEFAULT_CLOSED_FINDINGS_DAYS:-}
       SCRS_RETENTION_DEFAULT_AUDIT_LOG_DAYS: ${SCRS_RETENTION_DEFAULT_AUDIT_LOG_DAYS:-}
       # Licence metadata and version lists from deps.dev; compliance report builds.

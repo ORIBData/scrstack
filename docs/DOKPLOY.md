@@ -306,6 +306,10 @@ Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
 | --- | --- | --- |
 | `SCRS_ADVISORY_SYNC_SECONDS` | worker | How often due NVD and CVE Program syncs are checked (default 60; 0 disables) |
 | `SCRS_NVD_API_KEY` | worker | Optional NVD API key: one request per 0.7 s instead of 6 s |
+| `SCRS_DTRACK_PUSH_SECONDS` | worker | How often queued Dependency-Track uploads are pushed (default 30; 0 disables). The export itself is enabled with `PUT /integrations/dependency-track` |
+| `SCRS_DTRACK_PRIVATE_HOSTS` | API, worker | Dependency-Track hostnames allowed to resolve to private addresses and use http (a server on the same network) |
+| `SCRS_EVENTS_MAX_STREAMS` | API | Live event streams (`GET /events`) per API instance (default 200) |
+| `SCRS_EVENTS_STREAMS_PER_TOKEN` | API | Live event streams per API token (default 5) |
 | `SCRS_NVD_API_URL`, `SCRS_CVE_API_URL` | worker | Override the NVD and CVE Services URLs (mirrors, tests) |
 | `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS` | API, worker | Retention default for a class the policy leaves not set (0 or empty keeps forever; `AUDIT_LOG` at least 365) |
 | `SCRS_RELEASE_FEED_URL` | API | Optional https JSON release feed for `GET /maintenance/versions` |

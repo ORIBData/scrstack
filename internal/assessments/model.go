@@ -278,6 +278,9 @@ type Result struct {
 	// run: entries they hide are suppressed by configuration, not fixed.
 	SASTDisabledRules []string
 	SASTExcludes      []string
+	// ProjectLicense is the repository's own detected licence; dependencies
+	// are checked against it for outbound compatibility (LIC-005).
+	ProjectLicense *ComponentLicense
 }
 
 func Hash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }

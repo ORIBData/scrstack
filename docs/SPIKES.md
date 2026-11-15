@@ -153,3 +153,20 @@ It would then be one more optional analyzer behind the same interface.
 **Evidence:** `internal/connections` tests; `TestPostgresGitLabRegistryImportAndMirrors`.
 
 **Observed only:** GAR Workload Identity from a non-Google host. Real-account acceptance is part of release acceptance.
+
+## S14 CPE matching (VUL-007), planned
+
+**Question:** can SCRS match software that has no package URL, such as static binaries or vendored libraries in images, with acceptable false positives?
+
+**Why it is not built:**
+- OSV-Scanner drops packages without a package URL, and the scanner fails an inventory that contains one.
+- Image layers are walked for malware, YARA and IOCs, not for software identity.
+- The NVD sync keeps only CVEs already in the register, without CPE applicability.
+- So a CPE matcher would have nothing to match.
+
+**Plan:**
+1. Add a pinned binary cataloger (for example Syft's binary classifiers, which emit CPEs) to a test build of the scanner image. Record its licence and image-size cost.
+2. Query the NVD API by `virtualMatchString` per vendor and product through the existing NVD client and pacing. Cache the answers in PostgreSQL with a TTL, and evaluate version ranges locally.
+3. Run it on the Trivy parity images and two CreditChek images. Count true and false matches against Trivy and manual review.
+4. Go only if precision is high enough for low-confidence, non-gating entries (`match_method=cpe`). Then amend ADR-020 and relax the purl requirement in the inventory (the fingerprint needs a CPE or name and version in place of the package URL).
+

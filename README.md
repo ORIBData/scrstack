@@ -31,9 +31,10 @@ was added on top. The full product specification is in
 > triggers and signed outbound webhooks, relay and registry ingestion, Trivy
 > and SARIF import, git-history mirrors, integrity alerts, YARA, KEV/EPSS, VEX
 > export and scheduled maintenance are implemented and verified (see the
-> [production-readiness audit](docs/PRODUCTION_READINESS_AUDIT.md)). Native
-> Dependency-Track export, licences, built-in SAST and reachability remain on
-> the [roadmap](#roadmap).
+> [production-readiness audit](docs/PRODUCTION_READINESS_AUDIT.md)), as are
+> licences, built-in SAST and reachability, and the P2 features: Dependency-Track
+> export, live events, STIG and PDF reports, and outbound licence compatibility.
+> CPE matching is deferred (see the [roadmap](#roadmap)).
 
 ## Table of contents
 
@@ -301,10 +302,43 @@ rules.
 
 Keep Dependency-Track for portfolio-level component tracking. Every SCRS
 assessment produces a CycloneDX SBOM with licences (`GET /assessments/{id}/sbom`,
-also as XML or SPDX 2.3) and an MBOM (`GET /assessments/{id}/mbom`),
-so an n8n workflow can forward it to Dependency-Track's BOM upload API today.
-Check the upload endpoint and API-key permissions for your Dependency-Track
-version. A native push to Dependency-Track is a planned P2 feature.
+also as XML or SPDX 2.3) and an MBOM (`GET /assessments/{id}/mbom`).
+
+SCRS can push every scan's SBOM to Dependency-Track itself:
+
+1. In Dependency-Track, create an API key for a team with `BOM_UPLOAD` and
+   `PROJECT_CREATION_UPLOAD`.
+2. Store it with `PUT /integrations/dependency-track` (admin, `If-Match`), with
+   `{"enabled":true,"url":"https://dtrack.example.com","api_key":"..."}`. The key
+   is sealed with the master key and never returned. An internal server on
+   http must be listed in `SCRS_DTRACK_PRIVATE_HOSTS`.
+3. Check it with `POST /integrations/dependency-track:test`.
+
+How pushes work:
+- Each completed scan with an SBOM is queued in the same database transaction.
+- The worker uploads it with `PUT /api/v1/bom`. The project is the asset locator
+  and the version is the ref; projects are created automatically, optionally
+  under `parent_uuid`.
+- Transient failures retry with backoff for about two days. Rejected keys or
+  permissions fail at once and can be retried after a fix
+  (`POST /integrations/dependency-track/uploads/{id}/retry`).
+- `GET /integrations/dependency-track/uploads` lists uploads.
+- An unreachable Dependency-Track never affects an assessment.
+
+### Live events for a frontend
+
+`GET /scrs/v1/events` (scope `read`) is a server-sent-event stream of notices
+for committed events (`assessment.completed`, `finding.created` and the other
+webhook event types; filter with `?types=`).
+
+- Each notice carries the event id, type, time and the ids to fetch. It never
+  carries evidence or secrets.
+- The stream sends a heartbeat every 20 seconds and ends after 10 minutes with
+  `reconnect`, so revoked tokens stop receiving.
+- Streams are fire-and-forget: reload state on connect and on `resync`. Use
+  webhooks where delivery must be guaranteed.
+- Browsers should read the stream with `fetch` so the token goes in the
+  `Authorization` header, never in the URL.
 
 ## API overview
 
@@ -412,13 +446,13 @@ Milestones follow PRD section 15.2.
 | M2 Repository scanning | Done: trigger, batch, latest, long-poll, direct and relay GitHub ingestion, PR assessments, diffs and new-versus-existing gating, integrity events |
 | M3 Malware and malicious dependencies | Done: ClamAV, YARA via ClamAV with canary, `MAL-` matching, campaign IOC types, KEV and EPSS |
 | M4 Threat-intelligence feeds | Done: indicator bundles and sources with modes and confidence, CSV import, IPv6 indicators, YARA-X rulesets, STIX 2.1 upload, TAXII 2.1 polling, KEV/EPSS, Trivy and SARIF import, NVD and CVE Program records, OpenVEX/CycloneDX VEX/CSAF import, vulnerability-source registry with licences and health |
-| M5 Retention, maintenance, outbound | Done: retention classes with legal hold, reset, rebuild, sensor update, schedule and versions actions, signed outbound webhooks with profiles, header auth, connection scope and published event schemas, `finding.rescored` and `malicious_dependency.reported`, per-connection inbound webhooks, event log and replay, n8n workflows, snapshots, git mirrors. Open: server-sent events (OUT-004, P2) |
+| M5 Retention, maintenance, outbound | Done: retention classes with legal hold, reset, rebuild, sensor update, schedule and versions actions, signed outbound webhooks with profiles, header auth, connection scope and published event schemas, `finding.rescored` and `malicious_dependency.reported`, per-connection inbound webhooks, event log and replay, n8n workflows, snapshots, git mirrors. Server-sent events (OUT-004) were added in P2 |
 | M6 Images and registries | Done: Docker Hub, GAR, Harbor and OCI images by digest with layer scanning, registry push events, GitLab repositories and webhooks; Trivy parity recorded on Alpine, Debian 12 and Debian 13 images ([TRIVY_PARITY.md](docs/TRIVY_PARITY.md)) |
 | M7 Remediation and hardening | Done: npm and Maven plans, OpenVEX export, load and crash-recovery test |
 | E2E QA (Karate) | Done: runner service and image (in the Dokploy stack or on a separate VM), QA profiles, automatic runs after assessments, OpenAPI coverage, report-only QA findings, load runs, LLM-drafted Karate features and unit tests with approval. Open: acceptance with real LLM keys and on the VPS |
-| M8 Licences, SPDX, compliance reports | Done: licence detection, normalisation, categories, policy by distribution, entries and waivers, inventory, report and notices (LIC-001 to LIC-009); SCRS-generated CycloneDX and SPDX 2.3 export (SBM-010, SBM-011); OWASP 2021/2025, CWE Top 25 and PCI DSS evidence reports with custom packs (CMP-001 to CMP-003, CMP-005, CMP-006); safe versions (VUL-008) ([LICENSES_AND_COMPLIANCE.md](docs/LICENSES_AND_COMPLIANCE.md)). Open: STIG (CMP-004, P2, needs Q23), PDF reports (P2), counsel review of corporate-default (Q24) |
+| M8 Licences, SPDX, compliance reports | Done: licence detection, normalisation, categories, policy by distribution, entries and waivers, inventory, report and notices (LIC-001 to LIC-009); SCRS-generated CycloneDX and SPDX 2.3 export (SBM-010, SBM-011); OWASP 2021/2025, CWE Top 25 and PCI DSS evidence reports with custom packs (CMP-001 to CMP-003, CMP-005, CMP-006); safe versions (VUL-008) ([LICENSES_AND_COMPLIANCE.md](docs/LICENSES_AND_COMPLIANCE.md)). STIG (CMP-004, ASD STIG by XCCDF import), PDF reports and outbound licence compatibility (LIC-005) were added in P2. Open: counsel review of corporate-default and the outbound rules (Q24) |
 | M9 SAST and reachability | Done: analyzer framework and sandbox image with gosec, Bandit, OpenGrep and Bearer, normalised entries with data-flow steps, diff-aware gate, inline suppressions and suppression-added signal, rules and excludes, custom rulesets (SAST-001 to SAST-011); Go reachability by govulncheck with traces and scoring (REA-001 to REA-004, REA-006, REA-007); spikes S10 to S12 ([SAST.md](docs/SAST.md)). Open: reachability beyond Go (REA-005, REA-012, P2), Dart coverage, deduplication with imported SARIF of the same tool (SAST-012) |
-| P2 items | Not started: Dependency-Track SBOM export (forward SBOMs through n8n until then), CPE matching (VUL-007), STIG reports |
+| P2 items | Done 2026-11-15: Dependency-Track SBOM export, live events (OUT-004), ASD STIG import and reports (CMP-004), PDF reports, outbound licence compatibility (LIC-005). Deferred: CPE matching (VUL-007), pending spike S14, because SCRS has no inventory of software without a package URL |
 | Release acceptance | Outstanding: live Dokploy deployment and TLS checks, real GitHub/GitLab/registry accounts, hosted backup and restore drills, signed release manifests, review of the ClamAV image's open CVEs |
 
 ## Development and QA

@@ -410,11 +410,48 @@ The deployment test asserts the runner's labels, networks and lack of secrets. `
 
 **Not verified:** run time on large repositories, and a false-negative study of reachability on our own services.
 
+## P2 addendum (2026-11-15)
+
+**Delivered:**
+- **Dependency-Track export (ADR-033).**
+  - Admin settings, with the key sealed and write-only.
+  - Uploads queued in `Complete`'s transaction and pushed by a leased worker loop through the egress guard, with backoff, a retry endpoint and 90-day pruning.
+- **Live events (OUT-004, ADR-030).**
+  - `GET /events` server-sent events announced with `pg_notify` inside the emitting transaction, so only committed events are streamed.
+  - Each stream sends ids only, has a per-write deadline in place of the server's write timeout, lasts at most 10 minutes, and is limited per instance and per token. Slow readers are dropped.
+  - Streams end when the server shuts down.
+- **ASD STIG (CMP-004, ADR-031).**
+  - XCCDF import (XML or DISA's zip, size-capped, no external entities) into an editable `stig` pack with a starter mapping.
+  - Rule evidence values that are never checklist statuses.
+- **PDF reports (ADR-032):** a built-in, deterministic writer.
+- **Outbound licence compatibility (LIC-005):**
+  - the repository licence is stored with the assessment;
+  - conservative pairwise rules;
+  - `SCRS-LICENSE-OUTBOUND` entries under the existing licence gate;
+  - inventory counts and a dry run.
+- **Deferred:** CPE matching (VUL-007). SCRS has no inventory of software without a package URL to match. Spike S14 plans the work.
+
+**Safeguards:**
+- **Schema changes** are additive and re-runnable: the report format check is dropped and re-added, and the test bootstraps the schema twice.
+- **Nothing new can fail an assessment.** A Dependency-Track outage or a stream error never touches assessment state.
+- **Outbound entries** are report-only until the licence policy is made enforcing.
+- **The contract** has 184 operations.
+
+**Verified on 2026-11-15:**
+- `make qa`, `make database-test` (race detector, including `TestPostgresP2Features`), and the new unit tests in `internal/compliance`, `internal/license`, `internal/notify` and `internal/dtrack`;
+- sample PDFs read back with poppler's `pdftotext`.
+
+**Not verified:**
+- a live Dependency-Track server (the tests use a fake that implements its upload, version and token endpoints);
+- a real DISA ASD STIG release;
+- event streams through Traefik on the VPS;
+- counsel review of the outbound rules.
+
 ## Current status and remaining work (2026-11-15)
 
-Delivered: M0–M9, the threat-intelligence module, and E2E QA (Karate). Remaining:
+Delivered: M0–M9, the threat-intelligence module, E2E QA (Karate), and the P2 features except CPE matching. Remaining:
 
-1. **P2:** Dependency-Track push, CPE matching (VUL-007), server-sent events, STIG (CMP-004) and PDF reports, outbound licence compatibility (LIC-005).
+1. **P2:** CPE matching (VUL-007), after spike S14; reachability beyond Go (REA-005, REA-012).
 2. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
 3. **Acceptance:**
    - live Dokploy deployment with TLS;
@@ -422,4 +459,5 @@ Delivered: M0–M9, the threat-intelligence module, and E2E QA (Karate). Remaini
    - the runner on the VPS;
    - backup and restore drills;
    - signed release manifests;
-   - the ClamAV image CVE review.
+   - the ClamAV image CVE review;
+   - a live Dependency-Track upload, a real ASD STIG release, and event streams through Traefik.

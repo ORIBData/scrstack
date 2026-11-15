@@ -85,7 +85,11 @@ tags:
   - name: Licences
     description: Licence inventory, normalisation, categories and policy by distribution model, third-party notices. A policy aid, not legal advice.
   - name: Compliance reports
-    description: OWASP Top 10, CWE Top 25 and PCI DSS evidence reports from framework packs. Evidence for assessors, not certification.
+    description: OWASP Top 10, CWE Top 25, PCI DSS and imported DISA STIG evidence reports from framework packs, as JSON, CSV, Markdown or PDF. Evidence for assessors, not certification.
+  - name: Integrations
+    description: Optional export of SCRS-generated SBOMs to OWASP Dependency-Track. SCRS never depends on it being reachable.
+  - name: Live events
+    description: Server-sent events for frontends (OUT-004). Fire-and-forget notices of committed events; webhooks remain the guaranteed delivery path.
   - name: SAST
     description: Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, run in the scrs-sast sandbox without SCRS secrets.
   - name: LLM providers
@@ -2263,10 +2267,11 @@ paths:
                 purl: {type: string, maxLength: 512}
                 path: {type: string, maxLength: 512}
                 dev: {type: boolean}
+                project_license: {type: string, maxLength: 2000, description: 'Adds the outbound check (LIC-005): can this licence be combined into a project released under project_license?', examples: [GPL-2.0-only]}
       responses:
         '200':
           description: Normalised expression and decision
-          content: {application/json: {schema: {type: object, properties: {normalized: {$ref: '#/components/schemas/NormalizedLicense'}, policy: {type: string}, policy_revision: {type: integer}, enforcing: {type: boolean}, decision: {$ref: '#/components/schemas/LicenseDecision'}}}}}
+          content: {application/json: {schema: {type: object, properties: {normalized: {$ref: '#/components/schemas/NormalizedLicense'}, policy: {type: string}, policy_revision: {type: integer}, enforcing: {type: boolean}, decision: {$ref: '#/components/schemas/LicenseDecision'}, outbound: {$ref: '#/components/schemas/OutboundCompatibility'}}}}}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -2415,6 +2420,34 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /reports/frameworks/stig:
+    post:
+      tags: [Compliance reports]
+      operationId: importSTIG
+      summary: Import a DISA STIG benchmark
+      description: 'Imports a DISA STIG from its XCCDF benchmark (the `*-xccdf.xml` file, or the zip DISA publishes; at most 40 MiB) as a `stig` pack (CMP-004). Each rule becomes a category keyed by its STIG id, with its CAT severity, vulnerability and rule ids and CCIs. SCRS applies its starter mapping for the Application Security and Development STIG (CWE ids and finding types for the rules its scans can give evidence for); `mapping_unmatched` lists starter entries the benchmark does not contain. Download the pack, adjust the mapping and upload it with `POST /reports/frameworks`. SCRS bundles no DISA content, and reports never mark a rule "Not a Finding". The XML parser resolves no external entities. Audited. Scope `admin`.'
+      requestBody:
+        required: true
+        content:
+          application/xml: {schema: {type: string}}
+          application/zip: {schema: {type: string, format: binary}}
+      responses:
+        '201':
+          description: Imported pack
+          headers: {Location: {schema: {type: string}}}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pack: {$ref: '#/components/schemas/FrameworkPack'}
+                  rules_mapped: {type: integer, description: Rules SCRS findings can give evidence for}
+                  mapping_unmatched: {type: array, items: {type: string}, description: Starter-mapping STIG ids missing from this benchmark}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '413': {description: Benchmark too large, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /frameworks/{id}:
     parameters: [{name: id, in: path, required: true, schema: {type: string}}]
     get:
@@ -2497,11 +2530,104 @@ paths:
             application/json: {schema: {$ref: '#/components/schemas/EvidenceReport'}}
             text/csv: {schema: {type: string}}
             text/markdown: {schema: {type: string}}
+            application/pdf: {schema: {type: string, format: binary}}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {description: Report not ready, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /integrations/dependency-track:
+    get:
+      tags: [Integrations]
+      operationId: getDependencyTrack
+      summary: Dependency-Track export settings
+      description: The export settings; the API key is write-only (`api_key_set`). Scope `read` or `write`.
+      responses:
+        '200': {description: Settings, headers: {ETag: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DTrackSettings'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Integrations]
+      operationId: setDependencyTrack
+      summary: Configure the Dependency-Track export
+      description: 'While enabled, every completed scan with an SBOM queues an upload in the same transaction; the worker pushes it with `PUT /api/v1/bom` (project = asset locator, version = ref, auto-created), retrying transient failures with backoff for about two days. The key needs BOM_UPLOAD and PROJECT_CREATION_UPLOAD and is sealed with the master key; omit `api_key` to keep the stored one. Requires `If-Match`. Audited without the key. Scope `admin`.'
+      parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                enabled: {type: boolean}
+                url: {type: string, maxLength: 500}
+                api_key: {type: string, minLength: 16, maxLength: 256, writeOnly: true}
+                parent_uuid: {type: string, format: uuid}
+      responses:
+        '200': {description: Settings, headers: {ETag: {schema: {type: string}}}, content: {application/json: {schema: {$ref: '#/components/schemas/DTrackSettings'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {description: Stale revision, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '428': {description: If-Match required, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /integrations/dependency-track:test:
+    post:
+      tags: [Integrations]
+      operationId: testDependencyTrack
+      summary: Test the Dependency-Track connection
+      description: Reads the server version, then checks the stored key holds BOM upload permission. Sends no SBOM. Scope `admin`.
+      responses:
+        '200': {description: Result, content: {application/json: {schema: {type: object, properties: {ok: {type: boolean}, version: {type: string}, error: {type: string}}}}}}
+        '409': {description: No URL or key stored, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /integrations/dependency-track/uploads:
+    get:
+      tags: [Integrations]
+      operationId: listDependencyTrackUploads
+      summary: List SBOM uploads
+      description: Uploads, newest first; finished ones are kept 90 days. Scope `read` or `write`.
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [queued, sending, uploaded, failed]}}
+        - {name: cursor, in: query, schema: {type: string, format: uuid}}
+      responses:
+        '200': {description: Uploads, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/DTrackUpload'}}, next_cursor: {type: string}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /integrations/dependency-track/uploads/{id}/retry:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Integrations]
+      operationId: retryDependencyTrackUpload
+      summary: Retry a failed upload
+      description: Requeues a failed upload (for example after fixing the key). Audited. Scope `admin`.
+      responses:
+        '204': {description: Requeued}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /events:
+    get:
+      tags: [Live events]
+      operationId: streamEvents
+      summary: Stream live events
+      description: 'A `text/event-stream` of notices for committed events (OUT-004): `id` is the event id, `event` its type, `data` a JSON object with id, type, time, connection and asset ids and `refs` (ids to fetch; never evidence or secrets). The stream opens with `ready`, sends a comment heartbeat every 20 s, and ends after 10 minutes with `reconnect` so revoked tokens stop receiving; clients reconnect. Missed events are not replayed: reload state on connect and on `resync`. Use a client that can send the Authorization header (fetch streaming); tokens never go in the URL. At most 5 streams per token and 200 per API instance (SCRS_EVENTS_STREAMS_PER_TOKEN, SCRS_EVENTS_MAX_STREAMS). Scope `read` or `write`.'
+      parameters:
+        - {name: types, in: query, description: Comma-separated event types (default all), schema: {type: string, examples: ['assessment.completed,finding.created']}}
+      responses:
+        '200': {description: Event stream, content: {text/event-stream: {schema: {type: string}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {description: Too many streams or requests, headers: {Retry-After: {schema: {type: integer}}}, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Live events unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /schemas/{name}:
     parameters:
       - {name: name, in: path, required: true, schema: {type: string, enum: [license-policy, framework-pack]}}
@@ -3690,20 +3816,57 @@ components:
         enforcing: {type: boolean}
         counts: {type: object, additionalProperties: {type: integer}, description: By policy result and by category}
         distribution_hint: {type: string}
+        project_license: {$ref: '#/components/schemas/ComponentLicense'}
+        outbound: {type: object, additionalProperties: {type: integer}, description: 'Runtime dependencies by outbound effect (allow, review, deny) against the repository''s own licence (LIC-005); present when that licence is a known open-source licence'}
         items: {type: array, items: {$ref: '#/components/schemas/LicenseRow'}}
+    OutboundCompatibility:
+      type: object
+      description: 'Outbound-licence compatibility (LIC-005): a conservative policy aid, not legal advice.'
+      properties:
+        effect: {type: string, enum: [allow, review, deny]}
+        project_license: {type: string}
+        dependency_license: {type: string}
+        category: {type: string}
+        licenses: {type: array, items: {type: string}}
+        reason: {type: string}
+    DTrackSettings:
+      type: object
+      properties:
+        enabled: {type: boolean}
+        url: {type: string, description: 'Dependency-Track API base URL: https, or http for a host in SCRS_DTRACK_PRIVATE_HOSTS'}
+        api_key_set: {type: boolean, readOnly: true}
+        parent_uuid: {type: string, format: uuid, description: Optional parent project for created projects}
+        revision: {type: integer, readOnly: true}
+        updated_at: {type: string, format: date-time, readOnly: true}
+    DTrackUpload:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        assessment_id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        project_name: {type: string, description: The asset locator}
+        project_version: {type: string, description: The assessed ref (else the commit or digest)}
+        status: {type: string, enum: [queued, sending, uploaded, failed]}
+        attempts: {type: integer}
+        next_attempt_at: {type: string, format: date-time}
+        token: {type: string, description: Dependency-Track processing token}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        uploaded_at: {type: string, format: date-time}
     FrameworkPack:
       type: object
-      description: A versioned framework data pack (CMP-001). Uploads use kind `cwe_mapping`; schema at `GET /schemas/framework-pack`.
+      description: A versioned framework data pack (CMP-001). Uploads use kind `cwe_mapping`, or `stig` for an edited imported STIG; schema at `GET /schemas/framework-pack`.
       required: [id, name, version, kind]
       properties:
         id: {type: string, examples: [owasp-top10-2025]}
         name: {type: string}
         version: {type: string}
-        kind: {type: string, enum: [cwe_mapping, pci_dss]}
+        kind: {type: string, enum: [cwe_mapping, pci_dss, stig]}
+        benchmark: {type: object, description: stig only, properties: {id: {type: string}, title: {type: string}, version: {type: string}, release: {type: string}}}
         source: {type: string, description: Where the mapping comes from}
         url: {type: string}
         builtin: {type: boolean, readOnly: true}
-        categories: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}, cwes: {type: array, items: {type: integer}}}}}
+        categories: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}, cwes: {type: array, items: {type: integer}}, severity: {type: string, enum: [CAT I, CAT II, CAT III], description: stig only}, vuln_id: {type: string}, rule_id: {type: string}, ccis: {type: array, items: {type: string}}}}}
         type_categories: {type: object, additionalProperties: {type: string}, description: Finding types without a CWE of their own (vulnerable or malicious dependency, integrity, secret, misconfiguration) mapped to a category}
         type_categories_note: {type: string}
         requirements: {type: array, items: {type: object, properties: {id: {type: string}, title: {type: string}, evidence: {type: string}}}}
@@ -3723,7 +3886,7 @@ components:
         scope: {$ref: '#/components/schemas/ReportScope'}
         since: {type: string, format: date-time, description: Default 90 days before until}
         until: {type: string, format: date-time, description: Default now}
-        format: {type: string, enum: [json, csv, md], default: json}
+        format: {type: string, enum: [json, csv, md, pdf], default: json, description: 'pdf is an A4 text layout with the same content as md; the same report always produces the same bytes'}
         params:
           type: object
           additionalProperties: false
@@ -3739,7 +3902,7 @@ components:
         scope: {$ref: '#/components/schemas/ReportScope'}
         since: {type: string, format: date-time}
         until: {type: string, format: date-time}
-        format: {type: string, enum: [json, csv, md]}
+        format: {type: string, enum: [json, csv, md, pdf]}
         params: {type: object}
         status: {type: string, enum: [queued, running, succeeded, failed]}
         sha256: {type: string}
@@ -3765,6 +3928,14 @@ components:
         categories: {type: array, items: {type: object}, description: Per category open, opened and closed in window, by severity, CWE counts and weekly trend}
         unmapped: {type: object, properties: {no_cwe: {type: integer}, cwe_outside_pack: {type: integer}, top_outside_pack: {type: array, items: {type: object}}}}
         requirements: {type: array, items: {type: object}, description: PCI DSS 6.3.1, 6.3.2 and 6.3.3 evidence metrics}
+        stig:
+          type: object
+          description: 'STIG packs only. Each category also carries `severity` (CAT I to III) and `evidence`: open_findings, no_open_findings (SCRS scans cover the rule and report nothing open) or not_evidenced (manual review). These are not STIG checklist statuses.'
+          properties:
+            benchmark: {type: object}
+            rules: {type: integer}
+            rules_by_evidence: {type: object, additionalProperties: {type: integer}}
+            rules_with_open_findings_by_cat: {type: object, additionalProperties: {type: integer}}
     Finding:
       type: object
       properties:
@@ -3772,7 +3943,7 @@ components:
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license, sast], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns. `sast` entries (advisory id `<tool>:<rule>`, evidence with tool, rule, CWE ids, path and lines, code hash, data-flow steps and `suppressed_in_code`; no code) gate only when new: a new critical fails, a new high warns; inline-suppressed entries never gate, and a suppression added for an open entry raises integrity entry `SCRS-SAST-SUPPRESSION-ADDED`. Vulnerability evidence carries `reachability` (status reachable, imported_only, not_reachable, unknown or unsupported; method, tool, confidence, file-and-line trace) when reachability ran; reachable adds 10 to the score and not reachable subtracts 15, known-exploited entries keep at least 45, and nothing is closed for being unreachable'}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license, sast], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`, or `SCRS-LICENSE-OUTBOUND:<project licence>:<expression>` for a runtime dependency incompatible with, or needing review against, the licence of the repository itself in a SaaS or distributed asset) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns. `sast` entries (advisory id `<tool>:<rule>`, evidence with tool, rule, CWE ids, path and lines, code hash, data-flow steps and `suppressed_in_code`; no code) gate only when new: a new critical fails, a new high warns; inline-suppressed entries never gate, and a suppression added for an open entry raises integrity entry `SCRS-SAST-SUPPRESSION-ADDED`. Vulnerability evidence carries `reachability` (status reachable, imported_only, not_reachable, unknown or unsupported; method, tool, confidence, file-and-line trace) when reachability ran; reachable adds 10 to the score and not reachable subtracts 15, known-exploited entries keep at least 45, and nothing is closed for being unreachable'}
         advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
         severity: {type: string, enum: [critical, high, medium, low, info, unknown]}

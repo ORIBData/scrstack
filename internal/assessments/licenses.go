@@ -28,6 +28,8 @@ func licenseSchema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.package_metadata(system text NOT NULL,name text NOT NULL,version text NOT NULL,licenses jsonb NOT NULL DEFAULT '[]',status text NOT NULL CHECK(status IN ('ok','not_found')),fetched_at timestamptz NOT NULL DEFAULT clock_timestamp(),PRIMARY KEY(system,name,version))`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.package_versions(system text NOT NULL,name text NOT NULL,versions jsonb NOT NULL DEFAULT '[]',status text NOT NULL CHECK(status IN ('ok','not_found')),fetched_at timestamptz NOT NULL DEFAULT clock_timestamp(),PRIMARY KEY(system,name))`,
 		`CREATE INDEX IF NOT EXISTS findings_license_idx ON ` + s + `.findings(asset_id,ref) WHERE type='license'`,
+		// LIC-005 (P2): the repository's own licence, for outbound checks.
+		`ALTER TABLE ` + s + `.assessments ADD COLUMN IF NOT EXISTS project_license jsonb`,
 	}
 }
 
@@ -223,6 +225,8 @@ type licenseEvidence struct {
 	Distribution    string            `json:"distribution"`
 	Decision        license.Decision  `json:"decision"`
 	License         *ComponentLicense `json:"license"`
+	// ProjectLicense is set on outbound-compatibility entries (LIC-005).
+	ProjectLicense string `json:"project_license,omitempty"`
 }
 
 // licenseFindings evaluates every component's licence against the active
@@ -303,7 +307,62 @@ func (s *Store) licenseFindings(ctx context.Context, tx pgx.Tx, a Assessment, r 
 	if unresolved > 0 && policy.Policy.Enforcing {
 		r.Complete = false
 	}
+	s.outboundFindings(policy, catalog, distribution, r)
 	return nil
+}
+
+// outboundMinConfidence is the detection confidence a project licence file
+// needs before dependencies are checked against it.
+const outboundMinConfidence = 0.9
+
+// outboundFindings checks runtime dependencies against the repository's
+// own licence (LIC-005, P2) and adds a "license" entry for each review or
+// deny result. Internal assets are not checked; SaaS assets only for
+// network-use and restricted licences, which bind without distribution.
+// The entries follow the licence gate like policy entries.
+func (s *Store) outboundFindings(policy PolicyRecord, catalog *license.Catalog, distribution string, r *Result) {
+	p := r.ProjectLicense
+	if p == nil || distribution == license.Internal || p.Confidence > 0 && p.Confidence < outboundMinConfidence || !license.OutboundApplies(catalog, p.Expression) {
+		return
+	}
+	seen := map[string]bool{}
+	for _, c := range r.Components {
+		key := c.PURL + "\x00" + c.Path
+		if seen[key] || c.License == nil || c.Dev() {
+			continue
+		}
+		seen[key] = true
+		result := license.Outbound(catalog, p.Expression, c.License.Expression)
+		if result.Effect == license.Allow {
+			continue
+		}
+		if distribution == license.SaaS && result.Category != license.NetworkCopyleft && result.Category != license.NonCommercial && result.Category != license.SourceAvailableRestricted {
+			continue
+		}
+		if len(r.Findings) >= 10000 {
+			r.Complete = false
+			return
+		}
+		d := license.Decision{Effect: result.Effect, Expression: result.Dependency, Category: result.Category, Basis: "outbound:" + p.Expression, Reason: result.Reason, Licenses: result.Licenses}
+		evidence, _ := json.Marshal(licenseEvidence{Policy: policy.Policy.Name, PolicyRevision: policy.Revision, Enforcing: policy.Policy.Enforcing, CatalogRevision: catalog.Revision, Distribution: distribution, Decision: d, License: c.License, ProjectLicense: p.Expression})
+		score := 20
+		title := fmt.Sprintf("Licence %s needs review against the project licence %s", strings.Join(d.Licenses, ", "), p.Expression)
+		if d.Effect == license.Deny {
+			score = 50
+			title = fmt.Sprintf("Licence %s is incompatible with the project licence %s", strings.Join(d.Licenses, ", "), p.Expression)
+		}
+		advisory := "SCRS-LICENSE-OUTBOUND:" + p.Expression + ":" + d.Expression
+		if len(advisory) > 200 {
+			advisory = "SCRS-LICENSE-OUTBOUND:" + Hash([]byte(p.Expression + "\x00" + d.Expression))[:24]
+		}
+		guidance, _ := json.Marshal(map[string]any{
+			"summary":           "A policy aid, not legal advice. Replace the dependency, change the project's licence with counsel, or record a waiver after review.",
+			"policy_basis":      d.Basis,
+			"reason":            d.Reason,
+			"automatic_changes": false,
+		})
+		r.Findings = append(r.Findings, Finding{Type: "license", AdvisoryID: advisory, Title: title, Severity: policy.Policy.SeverityFor(d.Effect), Score: score, Component: c, Evidence: evidence, Guidance: guidance})
+	}
 }
 
 // licenseGate reads a licence entry's effect: an enforcing deny fails, an
@@ -359,7 +418,11 @@ type LicenseInventory struct {
 	Enforcing    bool           `json:"enforcing"`
 	Counts       map[string]int `json:"counts"`
 	Hint         string         `json:"distribution_hint,omitempty"`
-	Items        []LicenseRow   `json:"items"`
+	// ProjectLicense is the repository's own licence at this revision;
+	// Outbound counts dependencies by outbound effect against it (LIC-005).
+	ProjectLicense *ComponentLicense `json:"project_license,omitempty"`
+	Outbound       map[string]int    `json:"outbound,omitempty"`
+	Items          []LicenseRow      `json:"items"`
 }
 
 // AssetLicenses evaluates the components of the asset's newest successful
@@ -385,7 +448,8 @@ func (s *Store) AssetLicenses(ctx context.Context, asset uuid.UUID, ref string) 
 	var id uuid.UUID
 	var revision, assessedRef string
 	var at time.Time
-	err = s.pool.QueryRow(ctx, `SELECT id,resolved_commit,request->'target'->>'ref',completed_at FROM `+s.schema+`.assessments WHERE asset_id=$1 AND status='succeeded' AND request->'remediation' IS NULL AND request->'import' IS NULL AND ($2='' OR request->'target'->>'ref'=$2) AND EXISTS(SELECT 1 FROM `+s.schema+`.components c WHERE c.assessment_id=assessments.id) ORDER BY completed_at DESC,id DESC LIMIT 1`, asset, ref).Scan(&id, &revision, &assessedRef, &at)
+	var project []byte
+	err = s.pool.QueryRow(ctx, `SELECT id,resolved_commit,request->'target'->>'ref',completed_at,project_license FROM `+s.schema+`.assessments WHERE asset_id=$1 AND status='succeeded' AND request->'remediation' IS NULL AND request->'import' IS NULL AND ($2='' OR request->'target'->>'ref'=$2) AND EXISTS(SELECT 1 FROM `+s.schema+`.components c WHERE c.assessment_id=assessments.id) ORDER BY completed_at DESC,id DESC LIMIT 1`, asset, ref).Scan(&id, &revision, &assessedRef, &at, &project)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return out, nil
 	}
@@ -393,6 +457,9 @@ func (s *Store) AssetLicenses(ctx context.Context, asset uuid.UUID, ref string) 
 		return out, err
 	}
 	out.AssessmentID, out.Revision, out.Ref, out.AssessedAt = &id, revision, assessedRef, &at
+	if len(project) > 0 && json.Unmarshal(project, &out.ProjectLicense) == nil && license.OutboundApplies(catalog, out.ProjectLicense.Expression) {
+		out.Outbound = map[string]int{license.Allow: 0, license.Review: 0, license.Deny: 0}
+	}
 	components, err := s.AllComponents(ctx, id)
 	if err != nil {
 		return out, err
@@ -417,6 +484,9 @@ func (s *Store) AssetLicenses(ctx context.Context, asset uuid.UUID, ref string) 
 		}
 		out.Counts[row.Effect]++
 		out.Counts[row.Category]++
+		if out.Outbound != nil && c.License != nil && !c.Dev() {
+			out.Outbound[license.Outbound(catalog, out.ProjectLicense.Expression, c.License.Expression).Effect]++
+		}
 		out.Items = append(out.Items, row)
 	}
 	if mobile && out.Distribution != license.Distributed {
@@ -463,7 +533,7 @@ type licenseStatus struct {
 }
 
 func (s *Store) licenseStatuses(ctx context.Context, asset uuid.UUID, ref string) (map[string]licenseStatus, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id,component->>'purl',component->>'path',status,waiver_until FROM `+s.schema+`.findings WHERE asset_id=$1 AND ref=$2 AND type='license' AND status<>'fixed'`, asset, ref)
+	rows, err := s.pool.Query(ctx, `SELECT id,component->>'purl',component->>'path',status,waiver_until FROM `+s.schema+`.findings WHERE asset_id=$1 AND ref=$2 AND type='license' AND advisory_id NOT LIKE 'SCRS-LICENSE-OUTBOUND:%' AND status<>'fixed'`, asset, ref)
 	if err != nil {
 		return nil, err
 	}

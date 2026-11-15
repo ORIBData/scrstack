@@ -99,8 +99,9 @@ response/error OpenAPI schemas also need fuller typing and contract acceptance.
 | M5 Retention/maintenance/outbound | Not implemented. Developer image cleanup is not product retention. |
 | M6 Images/registries | Docker Hub/GAR discovery only; digest pull/assessment/layer attribution and remaining adapters absent. |
 | M7 Remediation/hardening | Opt-in npm in-place advice adapter, job persistence, artifact retrieval and isolated egress implemented; actual fix/provider acceptance, Maven, VEX and resilience gates remain. |
-| M8 Licences/compliance | Implemented 2026-11-14: see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). STIG and PDF reports remain P2. |
+| M8 Licences/compliance | Implemented 2026-11-14: see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). STIG and PDF reports were added in P2. |
 | M9 SAST/reachability | Implemented 2026-11-15: see [SAST.md](SAST.md). Reachability beyond Go remains P2. |
+| P2 | Implemented 2026-11-15: Dependency-Track export (ADR-033), live events OUT-004 (ADR-030), ASD STIG import CMP-004 (ADR-031, answers Q23), PDF reports (ADR-032), outbound licence compatibility LIC-005. CPE matching VUL-007 deferred to spike S14. |
 
 These are engineering deliverables, not items that can be closed through deployment
 configuration or documentation. The repository is not a complete supply-chain scanner.

@@ -172,6 +172,8 @@ func (h licenseHandler) evaluate(ctx context.Context, w http.ResponseWriter, r *
 		PURL         string     `json:"purl"`
 		Path         string     `json:"path"`
 		Dev          bool       `json:"dev"`
+		// ProjectLicense, when set, adds the outbound check (LIC-005).
+		ProjectLicense string `json:"project_license"`
 	}
 	if !readBody(w, r, &input) {
 		return
@@ -179,7 +181,7 @@ func (h licenseHandler) evaluate(ctx context.Context, w http.ResponseWriter, r *
 	if input.Distribution == "" {
 		input.Distribution = license.SaaS
 	}
-	if !license.ValidDistribution(input.Distribution) || len(input.Expression) > 2000 || len(input.PURL) > 512 || len(input.Path) > 512 {
+	if !license.ValidDistribution(input.Distribution) || len(input.Expression) > 2000 || len(input.ProjectLicense) > 2000 || len(input.PURL) > 512 || len(input.Path) > 512 {
 		writeError(w, 400, "distribution must be internal, saas or distributed; fields are bounded")
 		return
 	}
@@ -198,7 +200,16 @@ func (h licenseHandler) evaluate(ctx context.Context, w http.ResponseWriter, r *
 	if input.AssetID != nil {
 		subject.Asset = *input.AssetID
 	}
-	writeJSON(w, 200, map[string]any{"normalized": normalized, "policy": record.Policy.Name, "policy_revision": record.Revision, "enforcing": record.Policy.Enforcing, "decision": record.Policy.Evaluate(catalog, subject)})
+	result := map[string]any{"normalized": normalized, "policy": record.Policy.Name, "policy_revision": record.Revision, "enforcing": record.Policy.Enforcing, "decision": record.Policy.Evaluate(catalog, subject)}
+	if input.ProjectLicense != "" {
+		project := license.Normalize(input.ProjectLicense).Expression
+		if !license.OutboundApplies(catalog, project) {
+			writeError(w, 400, "project_license must be an SPDX expression of open-source licences")
+			return
+		}
+		result["outbound"] = license.Outbound(catalog, project, normalized.Expression)
+	}
+	writeJSON(w, 200, result)
 }
 
 // report serves GET /reports/licenses (LIC-007): one asset with asset_id,

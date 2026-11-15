@@ -300,7 +300,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	}
 	stages, _ := json.Marshal(r.Stages)
 	countJSON, _ := json.Marshal(counts)
-	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff)
+	var projectLicense []byte
+	if r.ProjectLicense != nil {
+		projectLicense, _ = json.Marshal(r.ProjectLicense)
+	}
+	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,project_license=$10,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff, projectLicense)
 	if err != nil {
 		return err
 	}
@@ -309,6 +313,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	}
 	done, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, a.ID))
 	if err != nil {
+		return err
+	}
+	if err := s.queueDTrack(ctx, tx, done, r.SBOMKey); err != nil {
 		return err
 	}
 	if err := s.emitCompletion(ctx, tx, done, created); err != nil {

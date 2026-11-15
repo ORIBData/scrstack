@@ -200,7 +200,7 @@ func (a *Artifacts) GetQAReport(ctx context.Context, key string) ([]byte, error)
 	return data, nil
 }
 
-var reportKey = regexp.MustCompile(`^reports/[a-f0-9]{64}\.(json|csv|md)$`)
+var reportKey = regexp.MustCompile(`^reports/[a-f0-9]{64}\.(json|csv|md|pdf)$`)
 
 // PutReport stores a compliance evidence report content-addressed (CMP-006).
 func (a *Artifacts) PutReport(ctx context.Context, data []byte, extension string) (string, string, error) {

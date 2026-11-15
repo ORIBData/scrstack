@@ -290,6 +290,16 @@ func pipelineCommand() error {
 		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
 			go w.RunGenerations(ctx)
 		}
+		// Dependency-Track export (P2): configured through the API; this loop
+		// only pushes uploads while it is enabled there.
+		dtrackPush := 30 * time.Second
+		if seconds, err := strconv.Atoi(os.Getenv("SCRS_DTRACK_PUSH_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {
+			dtrackPush = time.Duration(seconds) * time.Second
+		}
+		if dtrackPush > 0 {
+			w.SBOMs, w.DTrackPrivateHosts = artifacts, netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))
+			go w.RunDependencyTrack(ctx, dtrackPush)
+		}
 		// NVD and CVE Program records for the CVEs the register references.
 		advisorySync := time.Minute
 		if seconds, err := strconv.Atoi(os.Getenv("SCRS_ADVISORY_SYNC_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {

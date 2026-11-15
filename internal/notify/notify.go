@@ -92,8 +92,9 @@ func EmitScoped(ctx context.Context, tx pgx.Tx, schema, eventType string, data a
 		return uuid.Nil, ErrInput
 	}
 	id := uuid.New()
+	now := time.Now().UTC()
 	payload, err := json.Marshal(map[string]any{
-		"event": map[string]any{"id": id, "type": eventType, "version": SchemaVersion, "time": time.Now().UTC()},
+		"event": map[string]any{"id": id, "type": eventType, "version": SchemaVersion, "time": now},
 		"data":  data,
 	})
 	if err != nil {
@@ -103,7 +104,17 @@ func EmitScoped(ctx context.Context, tx pgx.Tx, schema, eventType string, data a
 		only = []string{}
 	}
 	_, err = tx.Exec(ctx, `WITH scope AS (SELECT COALESCE(NULLIF($5::uuid,'00000000-0000-0000-0000-000000000000'),(SELECT a.connection_id FROM `+schema+`.assets a WHERE a.id=NULLIF($6::uuid,'00000000-0000-0000-0000-000000000000')))::text AS connection) INSERT INTO `+schema+`.webhook_deliveries(id,subscription_id,event_id,event_type,payload) SELECT gen_random_uuid(),s.id,$1,$2,$3 FROM `+schema+`.webhook_subscriptions s,scope WHERE s.enabled AND s.events ? $2 AND (cardinality($4::text[])=0 OR s.name=ANY($4::text[])) AND (s.connections='[]'::jsonb OR scope.connection IS NULL OR s.connections ? scope.connection)`, id, eventType, payload, only, scope.Connection, scope.Asset)
-	return id, err
+	if err != nil {
+		return id, err
+	}
+	live := LiveEvent{ID: id, Type: eventType, Time: now, Refs: refs(data)}
+	if scope.Connection != uuid.Nil {
+		live.Connection = &scope.Connection
+	}
+	if scope.Asset != uuid.Nil {
+		live.Asset = &scope.Asset
+	}
+	return id, announce(ctx, tx, schema, live)
 }
 
 type Subscription struct {

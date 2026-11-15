@@ -91,6 +91,12 @@ type Worker struct {
 	DepsDevMaxLookups int
 	// Reports stores compliance evidence reports (CMP-006).
 	Reports ReportStore
+	// SBOMs reads stored SBOMs for the Dependency-Track export (P2);
+	// DTrackPrivateHosts may be internal servers; DTrackHTTP overrides the
+	// guarded client (tests only).
+	SBOMs              SBOMReader
+	DTrackPrivateHosts map[string]bool
+	DTrackHTTP         *http.Client
 	// SAST is the scrs-sast analyzer service (M9); nil disables SAST and
 	// reachability. SASTDefaults apply where an asset sets nothing.
 	SAST         *sast.Client
@@ -453,7 +459,7 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 		return err
 	}
 	stages = append(stages, extra...)
-	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true, SASTTools: sastResult.SASTTools, SASTDisabledRules: sastResult.SASTDisabledRules, SASTExcludes: sastResult.SASTExcludes})
+	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true, SASTTools: sastResult.SASTTools, SASTDisabledRules: sastResult.SASTDisabledRules, SASTExcludes: sastResult.SASTExcludes, ProjectLicense: output.ProjectLicense})
 }
 
 // Maintain runs retention, idempotency expiry and optional default-branch
