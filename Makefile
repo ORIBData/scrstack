@@ -10,6 +10,7 @@ DOCKER ?= docker
 VERSION ?=
 SCRS_IMAGE ?=
 SCRS_SAST_IMAGE ?=
+SCRS_QA_RUNNER_IMAGE ?=
 IMAGE_NAME ?= scrs
 PLATFORMS ?= linux/amd64,linux/arm64
 DOCKERHUB_REPO ?=
@@ -26,6 +27,7 @@ help:
 	@echo 'contract-check  Validate the published OpenAPI route paths'
 	@echo 'image           Build a local SCRS API image'
 	@echo 'image-reference Print the resolved SCRS_IMAGE release tag'
+	@echo 'sast-image-reference, qa-runner-image-reference  Print the resolved SCRS_SAST_IMAGE and SCRS_QA_RUNNER_IMAGE tags'
 	@echo 'image-audit     Generate SBOM and vulnerability evidence for a local image'
 	@echo 'database-test   Exercise concurrency, tokens, lifecycle and PostgreSQL restore'
 	@echo 'legacy-integration  Test the internal legacy scanner with ClamAV fixtures'
@@ -33,7 +35,7 @@ help:
 	@echo 'qa-runner-image Build the Karate runner image (E2E QA)'
 	@echo 'qa-runner-test  Test the runner with the pinned Karate jar (needs Java 21)'
 	@echo 'qa-runner-image-test  Test API, UI and load runs in a hardened runner container'
-	@echo 'release-qa-runner  Push SCRS_QA_RUNNER_IMAGE (Karate runner) for the Dokploy stack'
+	@echo 'release-qa-runner  Push SCRS_QA_RUNNER_IMAGE (Karate runner, from .env) for the Dokploy stack'
 	@echo 'clean           Remove older local SCRS images; keep newest and container-used images'
 	@echo 'clean-dry-run   Preview which local SCRS image tags would be removed'
 	@echo 'storage-check   Test the configured PostgreSQL, Redis and S3 stores'
@@ -101,9 +103,15 @@ storage-integration:
 release:
 	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_IMAGE)" PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py bash scripts/release.sh
 
-.PHONY: image-reference
+.PHONY: image-reference sast-image-reference qa-runner-image-reference
 image-reference:
 	@SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py
+
+sast-image-reference:
+	@SCRS_IMAGE_KEY=SCRS_SAST_IMAGE SCRS_IMAGE="$(SCRS_SAST_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO= python3 scripts/image_reference.py
+
+qa-runner-image-reference:
+	@SCRS_IMAGE_KEY=SCRS_QA_RUNNER_IMAGE SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO= python3 scripts/image_reference.py
 
 .PHONY: image-audit qa
 image-audit:
@@ -124,15 +132,14 @@ qa-runner-image:
 	$(DOCKER) build -f deploy/karate-runner/Dockerfile -t $(QA_RUNNER_IMAGE) .
 
 # Publishes the runner image the Dokploy stack deploys as scrs-qa-runner.
-# SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}
-SCRS_QA_RUNNER_IMAGE ?=
+# SCRS_QA_RUNNER_IMAGE (from .env, or on the command line) is a template like
+# registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}.
 release-qa-runner:
-	@test -n "$(SCRS_QA_RUNNER_IMAGE)" || { echo 'Set SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}' >&2; exit 2; }
-	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_QA_RUNNER_IMAGE SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
 
+# SCRS_SAST_IMAGE comes from .env, or the command line, like SCRS_IMAGE.
 release-sast:
-	@test -n "$(SCRS_SAST_IMAGE)" || { echo 'Set SCRS_SAST_IMAGE=registry/namespace/scrs-sast:scrs_YYYY_MM_DD_v{shortSHA256}' >&2; exit 2; }
-	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_SAST_IMAGE)" SCRS_DOCKERFILE=deploy/Dockerfile.sast PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_SAST_IMAGE SCRS_IMAGE="$(SCRS_SAST_IMAGE)" SCRS_DOCKERFILE=deploy/Dockerfile.sast PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
 
 qa-runner-test:
 	@mkdir -p bin
