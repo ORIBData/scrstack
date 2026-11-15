@@ -18,6 +18,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
+	"github.com/ORIBData/scrstack/internal/sast"
 	"github.com/ORIBData/scrstack/internal/scanner"
 	"github.com/ORIBData/scrstack/internal/storage"
 	"github.com/ORIBData/scrstack/internal/worker"
@@ -35,7 +36,13 @@ func pipelineCommand() error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	switch os.Args[1] {
 	case "egress-proxy":
-		server := &http.Server{Addr: ":8082", Handler: scanner.EgressProxy(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+		// The go-modules profile serves the SAST analyzers' module downloads
+		// only; the default serves remediation planning.
+		proxy := scanner.EgressProxy()
+		if os.Getenv("SCRS_EGRESS_PROFILE") == "go-modules" {
+			proxy = scanner.EgressProxyFor(scanner.GoModuleHosts)
+		}
+		server := &http.Server{Addr: ":8082", Handler: proxy, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
 		go func() { <-ctx.Done(); _ = server.Close() }()
 		err := server.ListenAndServe()
 		if errors.Is(err, http.ErrServerClosed) {
@@ -81,6 +88,43 @@ func pipelineCommand() error {
 				}
 			}
 			logger.Warn("clamd reload not confirmed; rules apply at its next SelfCheck")
+		}
+		return nil
+	case "sast":
+		// M9: static analyzers and Go reachability, in the scrs-sast image.
+		token := os.Getenv("SCRS_SAST_API_TOKEN")
+		if len(token) < 32 || strings.HasPrefix(token, "REPLACE") {
+			return errors.New("set a random SCRS_SAST_API_TOKEN of at least 32 characters")
+		}
+		paths := sast.DefaultPaths
+		engine := sast.New(paths, setting("SCRS_OSV_DB", "/feeds/current"), os.Getenv("SCRS_SAST_GO_PROXY"), strings.Split(setting("SCRS_SAST_ANALYZERS", "gosec,bandit,opengrep,bearer"), ","))
+		slots := 1
+		if n, err := strconv.Atoi(os.Getenv("SCRS_SAST_SLOTS")); err == nil && n > 0 && n <= 8 {
+			slots = n
+		}
+		service := &sast.Server{Engine: engine, WorkRoot: setting("SCRS_WORK_ROOT", "/work"), Slots: slots}
+		server := &http.Server{Addr: setting("SCRS_SAST_ADDR", ":8083"), Handler: service.Handler(token), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Minute, WriteTimeout: 50 * time.Minute, IdleTimeout: 30 * time.Second, MaxHeaderBytes: 16 << 10}
+		go func() {
+			<-ctx.Done()
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdown)
+		}()
+		logger.Info("SAST analyzers listening", "addr", server.Addr, "analyzers", setting("SCRS_SAST_ANALYZERS", "gosec,bandit,opengrep,bearer"))
+		err := server.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case "sast-healthcheck":
+		client := &http.Client{Timeout: 20 * time.Second}
+		response, err := client.Get("http://127.0.0.1" + setting("SCRS_SAST_ADDR", ":8083") + "/healthz")
+		if err != nil {
+			return errors.New("SAST service unavailable")
+		}
+		defer response.Body.Close()
+		if response.StatusCode != 200 {
+			return errors.New("an enabled analyzer is unavailable")
 		}
 		return nil
 	case "scanner-healthcheck":
@@ -246,6 +290,16 @@ func pipelineCommand() error {
 		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
 			go w.RunGenerations(ctx)
 		}
+		// Dependency-Track export (P2): configured through the API; this loop
+		// only pushes uploads while it is enabled there.
+		dtrackPush := 30 * time.Second
+		if seconds, err := strconv.Atoi(os.Getenv("SCRS_DTRACK_PUSH_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {
+			dtrackPush = time.Duration(seconds) * time.Second
+		}
+		if dtrackPush > 0 {
+			w.SBOMs, w.DTrackPrivateHosts = artifacts, netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))
+			go w.RunDependencyTrack(ctx, dtrackPush)
+		}
 		// NVD and CVE Program records for the CVEs the register references.
 		advisorySync := time.Minute
 		if seconds, err := strconv.Atoi(os.Getenv("SCRS_ADVISORY_SYNC_SECONDS")); err == nil && seconds >= 0 && seconds <= 3600 {
@@ -272,10 +326,50 @@ func pipelineCommand() error {
 			w.Reports = artifacts
 			go w.RunReports(ctx, reportPoll)
 		}
+		// SAST analyzers and Go reachability in the scrs-sast service (M9).
+		w.SAST, w.SASTDefaults, w.SASTTimeout, err = sastFromEnv()
+		if err != nil {
+			return err
+		}
+		if raw := os.Getenv("SCRS_REACHABILITY_WEIGHTS"); raw != "" {
+			reach, not, ok := strings.Cut(raw, ",")
+			a, errA := strconv.Atoi(strings.TrimSpace(reach))
+			b, errB := strconv.Atoi(strings.TrimSpace(not))
+			if !ok || errA != nil || errB != nil || a < 0 || a > 50 || b > 0 || b < -50 {
+				return errors.New("SCRS_REACHABILITY_WEIGHTS must be <reachable 0..50>,<not reachable -50..0>, for example 10,-15")
+			}
+			w.ReachabilityWeights = &[2]int{a, b}
+		}
 		go w.Maintain(ctx, time.Hour, rescan, mirror)
 		return w.Run(ctx)
 	}
 	return errors.New("unknown pipeline command")
+}
+
+// sastFromEnv returns the scrs-sast client (nil when SCRS_SAST_URL is
+// unset), the deployment defaults and the per-analyzer budget.
+func sastFromEnv() (*sast.Client, assessments.SASTDefaults, time.Duration, error) {
+	defaults := assessments.SASTDefaults{Enabled: os.Getenv("SCRS_SAST_ENABLED") == "true", Reachability: os.Getenv("SCRS_REACHABILITY_ENABLED") == "true"}
+	timeout := sast.DefaultTimeout
+	if raw := os.Getenv("SCRS_SAST_TIMEOUT"); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < time.Minute || d > time.Hour {
+			return nil, defaults, 0, errors.New("SCRS_SAST_TIMEOUT must be a duration from 1m to 1h")
+		}
+		timeout = d
+	}
+	url := os.Getenv("SCRS_SAST_URL")
+	if url == "" {
+		return nil, defaults, timeout, nil
+	}
+	token := os.Getenv("SCRS_SAST_API_TOKEN")
+	if len(token) < 32 || strings.HasPrefix(token, "REPLACE") {
+		return nil, defaults, 0, errors.New("SCRS_SAST_URL is set: set a random SCRS_SAST_API_TOKEN of at least 32 characters")
+	}
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+		return nil, defaults, 0, errors.New("SCRS_SAST_URL must be an http(s) URL")
+	}
+	return sast.NewClient(url, token), defaults, timeout, nil
 }
 
 // qaRunnerFromEnv returns the Karate runner client, or nil when

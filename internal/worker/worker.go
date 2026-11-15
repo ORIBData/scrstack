@@ -19,6 +19,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/depsdev"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
+	"github.com/ORIBData/scrstack/internal/sast"
 	"github.com/ORIBData/scrstack/internal/scanner"
 )
 
@@ -90,6 +91,20 @@ type Worker struct {
 	DepsDevMaxLookups int
 	// Reports stores compliance evidence reports (CMP-006).
 	Reports ReportStore
+	// SBOMs reads stored SBOMs for the Dependency-Track export (P2);
+	// DTrackPrivateHosts may be internal servers; DTrackHTTP overrides the
+	// guarded client (tests only).
+	SBOMs              SBOMReader
+	DTrackPrivateHosts map[string]bool
+	DTrackHTTP         *http.Client
+	// SAST is the scrs-sast analyzer service (M9); nil disables SAST and
+	// reachability. SASTDefaults apply where an asset sets nothing.
+	SAST         *sast.Client
+	SASTDefaults assessments.SASTDefaults
+	SASTTimeout  time.Duration
+	// ReachabilityWeights are the score changes for reachable and not
+	// reachable entries (REA-004); nil uses +10 and -15.
+	ReachabilityWeights *[2]int
 }
 
 // RunMirrors processes queued mirror requests one at a time. A bundle streams
@@ -253,6 +268,10 @@ func (w Worker) Run(ctx context.Context) error {
 		deadline := 5 * time.Minute
 		if a.Request.Target.Type == "image" {
 			deadline = 9 * time.Minute // registry download plus scan; lease is 10 minutes
+		} else if w.SAST != nil {
+			// Analyzers run one after another, then reachability; the lease is
+			// renewed meanwhile (analyzeSource).
+			deadline = sastDeadline(w.SASTTimeout)
 		}
 		jobCtx, cancel := context.WithTimeout(ctx, deadline)
 		err = w.run(jobCtx, &a)
@@ -427,12 +446,20 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	}
 	stages := []assessments.Stage{{Name: "resolve", Status: "ok"}, {Name: "fetch", Status: "ok"}}
 	stages = append(stages, output.Stages...)
+	// SAST entries and reachability before enrichment: safe versions and
+	// the SBOM are computed from the final findings.
+	var sastResult assessments.Result
+	analysed, err := w.analyzeSource(ctx, a, archive, &output, &sastResult)
+	if err != nil {
+		return err
+	}
+	stages = append(stages, analysed...)
 	extra, key, digest, err := w.enrich(ctx, *a, &output, commit)
 	if err != nil {
 		return err
 	}
 	stages = append(stages, extra...)
-	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
+	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true, SASTTools: sastResult.SASTTools, SASTDisabledRules: sastResult.SASTDisabledRules, SASTExcludes: sastResult.SASTExcludes, ProjectLicense: output.ProjectLicense})
 }
 
 // Maintain runs retention, idempotency expiry and optional default-branch

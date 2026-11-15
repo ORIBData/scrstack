@@ -33,6 +33,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		if stage.Name == "yara_x" && stage.Status != "ok" && stage.Status != "skipped" {
 			r.Complete = false
 		}
+		// SAST runs only where enabled; when it runs, a failed analyzer or a
+		// breached budget leaves the assessment incomplete (SAST-011).
+		if stage.Name == "sast" && stage.Status != "ok" {
+			r.Complete = false
+		}
 	}
 	for _, ok := range required {
 		if !ok {
@@ -179,6 +184,20 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		}
 		unique = append(unique, f)
 	}
+	// An inline suppression added for an open SAST entry is an integrity signal.
+	added, err := s.suppressionsAdded(ctx, tx, baseline, unique)
+	if err != nil {
+		return err
+	}
+	for _, f := range added {
+		f.Fingerprint = fingerprint(a, f)
+		if seen[f.Fingerprint] || len(unique) >= 10000 {
+			continue
+		}
+		seen[f.Fingerprint] = true
+		f.Change = "new"
+		unique = append(unique, f)
+	}
 	fingerprints := make([]string, len(unique))
 	for i, f := range unique {
 		fingerprints[i] = f.Fingerprint
@@ -233,13 +252,21 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if err = tx.SendBatch(ctx, batch).Close(); err != nil {
 		return err
 	}
+	// An entry suppressed only because a filter hid it is reported again once
+	// the filter is gone: reopen it (a person's suppression is left alone).
+	if _, err = tx.Exec(ctx, `WITH reopened AS (UPDATE `+s.schema+`.findings f SET status='open',revision=f.revision+1 WHERE f.fingerprint=ANY($1) AND f.type='sast' AND f.status='suppressed' AND (SELECT e.action FROM `+s.schema+`.finding_events e WHERE e.finding_id=f.id AND e.action<>'detected' ORDER BY e.id DESC LIMIT 1)='suppressed_by_configuration' RETURNING f.id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'reopened_filter_removed',jsonb_build_object('assessment_id',$2::text) FROM reopened`, fingerprints, a.ID); err != nil {
+		return err
+	}
 	// Only a scan of the ref's current head can close prior findings, and only
 	// for finding types whose producing stages completed. A webhook push names
 	// both commit and ref; ref_moved tells whether that commit is still the head.
 	// Change records (workflow changes, provider events) need human review and
 	// are never closed by absence.
 	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		if err := s.suppressConfigured(ctx, tx, a, r); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id NOT IN ('SCRS-WORKFLOW-CHANGE','SCRS-SAST-SUPPRESSION-ADDED') AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND (type<>'sast' OR evidence->>'tool'=ANY($5)) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable, nonNil(r.SASTTools))
 		if err != nil {
 			return err
 		}
@@ -273,7 +300,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	}
 	stages, _ := json.Marshal(r.Stages)
 	countJSON, _ := json.Marshal(counts)
-	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff)
+	var projectLicense []byte
+	if r.ProjectLicense != nil {
+		projectLicense, _ = json.Marshal(r.ProjectLicense)
+	}
+	_, err = tx.Exec(ctx, `UPDATE `+s.schema+`.assessments SET status='succeeded',verdict=$2,stages=$3,counts=$4,resolved_commit=$5,ref_moved=$6,sbom_key=$7,sbom_sha256=$8,diff=$9,project_license=$10,completed_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1`, a.ID, v, stages, countJSON, r.Commit, r.RefMoved, r.SBOMKey, r.SBOMSHA256, diff, projectLicense)
 	if err != nil {
 		return err
 	}
@@ -282,6 +313,9 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	}
 	done, err := scan(tx.QueryRow(ctx, `SELECT `+columns+` FROM `+s.schema+`.assessments WHERE id=$1`, a.ID))
 	if err != nil {
+		return err
+	}
+	if err := s.queueDTrack(ctx, tx, done, r.SBOMKey); err != nil {
 		return err
 	}
 	if err := s.emitCompletion(ctx, tx, done, created); err != nil {

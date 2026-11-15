@@ -90,6 +90,20 @@ type Report struct {
 	Categories   []CategoryResult    `json:"categories,omitempty"`
 	Unmapped     *Unmapped           `json:"unmapped,omitempty"`
 	Requirements []RequirementResult `json:"requirements,omitempty"`
+	STIG         *STIGSummary        `json:"stig,omitempty"`
+}
+
+// STIGSummary is the STIG view (CMP-004). Rule evidence is one of
+// open_findings, no_open_findings (SCRS scans give evidence for the rule
+// and report nothing open) or not_evidenced (manual review needed). It is
+// never a STIG checklist status: SCRS does not mark rules "Not a Finding".
+type STIGSummary struct {
+	Benchmark Benchmark `json:"benchmark"`
+	Rules     int       `json:"rules"`
+	// RulesByEvidence counts rules per evidence value.
+	RulesByEvidence map[string]int `json:"rules_by_evidence"`
+	// OpenByCAT counts rules with open findings per severity category.
+	OpenByCAT map[string]int `json:"rules_with_open_findings_by_cat"`
 }
 
 // Meta records what a report is about and when its data was read (CMP-006).
@@ -138,8 +152,11 @@ type CategoryResult struct {
 	BySeverity   map[string]int `json:"open_by_severity"`
 	MappedByCWE  int            `json:"mapped_by_cwe"`
 	MappedByType int            `json:"mapped_by_finding_type"`
-	CWEs         []CWECount     `json:"cwes"`
-	Trend        []Point        `json:"trend"`
+	// STIG rules only.
+	Severity string     `json:"severity,omitempty"`
+	Evidence string     `json:"evidence,omitempty"`
+	CWEs     []CWECount `json:"cwes"`
+	Trend    []Point    `json:"trend"`
 }
 
 // CWECount counts findings with one CWE.
@@ -226,6 +243,9 @@ func Build(p Pack, in Input) Report {
 	switch p.Kind {
 	case KindCWEMapping:
 		r.Categories, r.Unmapped = categories(p, in, considered)
+	case KindSTIG:
+		r.Categories, r.Unmapped = categories(p, in, considered)
+		r.STIG = stigSummary(p, r.Categories)
 	case KindPCIDSS:
 		r.Requirements = pci(p, in, considered, r.Gaps)
 	}
@@ -472,4 +492,31 @@ func pci(p Pack, in Input, findings []Finding, gapList []Gap) []RequirementResul
 		out = append(out, r)
 	}
 	return out
+}
+
+// stigSummary sets each rule's evidence and counts them.
+func stigSummary(p Pack, results []CategoryResult) *STIGSummary {
+	s := &STIGSummary{Rules: len(results), RulesByEvidence: map[string]int{"open_findings": 0, "no_open_findings": 0, "not_evidenced": 0}, OpenByCAT: map[string]int{"CAT I": 0, "CAT II": 0, "CAT III": 0}}
+	if p.Benchmark != nil {
+		s.Benchmark = *p.Benchmark
+	}
+	typed := map[string]bool{}
+	for _, id := range p.TypeCategories {
+		typed[id] = true
+	}
+	for i, c := range p.Categories {
+		r := &results[i]
+		r.Severity = c.Severity
+		switch {
+		case r.Open > 0:
+			r.Evidence = "open_findings"
+			s.OpenByCAT[c.Severity]++
+		case len(c.CWEs) > 0 || typed[c.ID]:
+			r.Evidence = "no_open_findings"
+		default:
+			r.Evidence = "not_evidenced"
+		}
+		s.RulesByEvidence[r.Evidence]++
+	}
+	return s
 }

@@ -1,0 +1,86 @@
+# SCRS SAST and reachability analyzer image (M9, ADR-018). It runs only the
+# `scrs sast` role: gosec, Bandit, OpenGrep and Bearer as sandboxed child
+# processes, and govulncheck Go call-graph reachability. It holds no SCRS secrets and
+# never runs project build, install or generate steps.
+ARG GO_VERSION=1.27.4
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd/scrs ./cmd/scrs
+COPY internal ./internal
+COPY api ./api
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/scrs ./cmd/scrs
+
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-alpine AS tools-build
+WORKDIR /tools
+COPY tools/sast/go.mod tools/sast/go.sum ./
+RUN go mod download
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X main.Version=2.30.0" -o /out/gosec github.com/securego/gosec/v2/cmd/gosec \
+ && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /out/govulncheck golang.org/x/vuln/cmd/govulncheck
+
+# Pinned release binaries and the OpenGrep rules, verified by SHA-256.
+FROM alpine:3.24 AS downloads
+ARG TARGETARCH
+ARG OPENGREP_VERSION=v2.0.0
+ARG OPENGREP_SHA256_AMD64=37e93f4da5fd04a18c5c1febbdd12f7e98dfccd4d0c9cf2593bcb25eeb462da0
+ARG OPENGREP_SHA256_ARM64=6257b65423a744b704af2ff9beeb8f222c2f6925236af386b56b031d4c06d6d8
+ARG BEARER_VERSION=2.1.3
+ARG BEARER_SHA256_AMD64=974d4ad7bb71bc578675684d444e345e8fbad91c85557aac035406ef5cc04c68
+ARG BEARER_SHA256_ARM64=93e340650311d4129689a25e7063dd146bcda2e33d22adf15ffba5fc8b112260
+ARG BEARER_RULES_VERSION=v0.48.4
+ARG BEARER_RULES_SHA256="javascript:08c12673a8bdcf0cb0332aac93c1657baba1d2d27503e954f564268f76482688 java:0b0c2ccfd10fa2b8d9df792274dc162fa9b058614bf2203449817c0ab5ee4bc3 php:4197647742328a32c0b4cd00feaa33ff125cf41ce8842369523346a722411ab0 ruby:86dd93dd2fe0ab95cc5bafd0ab4722aa60733c8722774b2029e4b1f81b42dfa0"
+ARG RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa
+ARG RULES_SHA256=9a5f1cd5c625418cc1c776120123e2d4371df9bb66e099426b17c3488e13619d
+RUN apk add --no-cache curl \
+ && case "$TARGETARCH" in amd64) og=x86; ogsum=$OPENGREP_SHA256_AMD64; bsum=$BEARER_SHA256_AMD64 ;; arm64) og=aarch64; ogsum=$OPENGREP_SHA256_ARM64; bsum=$BEARER_SHA256_ARM64 ;; *) exit 1 ;; esac \
+ && mkdir -p /out/bin /out/rules \
+ && curl -fsSL -o /out/bin/opengrep "https://github.com/opengrep/opengrep/releases/download/${OPENGREP_VERSION}/opengrep_linux_${og}" \
+ && echo "${ogsum}  /out/bin/opengrep" | sha256sum -c - && chmod 0755 /out/bin/opengrep \
+ && curl -fsSL -o /tmp/bearer.tgz "https://github.com/Bearer/bearer/releases/download/v${BEARER_VERSION}/bearer_${BEARER_VERSION}_linux_${TARGETARCH}.tar.gz" \
+ && echo "${bsum}  /tmp/bearer.tgz" | sha256sum -c - && tar -xzf /tmp/bearer.tgz -C /out/bin bearer \
+ && curl -fsSL -o /tmp/rules.tgz "https://codeload.github.com/opengrep/opengrep-rules/tar.gz/${RULES_COMMIT}" \
+ && echo "${RULES_SHA256}  /tmp/rules.tgz" | sha256sum -c - \
+ && mkdir /tmp/rules && tar -xzf /tmp/rules.tgz -C /tmp/rules --strip-components=1 \
+ && cp /tmp/rules/LICENSE /out/rules/LICENSE \
+ && cd /tmp/rules && for lang in javascript typescript java kotlin swift scala php ruby csharp c rust bash html dockerfile; do \
+      find "$lang" -type f \( -name '*.yaml' -o -name '*.yml' \) ! -name '*.test.yaml' -exec install -D -m 0644 {} /out/rules/{} \; ; done \
+ && echo "$RULES_COMMIT" > /out/rules/COMMIT \
+ && mkdir -p /out/bearer-rules \
+ && for entry in $BEARER_RULES_SHA256; do lang=${entry%%:*}; sum=${entry#*:}; \
+      curl -fsSL -o /tmp/br.tgz "https://github.com/Bearer/bearer-rules/releases/download/${BEARER_RULES_VERSION}/${lang}.tar.gz" \
+      && echo "${sum}  /tmp/br.tgz" | sha256sum -c - && tar -xzf /tmp/br.tgz -C /out/bearer-rules; done \
+ && echo "$BEARER_RULES_VERSION" > /out/bearer-rules/VERSION
+
+FROM python:3.13-slim-bookworm
+LABEL io.scrs.project="scrstack" \
+      org.opencontainers.image.title="SCRS SAST analyzers" \
+      org.opencontainers.image.description="gosec, Bandit, OpenGrep and Bearer static analysis and Go reachability for SCRS, run without SCRS secrets"
+COPY deploy/sast/requirements.txt /tmp/requirements.txt
+# git: Bearer reads repository context. Its configuration is never read
+# (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL=/dev/null), so a hostile repository
+# cannot point core.fsmonitor or hooks at a program.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt && rm /tmp/requirements.txt \
+ && rm -rf /root/.cache
+COPY --from=golang:1.27.4-bookworm /usr/local/go /usr/local/go
+COPY --from=build /out/scrs /usr/local/bin/scrs
+COPY --from=tools-build /out/gosec /out/govulncheck /usr/local/bin/
+COPY --from=downloads /out/bin/ /usr/local/bin/
+COPY --from=downloads /out/rules /opt/scrs/opengrep-rules
+COPY --from=downloads /out/bearer-rules /opt/scrs/bearer-rules
+# The toolchain never fetches another Go version, never uses cgo (no C
+# preprocessor on hostile preambles) and never vendors or writes go.mod.
+ENV PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin \
+    GOTOOLCHAIN=local CGO_ENABLED=0 GOFLAGS=-mod=mod GOTELEMETRY=off GOPROXY=off \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+    SEMGREP_SEND_METRICS=off BEARER_DISABLE_VERSION_CHECK=true
+USER 65532:65532
+EXPOSE 8083
+ENTRYPOINT ["/usr/local/bin/scrs"]
+CMD ["sast"]

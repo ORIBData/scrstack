@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -54,6 +55,32 @@ func (h reportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 201, pack)
+	case path == "/reports/frameworks/stig" && r.Method == http.MethodPost:
+		// CMP-004: import a DISA STIG benchmark (XCCDF XML or DISA's zip).
+		if !principal.Allows("admin") {
+			writeError(w, 403, "admin scope required")
+			return
+		}
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 40<<20))
+		if err != nil {
+			writeError(w, 413, "benchmark too large")
+			return
+		}
+		imported, err := compliance.ImportSTIG(raw)
+		if err != nil {
+			if errors.Is(err, compliance.ErrSTIG) {
+				writeError(w, 400, err.Error())
+				return
+			}
+			licenseError(w, err)
+			return
+		}
+		if err := h.store.SaveFrameworkPack(ctx, imported.Pack, principal.ID); err != nil {
+			licenseError(w, err)
+			return
+		}
+		w.Header().Set("Location", BasePath+"/frameworks/"+imported.Pack.ID)
+		writeJSON(w, 201, imported)
 	case strings.HasPrefix(path, "/frameworks/"):
 		// One pack: /frameworks/{id} (/reports/{id} names report jobs).
 		id := strings.TrimPrefix(path, "/frameworks/")
@@ -94,7 +121,7 @@ func (h reportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		job, err := h.store.CreateReport(ctx, input, principal.ID)
 		if err != nil {
 			if err == assessments.ErrInput {
-				writeError(w, 400, "framework, scope (asset, owner or portfolio), format (json, csv, md) and a window of at most 366 days are required")
+				writeError(w, 400, "framework, scope (asset, owner or portfolio), format (json, csv, md or pdf) and a window of at most 366 days are required")
 				return
 			}
 			licenseError(w, err)

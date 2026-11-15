@@ -67,7 +67,51 @@ Every asset has a `distribution`: `internal`, `saas` (the default) or `distribut
 - Rules apply in order and the first match decides. Otherwise the matrix decides, then `default`.
 - `AND` takes the strictest result and `OR` the most lenient.
 
-`POST /policies/license:evaluate` is a dry run for counsel: it normalises the text and returns the decision with its basis (`rule:<n>`, `matrix:<category>/<distribution>` or `default`).
+`POST /policies/license:evaluate` is a dry run for counsel: it normalises the text and returns the decision with its basis (`rule:<n>`, `matrix:<category>/<distribution>` or `default`). With `project_license` it also returns the outbound check below.
+
+### Outbound compatibility (LIC-005, P2)
+
+The policy asks "may we use this licence in this kind of product?". The outbound check asks a second question: "can this dependency be combined into a project released under the project's own licence?".
+
+**Project licence:**
+- It is the repository's root licence file, detected with at least 90% confidence.
+- It is stored with the assessment and shown in the licence inventory (`project_license`, with `outbound` counts).
+- The check runs only when it names known open-source licences. A proprietary or unlicensed repository is left to the policy.
+- Root manifest fields (`package.json` `license`, `pyproject.toml`) are not read yet.
+
+**Which assets are checked:**
+
+| Distribution | Dependencies checked |
+| --- | --- |
+| `internal` | none |
+| `saas` | network copyleft, non-commercial and source-available licences only (they bind without distribution) |
+| `distributed` | every runtime dependency (dev dependencies never) |
+
+**Rules:** each pair is `allow`, `review` or `deny`, with a reason:
+- **deny:**
+  - GPL in a permissive or weak-copyleft project;
+  - Apache-2.0 in a GPL-2.0-only or LGPL-2.1-only project;
+  - GPL-2.0-only and GPL-3.0 code mixed;
+  - LGPL-3.0 code in a GPL-2.0-only project;
+  - EPL-1.0, CDDL or MPL-1.1 code in a GPL project;
+  - AGPL code outside an AGPL or GPL-3.0 project;
+  - non-commercial or source-available terms in any open-source project.
+- **review:**
+  - weak copyleft (LGPL, MPL, EPL-2.0) in a permissive project, which carries file-level or relinking duties;
+  - AGPL in a GPL-3.0 project (section 13);
+  - a GPL-3.0 dependency in a GPL-2.0-or-later project;
+  - proprietary or unknown terms.
+- **allow:** permissive licences (keep their notices), the same licence, and compatible copyleft combinations.
+- **Expressions:**
+  - A dependency `OR` takes its most lenient option and `AND` its strictest.
+  - A project `AND` takes the strictest result.
+  - A project `OR` gives `review` when its options disagree.
+
+**Entries:**
+- Each `review` or `deny` result is a `license` entry with advisory id `SCRS-LICENSE-OUTBOUND:<project licence>:<expression>`, next to the dependency's policy entry.
+- It follows the same gate (report-only: a deny warns), waivers and closure.
+
+This is a conservative aid for counsel, not legal advice.
 
 ### Entries, gate and waivers (LIC-006, LIC-008)
 
@@ -159,13 +203,49 @@ Candidates are the deps.dev version list (deprecated versions and pre-releases l
 
 **Custom packs:** admins upload `cwe_mapping` packs with `POST /reports/frameworks` (schema at `GET /schemas/framework-pack`) and read or delete them at `/frameworks/{id}`. Shipped ids are reserved.
 
+### STIG (CMP-004, P2)
+
+SCRS supports the DISA **Application Security and Development (ASD) STIG** by import. It ships no DISA content.
+
+1. **Import.** Download the STIG from DISA (cyber.mil). An admin uploads the zip, or its `*-xccdf.xml` file, with `POST /reports/frameworks/stig`.
+   - The upload is at most 40 MiB, and the parser resolves no external entities.
+   - It becomes a `stig` pack (`stig-<benchmark>-v<version>`).
+   - Every rule becomes a category, keyed by its STIG id (for example `APSC-DV-002540`) and stable across releases, with its CAT I to III severity, vulnerability and rule ids, and CCIs.
+2. **Starter mapping.** SCRS maps the rules its own scans can give evidence for (`internal/compliance/stig/asd-mapping.json`).
+
+   | STIG id | Rule | Evidence |
+   | --- | --- | --- |
+   | APSC-DV-002490 | Cross-site scripting | CWE-79 and related |
+   | APSC-DV-002500 | CSRF | CWE-352 |
+   | APSC-DV-002510 | Command injection | CWE-77, 78, 88 |
+   | APSC-DV-002520 | Canonical representation | CWE-22 and related |
+   | APSC-DV-002530 | Input validation | CWE-20 |
+   | APSC-DV-002540 | SQL injection | CWE-89 and related |
+   | APSC-DV-002550 | XML-oriented attacks | CWE-611, 776 and related |
+   | APSC-DV-002560 | Input handling (code injection, deserialisation) | CWE-94, 502 and related |
+   | APSC-DV-002570 | Error messages | CWE-209 |
+   | APSC-DV-002590 | Overflows | CWE-119, 120, 787 and related |
+   | APSC-DV-002630 | Security patches kept up to date | vulnerable and malicious dependencies |
+   | APSC-DV-003110 | Embedded authentication data | CWE-798 and secrets |
+
+   The import response lists `mapping_unmatched`: starter ids the uploaded release does not contain. Check them against your release before relying on the pack.
+3. **Adjust.** Download the pack (`GET /frameworks/{id}`), edit the CWE and `type_categories` mapping, and upload it with `POST /reports/frameworks`.
+
+**What a STIG report shows:**
+- Each rule has an `evidence` value:
+  - `open_findings`;
+  - `no_open_findings`: SCRS scans cover the rule and report nothing open;
+  - `not_evidenced`: needs manual review.
+- The `stig` summary counts rules by evidence and by CAT.
+- These values are not STIG checklist statuses. SCRS never marks a rule "Not a Finding" or "Not Applicable". Those calls belong to the assessor.
+
 ### Reports (CMP-002, CMP-003, CMP-006)
 
 `POST /reports` takes these fields:
 - `framework`;
 - `scope`: `asset`, `owner` or `portfolio`;
 - a window of `since` to `until`, at most 366 days (default the last 90);
-- `format`: `json`, `csv` or `md`;
+- `format`: `json`, `csv`, `md` or `pdf`;
 - `params`: `sbom_max_age_days` (default 30), `sla_critical_days` (30) and `sla_high_days` (90).
 
 The worker builds the report (`SCRS_REPORT_POLL_SECONDS`). Poll `GET /reports/{id}` and fetch `GET /reports/{id}/download`. The file is integrity-checked; its digest is in `ETag` and `X-SCRS-Report-SHA256`.
@@ -184,6 +264,13 @@ Every report records:
 | PCI DSS 6.3.1 | Open findings ranked by severity per asset, with known-exploited counts |
 | PCI DSS 6.3.2 | SBOM coverage and gaps |
 | PCI DSS 6.3.3 | Critical and high vulnerabilities open past their patch window, fixed within or after it, and the median days to fix |
+
+| STIG | Per rule: CAT, evidence (`open_findings`, `no_open_findings`, `not_evidenced`), open findings by severity; a summary by evidence and by CAT |
+
+**PDF (P2):**
+- A4 pages with the Markdown report's content, and a footer on every page saying the report carries no compliance verdict.
+- The pure-Go writer is part of SCRS (no browser and no extra library). It uses the standard Helvetica fonts and writes no timestamp, so the same report always produces the same bytes and SHA-256.
+- Characters outside Latin-1 print as `?`.
 
 **Retention:** files are stored under `reports/` in S3 in the `reports` retention class.
 
@@ -204,9 +291,14 @@ Every report records:
 | `internal/license` | Normalisation cases, categories and overrides, corporate-default (AT-25 decisions), rules, the policy schema, detection and every manifest parser |
 | `internal/sbom` | CycloneDX 1.6 and SPDX 2.3 validated against the official schemas, equal counts, licences and XML (AT-26) |
 | `internal/versions` | OSV range evaluation in npm, PyPI and Debian ordering, and the safe-version cases including a fix that a later advisory affects |
-| `internal/compliance` | Shipped packs, pack validation, category, unmapped, gap and PCI computations, and rendering without a verdict |
+| `internal/compliance` | Shipped packs, pack validation, category, unmapped, gap and PCI computations, and rendering without a verdict; XCCDF import (XML and DISA zip, entity and malformed uploads refused), STIG evidence values, and PDF structure (cross-reference offsets, escaping, page breaks, determinism; also read back with poppler) |
+| `internal/license` | Also the outbound compatibility rules (GPL versions, Apache-2.0, AGPL, exceptions, expressions) |
+| `TestPostgresP2Features` | STIG import and an edited pack through the API, a PDF report download, outbound entries and inventory counts against the repository licence, the evaluate dry run, the Dependency-Track export and live events |
 | `make scanner-test` | Declared licences and the package index with the real OSV-Scanner |
 | `TestPostgresLicencesSafeVersionsSBOMAndReports` | The worker end to end: deps.dev metadata and cache, entries and verdicts report-only and enforcing, waiver (AT-25), safe versions, generated SBOM against SPDX (AT-26), OWASP 2025 and PCI reports (AT-30) |
 | `TestPostgresLicenceAndComplianceAPI` | Every new endpoint through the real router, with scopes, `If-Match`, formats, downloads and audit records |
 
-**Not yet tried:** real deps.dev at volume, and counsel review of `corporate-default` (PRD Q24).
+**Not yet tried:**
+- real deps.dev at volume;
+- counsel review of `corporate-default` and of the outbound rules (PRD Q24);
+- a real DISA ASD STIG release against the starter mapping (the tests use a fixture shaped like DISA's XCCDF).

@@ -144,9 +144,6 @@ func TestBuildOWASPAndPCI(t *testing.T) {
 			}
 		}
 	}
-	if _, err := Render(r, "pdf"); err == nil {
-		t.Fatal("pdf rendered")
-	}
 	md, _ := Render(p, "md")
 	if !bytes.Contains(md, []byte("## Requirement 6.3.3")) || !bytes.Contains(md, []byte("org/none")) {
 		t.Fatalf("markdown %s", md)

@@ -306,6 +306,10 @@ Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
 | --- | --- | --- |
 | `SCRS_ADVISORY_SYNC_SECONDS` | worker | How often due NVD and CVE Program syncs are checked (default 60; 0 disables) |
 | `SCRS_NVD_API_KEY` | worker | Optional NVD API key: one request per 0.7 s instead of 6 s |
+| `SCRS_DTRACK_PUSH_SECONDS` | worker | How often queued Dependency-Track uploads are pushed (default 30; 0 disables). The export itself is enabled with `PUT /integrations/dependency-track` |
+| `SCRS_DTRACK_PRIVATE_HOSTS` | API, worker | Dependency-Track hostnames allowed to resolve to private addresses and use http (a server on the same network) |
+| `SCRS_EVENTS_MAX_STREAMS` | API | Live event streams (`GET /events`) per API instance (default 200) |
+| `SCRS_EVENTS_STREAMS_PER_TOKEN` | API | Live event streams per API token (default 5) |
 | `SCRS_NVD_API_URL`, `SCRS_CVE_API_URL` | worker | Override the NVD and CVE Services URLs (mirrors, tests) |
 | `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS` | API, worker | Retention default for a class the policy leaves not set (0 or empty keeps forever; `AUDIT_LOG` at least 365) |
 | `SCRS_RELEASE_FEED_URL` | API | Optional https JSON release feed for `GET /maintenance/versions` |
@@ -313,6 +317,29 @@ Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
 
 **Outbound access** from `scrs-worker` also includes
 `services.nvd.nist.gov` and `cveawg.mitre.org`.
+
+## SAST analyzers and reachability (M9)
+
+`scrs-sast` is a third image (`make release-sast SCRS_SAST_IMAGE=...`) in the same stack:
+- It sits on the internal `sast` network with the API and worker.
+- Its one route out is `scrs-sast-egress` (`SCRS_EGRESS_PROFILE=go-modules`: `proxy.golang.org` and `sum.golang.org` only).
+- It mounts `scrs-feeds` read-only for the Go advisory archive.
+- It is not published through Traefik.
+
+Tables `sast_settings`, `asset_sast_settings` and `sast_rulesets` are created by `scrs-storage-init`.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_SAST_IMAGE` | stack | Published scrs-sast image reference |
+| `SCRS_SAST_API_TOKEN` | API, worker, scrs-sast | Shared bearer token (32 or more random characters) |
+| `SCRS_SAST_URL` | API, worker | Default `http://scrs-sast:8083` |
+| `SCRS_SAST_ENABLED`, `SCRS_REACHABILITY_ENABLED` | API, worker | Deployment defaults (false); assets override them with `PUT /assets/{id}/sast` |
+| `SCRS_SAST_ANALYZERS` | scrs-sast | Analyzers allowed (default `gosec,bandit,opengrep,bearer`) |
+| `SCRS_SAST_TIMEOUT` | worker | Per-analyzer budget (default `10m`); a breach makes the assessment incomplete |
+| `SCRS_REACHABILITY_WEIGHTS` | worker | Score change for reachable and not reachable (default `10,-15`) |
+| `SCRS_SAST_SLOTS`, `SCRS_SAST_MEMORY`, `SCRS_SAST_WORK_SIZE` | scrs-sast | Concurrent analyses (1), memory (4g), tmpfs work area (4g) |
+
+**Outbound access** from `scrs-sast-egress`: `proxy.golang.org` and `sum.golang.org`. See [SAST.md](SAST.md).
 
 ## Licences, SBOM exports and compliance reports (M8)
 

@@ -375,17 +375,89 @@ The deployment test asserts the runner's labels, networks and lack of secrets. `
 
 **Not verified:** live deps.dev at volume, and counsel review of `corporate-default`.
 
-## Current status and remaining work (2026-11-14)
+## Addendum 2026-11-15: M9
 
-Delivered: M0–M8, the threat-intelligence module, and E2E QA (Karate). Remaining:
+**Delivered** (details in [SAST.md](SAST.md)):
+- **The `scrs-sast` image**: gosec, Bandit, OpenGrep and Bearer, pinned by hash or `go.sum`, as child processes behind one interface.
+- **Normalised `sast` entries** with CWE ids, location, data-flow steps and a code hash, with no snippet stored.
+- **A diff-aware gate**, inline suppressions recorded, and an integrity entry when a suppression is added for an open entry.
+- **Disabled rules, excludes and analyzer selection** globally and per asset, plus custom OpenGrep rulesets compiled before they are stored.
+- **Go reachability** with govulncheck: traces, `imported_only` and `not_reachable`, scoring, and `unknown` on failure.
+- **Lease renewal** for long analyzer runs.
 
-1. **M9 (next):** SAST analyzers (gosec, Bandit, Bearer), Go reachability and taint traces (spikes S10–S12).
-2. **P2:** Dependency-Track push, CPE matching (VUL-007), server-sent events, STIG (CMP-004) and PDF reports, outbound licence compatibility (LIC-005).
-3. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
-4. **Acceptance:**
+**Decisions and safeguards:**
+- **The analyzers have no network.** Go module downloads go only to `proxy.golang.org` and `sum.golang.org`, through a dedicated egress proxy.
+- **git configuration is ignored**, cgo is off, and no build, install or generate step runs.
+- **A failed analyzer or a breached budget makes the assessment incomplete.**
+- **Bearer and the OpenGrep rules are internal-use only** (ADR-029).
+- **Shield is a no-go for now** (S11).
+
+**Verified:**
+- the `internal/sast` and `internal/worker` unit tests and `make qa`;
+- spike S10 against the real image: every tool offline, and the hostile repository inert.
+
+**Verified on 2026-11-15:** `make database-test` (including `TestPostgresSASTAndReachabilityPipeline`) and `make sast-image-test` (AT-27, AT-28 and AT-29 against the real image).
+
+**Fixed by that verification and a review against the design decisions:**
+- **Busy slot:** the service freed its slot only after writing a response, so back-to-back requests were refused as busy. A busy service now makes the worker wait up to three minutes and then requeue the job without spending an attempt, as it does for the scanner.
+- **Job deadline:** repository jobs had a five-minute deadline, which would have cut every SAST run short. The deadline now covers the analyzer budgets, up to one hour, with the lease renewed meanwhile.
+- **Silent gosec gaps:** with `-quiet`, gosec printed nothing when clean and hid packages it could not load. Load failures now make its run `partial`, and gosec fetches modules through the go-modules proxy.
+- **Rule validation:** `opengrep validate` downloads lint rules from the internet; custom rules now compile offline.
+- **Closure:** an `ok` run closed the entries of analyzers that had been deselected. Only an entry's own analyzer can close it now.
+- **Canary check:** the hostile-repository check ran inside the container under test. It now runs from the host.
+- **Configured suppression:** disabling a SAST rule or excluding a path marked hidden entries `fixed`. They are now `suppressed` with the filter recorded.
+- **Orphan objects:** artifacts uploaded before a completion that never committed were never deleted. A daily, audited orphan sweep now removes unreferenced objects older than 24 hours.
+
+**Not verified:** run time on large repositories, and a false-negative study of reachability on our own services.
+
+## P2 addendum (2026-11-15)
+
+**Delivered:**
+- **Dependency-Track export (ADR-033).**
+  - Admin settings, with the key sealed and write-only.
+  - Uploads queued in `Complete`'s transaction and pushed by a leased worker loop through the egress guard, with backoff, a retry endpoint and 90-day pruning.
+- **Live events (OUT-004, ADR-030).**
+  - `GET /events` server-sent events announced with `pg_notify` inside the emitting transaction, so only committed events are streamed.
+  - Each stream sends ids only, has a per-write deadline in place of the server's write timeout, lasts at most 10 minutes, and is limited per instance and per token. Slow readers are dropped.
+  - Streams end when the server shuts down.
+- **ASD STIG (CMP-004, ADR-031).**
+  - XCCDF import (XML or DISA's zip, size-capped, no external entities) into an editable `stig` pack with a starter mapping.
+  - Rule evidence values that are never checklist statuses.
+- **PDF reports (ADR-032):** a built-in, deterministic writer.
+- **Outbound licence compatibility (LIC-005):**
+  - the repository licence is stored with the assessment;
+  - conservative pairwise rules;
+  - `SCRS-LICENSE-OUTBOUND` entries under the existing licence gate;
+  - inventory counts and a dry run.
+- **Deferred:** CPE matching (VUL-007). SCRS has no inventory of software without a package URL to match. Spike S14 plans the work.
+
+**Safeguards:**
+- **Schema changes** are additive and re-runnable: the report format check is dropped and re-added, and the test bootstraps the schema twice.
+- **Nothing new can fail an assessment.** A Dependency-Track outage or a stream error never touches assessment state.
+- **Outbound entries** are report-only until the licence policy is made enforcing.
+- **The contract** has 184 operations.
+
+**Verified on 2026-11-15:**
+- `make qa`, `make database-test` (race detector, including `TestPostgresP2Features`), and the new unit tests in `internal/compliance`, `internal/license`, `internal/notify` and `internal/dtrack`;
+- sample PDFs read back with poppler's `pdftotext`.
+
+**Not verified:**
+- a live Dependency-Track server (the tests use a fake that implements its upload, version and token endpoints);
+- a real DISA ASD STIG release;
+- event streams through Traefik on the VPS;
+- counsel review of the outbound rules.
+
+## Current status and remaining work (2026-11-15)
+
+Delivered: M0–M9, the threat-intelligence module, E2E QA (Karate), and the P2 features except CPE matching. Remaining:
+
+1. **P2:** CPE matching (VUL-007), after spike S14; reachability beyond Go (REA-005, REA-012).
+2. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
+3. **Acceptance:**
    - live Dokploy deployment with TLS;
    - real provider, registry, TAXII, NVD and LLM accounts;
    - the runner on the VPS;
    - backup and restore drills;
    - signed release manifests;
-   - the ClamAV image CVE review.
+   - the ClamAV image CVE review;
+   - a live Dependency-Track upload, a real ASD STIG release, and event streams through Traefik.

@@ -26,6 +26,8 @@ type MaintenanceReport struct {
 	Purged         map[string]int64 `json:"purged"`
 	ObjectsDeleted int              `json:"objects_deleted"`
 	ObjectErrors   int              `json:"object_errors"`
+	// OrphansDeleted counts unreferenced artifacts removed (at most daily).
+	OrphansDeleted int `json:"orphans_deleted"`
 }
 
 // Maintain applies the retention policy of every data class and expires
@@ -74,6 +76,9 @@ func (s *Store) Maintain(ctx context.Context, actor uuid.UUID, trigger string) (
 		return report, err
 	}
 	report.ObjectsDeleted, report.ObjectErrors = s.deleteObjects(context.WithoutCancel(ctx), freed)
+	// A failed sweep is recorded in scheduler_runs and retried next run;
+	// it never fails retention.
+	report.OrphansDeleted, _ = s.SweepOrphans(context.WithoutCancel(ctx), trigger == "manual")
 	return report, nil
 }
 

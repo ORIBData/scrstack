@@ -71,9 +71,11 @@ that finding type completed (for example inventory, SBOM and vulnerability match
 `vulnerability`). Types whose producing stage was partial or skipped retain history;
 integrity entries therefore stay open until reviewed while that stage remains partial.
 
-S3 success followed by a database failure can leave an unreferenced immutable object.
-This is intentional to avoid a database reference to a missing artifact. S3 garbage collection is not enabled. Raw webhook-event retention is available separately and defaults to keep forever. A production retention feature
-must reference-check objects and preserve audit/history before deletion.
+S3 success followed by a database failure (or a completion refused for a lost lease)
+leaves an unreferenced immutable object. This is intentional: it avoids a database
+reference to a missing artifact.
+
+**Orphan sweep:** once a day, maintenance deletes SBOMs, snapshots, remediation plans, QA reports and compliance reports that no row references and that are older than 24 hours, well past any job's deadline. Each sweep is audited (`retention.orphans_deleted`) and recorded in `GET /maintenance/schedule` (`orphan_sweep`). A manual `POST /maintenance:run` sweeps at once. Mirrors have their own retention.
 
 ## Deployment and resource boundaries
 
@@ -202,8 +204,8 @@ SHA-256 object-format repositories are not supported.
 
 The full list, by PRD milestone, is in the README roadmap. For this pipeline:
 
-- Built-in SAST and reachability analysis (M9). SARIF import covers external SAST
-  tools meanwhile.
+- SAST and Go reachability run in `scrs-sast` when enabled (M9, see [SAST.md](SAST.md));
+  reachability beyond Go is unsupported.
 - NVD, CVE Program and VEX/CSAF advisory sources, and the source registry with per-source health (M4).
 - Retention classes beyond raw inbound events and the webhook delivery log, and the
   reset/rebuild/sensor-update maintenance actions (M5).

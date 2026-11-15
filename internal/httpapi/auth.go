@@ -16,6 +16,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
+	"github.com/ORIBData/scrstack/internal/sast"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -58,6 +59,18 @@ type Security struct {
 	QAReports       QAReportReader
 	QARunner        *qa.Runner
 	LLMPrivateHosts map[string]bool
+	// SAST is the scrs-sast service client (M9); SASTDefaults are the
+	// deployment defaults for SAST and reachability.
+	SAST         *sast.Client
+	SASTDefaults assessments.SASTDefaults
+	// Live fans committed events out to GET /events streams (OUT-004);
+	// nil answers 503.
+	Live *notify.Hub
+	// DTrackPrivateHosts may be internal Dependency-Track servers
+	// (SCRS_DTRACK_PRIVATE_HOSTS); DTrackHTTP overrides the guarded client
+	// (tests only).
+	DTrackPrivateHosts map[string]bool
+	DTrackHTTP         *http.Client
 }
 
 var tokenWindow = redis.NewScript(`
@@ -147,6 +160,12 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		if sealer, ok := store.(Sealer); ok && secrets == nil {
 			secrets = sealer
 		}
+		dtrackAPI := security.protect("read|write", dtrackHandler{store: security.Assessments, secrets: secrets, hosts: security.DTrackPrivateHosts, client: security.DTrackHTTP})
+		mux.Handle("GET "+BasePath+"/integrations/dependency-track", dtrackAPI)
+		mux.Handle("PUT "+BasePath+"/integrations/dependency-track", dtrackAPI)
+		mux.Handle("POST "+BasePath+"/integrations/dependency-track:test", dtrackAPI)
+		mux.Handle("GET "+BasePath+"/integrations/dependency-track/uploads", dtrackAPI)
+		mux.Handle("POST "+BasePath+"/integrations/dependency-track/uploads/{id}/retry", dtrackAPI)
 		sources := security.protect("read|write", sourceHandler{store: security.Assessments, validate: validate, compiles: compiles, secrets: secrets, taxiiHosts: security.TAXIIPrivateHosts})
 		mux.Handle(BasePath+"/intel/indicator-sources", sources)
 		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
@@ -202,9 +221,11 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/reports/licenses", licenses)
 		mux.Handle("GET "+BasePath+"/assets/{id}/licenses", licenses)
 		mux.Handle("GET "+BasePath+"/assets/{id}/licenses/notices", licenses)
+		mux.Handle("GET "+BasePath+"/events", security.protect("read|write", eventStream{hub: security.Live, lifetime: streamLifetime}))
 		reports := security.protect("read|write", reportHandler{store: security.Assessments, artifacts: security.Artifacts})
 		mux.Handle("GET "+BasePath+"/reports/frameworks", reports)
 		mux.Handle("POST "+BasePath+"/reports/frameworks", reports)
+		mux.Handle("POST "+BasePath+"/reports/frameworks/stig", reports)
 		mux.Handle("GET "+BasePath+"/frameworks/{id}", reports)
 		mux.Handle("DELETE "+BasePath+"/frameworks/{id}", reports)
 		mux.Handle("GET "+BasePath+"/reports", reports)
@@ -214,6 +235,18 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/schemas/{name}", security.protect("read|write|trigger", http.HandlerFunc(schemaDocuments)))
 		sboms := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts}
 		mux.Handle("GET "+BasePath+"/sboms/{id}/download", security.protect("read|write", http.HandlerFunc(sboms.sbomDownload)))
+		// M9: SAST analyzers, settings, rulesets and reachability.
+		sastAPI := security.protect("read|write", sastHandler{store: security.Assessments, client: security.SAST, defaults: security.SASTDefaults})
+		mux.Handle("GET "+BasePath+"/sast/analyzers", sastAPI)
+		mux.Handle("GET "+BasePath+"/reachability/capabilities", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/settings", sastAPI)
+		mux.Handle("PUT "+BasePath+"/sast/settings", sastAPI)
+		mux.Handle("GET "+BasePath+"/assets/{id}/sast", sastAPI)
+		mux.Handle("PUT "+BasePath+"/assets/{id}/sast", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/rulesets", sastAPI)
+		mux.Handle("POST "+BasePath+"/sast/rulesets", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/rulesets/{id}", sastAPI)
+		mux.Handle("DELETE "+BasePath+"/sast/rulesets/{id}", sastAPI)
 		mux.Handle("GET "+BasePath+"/audit", security.protect("admin", auditHandler{security.Assessments}))
 		mux.Handle("GET "+BasePath+"/schemas/events", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))
 		mux.Handle("GET "+BasePath+"/schemas/events/{type}/{version}", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))

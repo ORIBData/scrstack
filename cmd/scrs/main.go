@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,7 +25,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy" || os.Args[1] == "yara-install") {
+	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy" || os.Args[1] == "yara-install" || os.Args[1] == "sast" || os.Args[1] == "sast-healthcheck") {
 		if err := pipelineCommand(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -176,9 +177,22 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(2)
 	}
+	sastClient, sastDefaults, _, err := sastFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(2)
+	}
+	// OUT-004: live event streams on this instance.
+	live := &notify.Hub{MaxStreams: 200, PerToken: 5, Logger: logger}
+	if n, err := strconv.Atoi(os.Getenv("SCRS_EVENTS_MAX_STREAMS")); err == nil && n > 0 && n <= 10000 {
+		live.MaxStreams = n
+	}
+	if n, err := strconv.Atoi(os.Getenv("SCRS_EVENTS_STREAMS_PER_TOKEN")); err == nil && n > 0 && n <= 100 {
+		live.PerToken = n
+	}
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,
@@ -187,6 +201,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// Streams never finish on their own: end them when shutdown starts.
+	server.RegisterOnShutdown(live.Close)
+	go events.Listen(ctx, live)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

@@ -1,0 +1,187 @@
+{
+ "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+ "version": "2.1.0",
+ "runs": [
+  {
+   "tool": {
+    "driver": {
+     "name": "Bearer",
+     "rules": [
+      {
+       "id": "javascript_express_helmet_missing",
+       "name": "javascript_express_helmet_missing",
+       "shortDescription": {
+        "text": "Missing Helmet configuration on HTTP headers"
+       },
+       "defaultConfiguration": {
+        "level": "error"
+       }
+      },
+      {
+       "id": "javascript_lang_eval_user_input",
+       "name": "javascript_lang_eval_user_input",
+       "shortDescription": {
+        "text": "Unsanitized user input in 'eval' type function"
+       },
+       "defaultConfiguration": {
+        "level": "error"
+       }
+      },
+      {
+       "id": "javascript_lang_raw_html_using_user_input",
+       "name": "javascript_lang_raw_html_using_user_input",
+       "shortDescription": {
+        "text": "Unsanitized user input in raw HTML strings (XSS)"
+       },
+       "defaultConfiguration": {
+        "level": "error"
+       }
+      },
+      {
+       "id": "javascript_express_reduce_fingerprint",
+       "name": "javascript_express_reduce_fingerprint",
+       "shortDescription": {
+        "text": "Missing server configuration to reduce server fingerprinting"
+       },
+       "defaultConfiguration": {
+        "level": "error"
+       }
+      },
+      {
+       "id": "javascript_express_cross_site_scripting",
+       "name": "javascript_express_cross_site_scripting",
+       "shortDescription": {
+        "text": "Unsanitized user input in HTTP response (XSS)"
+       },
+       "defaultConfiguration": {
+        "level": "error"
+       }
+      }
+     ]
+    }
+   },
+   "results": [
+    {
+     "ruleId": "javascript_lang_eval_user_input",
+     "message": {
+      "text": "Unsanitized user input in 'eval' type function"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "web/src/index.ts"
+        },
+        "region": {
+         "startLine": 6,
+         "startColumn": 3,
+         "endColumn": 33,
+         "endLine": 6
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "7dd28e2d3043cfe0b0a819511d759f1a_0"
+     }
+    },
+    {
+     "ruleId": "javascript_express_cross_site_scripting",
+     "message": {
+      "text": "Unsanitized user input in HTTP response (XSS)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "web/src/index.ts"
+        },
+        "region": {
+         "startLine": 5,
+         "startColumn": 3,
+         "endColumn": 42,
+         "endLine": 5
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "b8eef1e60def54d151d51aa7f7245b9e_0"
+     }
+    },
+    {
+     "ruleId": "javascript_lang_raw_html_using_user_input",
+     "message": {
+      "text": "Unsanitized user input in raw HTML strings (XSS)"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "web/src/index.ts"
+        },
+        "region": {
+         "startLine": 5,
+         "startColumn": 12,
+         "endColumn": 31,
+         "endLine": 5
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "44eb3778dacb1160ee51ad3096ab7ca1_0"
+     }
+    },
+    {
+     "ruleId": "javascript_express_helmet_missing",
+     "message": {
+      "text": "Missing Helmet configuration on HTTP headers"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "web/src/index.ts"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 13,
+         "endColumn": 22,
+         "endLine": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "6922f0f161d9b78e918db9684fa596d7_0"
+     }
+    },
+    {
+     "ruleId": "javascript_express_reduce_fingerprint",
+     "message": {
+      "text": "Missing server configuration to reduce server fingerprinting"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "web/src/index.ts"
+        },
+        "region": {
+         "startLine": 2,
+         "startColumn": 13,
+         "endColumn": 22,
+         "endLine": 2
+        }
+       }
+      }
+     ],
+     "partialFingerprints": {
+      "primaryLocationLineHash": "0e543ef650664b095c13e85e796f7706_0"
+     }
+    }
+   ]
+  }
+ ]
+}

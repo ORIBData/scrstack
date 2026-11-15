@@ -1,0 +1,23 @@
+{
+  "benchmark": "Application Security and Development STIG",
+  "note": "SCRS starter mapping for the ASD STIG, keyed by STIG id; not a DISA product. Review it against your benchmark release",
+  "rules": {
+    "APSC-DV-002490": {"cwes": [79, 80, 83, 87]},
+    "APSC-DV-002500": {"cwes": [352]},
+    "APSC-DV-002510": {"cwes": [77, 78, 88]},
+    "APSC-DV-002520": {"cwes": [22, 23, 36, 73, 180]},
+    "APSC-DV-002530": {"cwes": [20, 1284]},
+    "APSC-DV-002540": {"cwes": [89, 564, 943]},
+    "APSC-DV-002550": {"cwes": [91, 611, 643, 776]},
+    "APSC-DV-002560": {"cwes": [94, 95, 470, 502, 915, 917, 1336]},
+    "APSC-DV-002570": {"cwes": [209, 210, 497]},
+    "APSC-DV-002590": {"cwes": [119, 120, 121, 122, 125, 190, 680, 787]},
+    "APSC-DV-002630": {"cwes": [1104]},
+    "APSC-DV-003110": {"cwes": [259, 321, 798]}
+  },
+  "types": {
+    "vulnerability": "APSC-DV-002630",
+    "malicious_dependency": "APSC-DV-002630",
+    "secret": "APSC-DV-003110"
+  }
+}

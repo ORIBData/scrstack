@@ -1,0 +1,457 @@
+{
+ "version": "2.1.0",
+ "runs": [
+  {
+   "invocations": [
+    {
+     "executionSuccessful": true,
+     "toolExecutionNotifications": []
+    }
+   ],
+   "results": [
+    {
+     "codeFlows": [
+      {
+       "message": {
+        "text": "Untrusted dataflow from /src/web/src/index.ts:4 to /src/web/src/index.ts:5"
+       },
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "message": {
+             "text": "Source: 'req.query' @ '/src/web/src/index.ts:4'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 25,
+              "endLine": 4,
+              "message": {
+               "text": "Source: 'req.query' @ '/src/web/src/index.ts:4'"
+              },
+              "snippet": {
+               "text": "req.query"
+              },
+              "startColumn": 16,
+              "startLine": 4
+             }
+            }
+           },
+           "nestingLevel": 0
+          },
+          {
+           "location": {
+            "message": {
+             "text": "Propagator : 'name' @ '/src/web/src/index.ts:4'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 13,
+              "endLine": 4,
+              "message": {
+               "text": "Propagator : 'name' @ '/src/web/src/index.ts:4'"
+              },
+              "snippet": {
+               "text": "name"
+              },
+              "startColumn": 9,
+              "startLine": 4
+             }
+            }
+           },
+           "nestingLevel": 0
+          },
+          {
+           "location": {
+            "message": {
+             "text": "Sink: '\"<h1>Hello \" + name' @ '/src/web/src/index.ts:5'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 31,
+              "endLine": 5,
+              "message": {
+               "text": "Sink: '\"<h1>Hello \" + name' @ '/src/web/src/index.ts:5'"
+              },
+              "snippet": {
+               "text": "\"<h1>Hello \" + name"
+              },
+              "startColumn": 12,
+              "startLine": 5
+             }
+            }
+           },
+           "nestingLevel": 0
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "fingerprints": {
+      "matchBasedId/v1": "90975553fe6db15b4300d91ef44e74a7f7d392edf2adb31787c3ada20aaaf30c4a061645d607eef7d799d61e3302b838465632c2a88de91ca123ecf8ba45c41e_0"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "/src/web/src/index.ts",
+         "uriBaseId": "%SRCROOT%"
+        },
+        "region": {
+         "endColumn": 31,
+         "endLine": 5,
+         "snippet": {
+          "text": "  res.send(\"<h1>Hello \" + name + \"</h1>\");"
+         },
+         "startColumn": 12,
+         "startLine": 5
+        }
+       }
+      }
+     ],
+     "message": {
+      "text": "User data flows into the host portion of this manually-constructed HTML. This can introduce a Cross-Site-Scripting (XSS) vulnerability if this comes from user-provided input. Consider using a sanitization library such as DOMPurify to sanitize the HTML within."
+     },
+     "properties": {},
+     "ruleId": "opt.scrs.opengrep-rules.javascript.express.security.injection.raw-html-format"
+    },
+    {
+     "codeFlows": [
+      {
+       "message": {
+        "text": "Untrusted dataflow from /src/web/src/index.ts:4 to /src/web/src/index.ts:5"
+       },
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "message": {
+             "text": "Source: 'req.query' @ '/src/web/src/index.ts:4'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 25,
+              "endLine": 4,
+              "message": {
+               "text": "Source: 'req.query' @ '/src/web/src/index.ts:4'"
+              },
+              "snippet": {
+               "text": "req.query"
+              },
+              "startColumn": 16,
+              "startLine": 4
+             }
+            }
+           },
+           "nestingLevel": 0
+          },
+          {
+           "location": {
+            "message": {
+             "text": "Propagator : 'name' @ '/src/web/src/index.ts:4'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 13,
+              "endLine": 4,
+              "message": {
+               "text": "Propagator : 'name' @ '/src/web/src/index.ts:4'"
+              },
+              "snippet": {
+               "text": "name"
+              },
+              "startColumn": 9,
+              "startLine": 4
+             }
+            }
+           },
+           "nestingLevel": 0
+          },
+          {
+           "location": {
+            "message": {
+             "text": "Sink: '\"<h1>Hello \" + name + \"</h1>\"' @ '/src/web/src/index.ts:5'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 41,
+              "endLine": 5,
+              "message": {
+               "text": "Sink: '\"<h1>Hello \" + name + \"</h1>\"' @ '/src/web/src/index.ts:5'"
+              },
+              "snippet": {
+               "text": "\"<h1>Hello \" + name + \"</h1>\""
+              },
+              "startColumn": 12,
+              "startLine": 5
+             }
+            }
+           },
+           "nestingLevel": 0
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "fingerprints": {
+      "matchBasedId/v1": "c80e7fe9b2f4ff6c1bcb62f07c35d474f9d3eccbeba4469fbc6a767f4e2c2c2466159f2b001d763be263603daceeb27f3a972c6d3222a4c863b9dffc4c679203_0"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "/src/web/src/index.ts",
+         "uriBaseId": "%SRCROOT%"
+        },
+        "region": {
+         "endColumn": 41,
+         "endLine": 5,
+         "snippet": {
+          "text": "  res.send(\"<h1>Hello \" + name + \"</h1>\");"
+         },
+         "startColumn": 12,
+         "startLine": 5
+        }
+       }
+      }
+     ],
+     "message": {
+      "text": "Detected directly writing to a Response object from user-defined input. This bypasses any HTML escaping and may expose your application to a Cross-Site-scripting (XSS) vulnerability. Instead, use 'resp.render()' to render safely escaped HTML."
+     },
+     "properties": {},
+     "ruleId": "opt.scrs.opengrep-rules.javascript.express.security.audit.xss.direct-response-write"
+    },
+    {
+     "fingerprints": {
+      "matchBasedId/v1": "dc38f21528d9021a6ea17e650c2e2ad2c776dd2ebafb34ee7a10c590486794d451a2dcee8ec3db7d2b080caf126668e20e09acc7d621425daf6601216693f668_0"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "/src/web/src/index.ts",
+         "uriBaseId": "%SRCROOT%"
+        },
+        "region": {
+         "endColumn": 33,
+         "endLine": 6,
+         "snippet": {
+          "text": "  eval(req.query.code as string);"
+         },
+         "startColumn": 3,
+         "startLine": 6
+        }
+       }
+      }
+     ],
+     "message": {
+      "text": "Detected the use of eval(). eval() can be dangerous if used to evaluate dynamic content. If this content can be input from outside the program, this may be a code injection vulnerability. Ensure evaluated content is not definable by external sources."
+     },
+     "properties": {},
+     "ruleId": "opt.scrs.opengrep-rules.javascript.browser.security.eval-detected"
+    },
+    {
+     "codeFlows": [
+      {
+       "message": {
+        "text": "Untrusted dataflow from /src/web/src/index.ts:6 to /src/web/src/index.ts:6"
+       },
+       "threadFlows": [
+        {
+         "locations": [
+          {
+           "location": {
+            "message": {
+             "text": "Source: 'req.query' @ '/src/web/src/index.ts:6'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 17,
+              "endLine": 6,
+              "message": {
+               "text": "Source: 'req.query' @ '/src/web/src/index.ts:6'"
+              },
+              "snippet": {
+               "text": "req.query"
+              },
+              "startColumn": 8,
+              "startLine": 6
+             }
+            }
+           },
+           "nestingLevel": 0
+          },
+          {
+           "location": {
+            "message": {
+             "text": "Sink: 'eval(req.query.code as string)' @ '/src/web/src/index.ts:6'"
+            },
+            "physicalLocation": {
+             "artifactLocation": {
+              "uri": "/src/web/src/index.ts"
+             },
+             "region": {
+              "endColumn": 33,
+              "endLine": 6,
+              "message": {
+               "text": "Sink: 'eval(req.query.code as string)' @ '/src/web/src/index.ts:6'"
+              },
+              "snippet": {
+               "text": "eval(req.query.code as string)"
+              },
+              "startColumn": 3,
+              "startLine": 6
+             }
+            }
+           },
+           "nestingLevel": 0
+          }
+         ]
+        }
+       ]
+      }
+     ],
+     "fingerprints": {
+      "matchBasedId/v1": "3e86b1ea29d408b6cd45b7be9fbd43e9cbaa605f93d1a42bcc4ccc8a7b877979faf41f9969112dcfb01da5bf2371c9fd3cf570839c63171f50f49c00acbd673c_0"
+     },
+     "locations": [
+      {
+       "physicalLocation": {
+        "artifactLocation": {
+         "uri": "/src/web/src/index.ts",
+         "uriBaseId": "%SRCROOT%"
+        },
+        "region": {
+         "endColumn": 33,
+         "endLine": 6,
+         "snippet": {
+          "text": "  eval(req.query.code as string);"
+         },
+         "startColumn": 3,
+         "startLine": 6
+        }
+       }
+      }
+     ],
+     "message": {
+      "text": "Found data from an Express or Next web request flowing to `eval`. If this data is user-controllable this can lead to execution of arbitrary system commands in the context of your application process. Avoid `eval` whenever possible."
+     },
+     "properties": {},
+     "ruleId": "opt.scrs.opengrep-rules.javascript.lang.security.audit.code-string-concat"
+    }
+   ],
+   "tool": {
+    "driver": {
+     "name": "Opengrep",
+     "rules": [
+      {
+       "defaultConfiguration": {
+        "level": "warning"
+       },
+       "id": "opt.scrs.opengrep-rules.javascript.browser.security.eval-detected",
+       "name": "opt.scrs.opengrep-rules.javascript.browser.security.eval-detected",
+       "properties": {
+        "precision": "very-high",
+        "tags": [
+         "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+         "LOW CONFIDENCE",
+         "OWASP-A03:2021 - Injection",
+         "security"
+        ]
+       },
+       "shortDescription": {
+        "text": "Opengrep Finding: opt.scrs.opengrep-rules.javascript.browser.security.eval-detected"
+       }
+      },
+      {
+       "defaultConfiguration": {
+        "level": "warning"
+       },
+       "id": "opt.scrs.opengrep-rules.javascript.express.security.audit.xss.direct-response-write",
+       "name": "opt.scrs.opengrep-rules.javascript.express.security.audit.xss.direct-response-write",
+       "properties": {
+        "precision": "very-high",
+        "tags": [
+         "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+         "MEDIUM CONFIDENCE",
+         "OWASP-A03:2021 - Injection",
+         "OWASP-A07:2017 - Cross-Site Scripting (XSS)",
+         "security"
+        ]
+       },
+       "shortDescription": {
+        "text": "Opengrep Finding: opt.scrs.opengrep-rules.javascript.express.security.audit.xss.direct-response-write"
+       }
+      },
+      {
+       "defaultConfiguration": {
+        "level": "warning"
+       },
+       "id": "opt.scrs.opengrep-rules.javascript.express.security.injection.raw-html-format",
+       "name": "opt.scrs.opengrep-rules.javascript.express.security.injection.raw-html-format",
+       "properties": {
+        "precision": "very-high",
+        "tags": [
+         "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')",
+         "MEDIUM CONFIDENCE",
+         "OWASP-A03:2021 - Injection",
+         "OWASP-A07:2017 - Cross-Site Scripting (XSS)",
+         "security"
+        ]
+       },
+       "shortDescription": {
+        "text": "Opengrep Finding: opt.scrs.opengrep-rules.javascript.express.security.injection.raw-html-format"
+       }
+      },
+      {
+       "defaultConfiguration": {
+        "level": "error"
+       },
+       "id": "opt.scrs.opengrep-rules.javascript.lang.security.audit.code-string-concat",
+       "name": "opt.scrs.opengrep-rules.javascript.lang.security.audit.code-string-concat",
+       "properties": {
+        "precision": "very-high",
+        "tags": [
+         "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')",
+         "HIGH CONFIDENCE",
+         "OWASP-A03:2021 - Injection",
+         "security"
+        ]
+       },
+       "shortDescription": {
+        "text": "Opengrep Finding: opt.scrs.opengrep-rules.javascript.lang.security.audit.code-string-concat"
+       }
+      }
+     ],
+     "semanticVersion": "2.0.0"
+    }
+   }
+  }
+ ],
+ "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json"
+}

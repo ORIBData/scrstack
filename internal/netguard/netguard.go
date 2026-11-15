@@ -38,6 +38,10 @@ func Public(ip net.IP) bool {
 	return true
 }
 
+// ErrBlocked is returned for a destination that is not a public address
+// and not a named private host.
+var ErrBlocked = errors.New("destination address not permitted")
+
 // DialContext connects only to addresses it validated itself, so DNS cannot
 // rebind a public name to an internal service between check and connect.
 // Hosts in private (lower-case names) may resolve to non-public addresses.
@@ -55,7 +59,7 @@ func DialContext(private map[string]bool) func(ctx context.Context, network, add
 		allowed := private[strings.ToLower(host)]
 		for _, ip := range ips {
 			if !allowed && !Public(ip) {
-				return nil, errors.New("destination address not permitted")
+				return nil, ErrBlocked
 			}
 		}
 		return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].String(), port))

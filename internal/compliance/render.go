@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// Formats are the report formats of CMP-006 (PDF is P2).
-var Formats = []string{"json", "csv", "md"}
+// Formats are the report formats of CMP-006.
+var Formats = []string{"json", "csv", "md", "pdf"}
 
 // ContentType returns the media type of a report format.
 func ContentType(format string) string {
@@ -22,6 +22,8 @@ func ContentType(format string) string {
 		return "text/csv; charset=utf-8"
 	case "md":
 		return "text/markdown; charset=utf-8"
+	case "pdf":
+		return "application/pdf"
 	}
 	return "application/json"
 }
@@ -44,8 +46,10 @@ func Render(r Report, format string) ([]byte, error) {
 		return renderCSV(r)
 	case "md":
 		return renderMarkdown(r), nil
+	case "pdf":
+		return renderPDF(r), nil
 	}
-	return nil, errors.New("format must be json, csv or md")
+	return nil, errors.New("format must be json, csv, md or pdf")
 }
 
 func stamp(t *time.Time) string {
@@ -83,7 +87,11 @@ func renderCSV(r Report) ([]byte, error) {
 		for _, s := range severityOrder {
 			severities = append(severities, fmt.Sprintf("%s=%d", s, c.BySeverity[s]))
 		}
-		write("category", c.ID, c.Name, strconv.Itoa(c.Open), fmt.Sprintf("opened_in_window=%d closed_in_window=%d mapped_by_cwe=%d mapped_by_finding_type=%d %s", c.Opened, c.Closed, c.MappedByCWE, c.MappedByType, strings.Join(severities, " ")))
+		detail := fmt.Sprintf("opened_in_window=%d closed_in_window=%d mapped_by_cwe=%d mapped_by_finding_type=%d %s", c.Opened, c.Closed, c.MappedByCWE, c.MappedByType, strings.Join(severities, " "))
+		if c.Evidence != "" {
+			detail = fmt.Sprintf("cat=%s evidence=%s %s", strings.ReplaceAll(c.Severity, " ", "_"), c.Evidence, detail)
+		}
+		write("category", c.ID, c.Name, strconv.Itoa(c.Open), detail)
 	}
 	if u := r.Unmapped; u != nil {
 		write("unmapped", "no_cwe", "", strconv.Itoa(u.NoCWE), "")
@@ -145,7 +153,18 @@ func renderMarkdown(r Report) []byte {
 		fmt.Fprintf(&b, " Excluded types: %s.", strings.Join(kinds, ", "))
 	}
 	b.WriteString("\n\n")
-	if len(r.Categories) > 0 {
+	if st := r.STIG; st != nil {
+		fmt.Fprintf(&b, "## STIG: %s\n\n", escape(st.Benchmark.Title))
+		fmt.Fprintf(&b, "Benchmark %s, version %s, %s. Rules: %d; with open findings %d; mapped to SCRS evidence with nothing open %d; not evidenced by SCRS (manual review) %d.\n\n", escape(st.Benchmark.ID), escape(st.Benchmark.Version), escape(firstNonEmpty(st.Benchmark.Release, "release not stated")), st.Rules, st.RulesByEvidence["open_findings"], st.RulesByEvidence["no_open_findings"], st.RulesByEvidence["not_evidenced"])
+		b.WriteString("| STIG id | CAT | Evidence | Open | Critical | High | Title |\n| --- | --- | --- | --- | --- | --- | --- |\n")
+		for _, c := range r.Categories {
+			if c.Evidence == "not_evidenced" {
+				continue
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %d | %d | %d | %s |\n", c.ID, c.Severity, c.Evidence, c.Open, c.BySeverity["critical"], c.BySeverity["high"], escape(c.Name))
+		}
+		b.WriteString("\nRules not evidenced by SCRS scans are listed in the JSON and CSV formats.\n\n")
+	} else if len(r.Categories) > 0 {
 		b.WriteString("## Categories\n\n| Category | Open | Critical | High | Opened | Closed | By CWE | By type |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n")
 		for _, c := range r.Categories {
 			fmt.Fprintf(&b, "| %s %s | %d | %d | %d | %d | %d | %d | %d |\n", c.ID, escape(c.Name), c.Open, c.BySeverity["critical"], c.BySeverity["high"], c.Opened, c.Closed, c.MappedByCWE, c.MappedByType)
@@ -184,3 +203,93 @@ func firstNonEmpty(values ...string) string {
 }
 
 func escape(s string) string { return strings.NewReplacer("|", "\\|", "\n", " ").Replace(s) }
+
+// renderPDF lays out the same content as the Markdown report.
+func renderPDF(r Report) []byte {
+	m := r.Meta
+	title := m.Framework.Name + " " + m.Framework.Version + " evidence report"
+	d := newPDF(title)
+	d.paragraph(title, 16, true)
+	d.paragraph(r.Statement, 9, false)
+	d.table([]string{"Field", "Value"}, []float64{0.25, 0.75}, [][]string{
+		{"Scope", m.Scope.Kind + " " + firstNonEmpty(m.Scope.Name, scopeID(m.Scope))},
+		{"Window", m.Since.UTC().Format("2006-01-02") + " to " + m.Until.UTC().Format("2006-01-02")},
+		{"Data as of", m.DataAsOf.UTC().Format(time.RFC3339)},
+		{"SCRS version", m.Version},
+		{"Report id", m.ID.String()},
+		{"Mapping source", m.Framework.Source},
+	})
+	d.heading("Feed freshness", 12)
+	if len(r.Feeds) == 0 {
+		d.paragraph("No advisory sources recorded.", 9, false)
+	} else {
+		rows := [][]string{}
+		for _, f := range r.Feeds {
+			rows = append(rows, []string{f.Name, firstNonEmpty(stamp(f.LastSuccess), "never"), strconv.FormatBool(f.Stale)})
+		}
+		d.table([]string{"Source", "Last success", "Stale"}, []float64{0.5, 0.35, 0.15}, rows)
+	}
+	d.heading(fmt.Sprintf("Assets (%d) and SBOM gaps (%d)", len(r.Assets), len(r.Gaps)), 12)
+	if len(r.Gaps) == 0 {
+		d.paragraph("Every asset in scope has a recent SBOM.", 9, false)
+	} else {
+		rows := [][]string{}
+		for _, g := range r.Gaps {
+			rows = append(rows, []string{g.Locator, g.Reason})
+		}
+		d.table([]string{"Asset", "Gap"}, []float64{0.6, 0.4}, rows)
+	}
+	totals := fmt.Sprintf("Findings considered: %d (open %d, dismissed %d).", r.Totals.Considered, r.Totals.Open, r.Totals.Dismissed)
+	if len(r.Totals.Excluded) > 0 {
+		kinds := make([]string, 0, len(r.Totals.Excluded))
+		for k, n := range r.Totals.Excluded {
+			kinds = append(kinds, fmt.Sprintf("%s %d", k, n))
+		}
+		sort.Strings(kinds)
+		totals += " Excluded types: " + strings.Join(kinds, ", ") + "."
+	}
+	d.paragraph(totals, 9, false)
+	if st := r.STIG; st != nil {
+		d.heading("STIG: "+st.Benchmark.Title, 12)
+		d.paragraph(fmt.Sprintf("Benchmark %s, version %s, %s. Rules: %d; with open findings %d; mapped to SCRS evidence with nothing open %d; not evidenced by SCRS scans (manual review) %d.", st.Benchmark.ID, st.Benchmark.Version, firstNonEmpty(st.Benchmark.Release, "release not stated"), st.Rules, st.RulesByEvidence["open_findings"], st.RulesByEvidence["no_open_findings"], st.RulesByEvidence["not_evidenced"]), 9, false)
+		rows := [][]string{}
+		for _, c := range r.Categories {
+			if c.Evidence != "not_evidenced" {
+				rows = append(rows, []string{c.ID, c.Severity, strings.ReplaceAll(c.Evidence, "_", " "), fmtInt(c.Open), c.Name})
+			}
+		}
+		d.table([]string{"STIG id", "CAT", "Evidence", "Open", "Title"}, []float64{0.17, 0.08, 0.15, 0.07, 0.53}, rows)
+		d.paragraph("Rules not evidenced by SCRS scans are listed in the JSON and CSV formats.", 8, false)
+	} else if len(r.Categories) > 0 {
+		d.heading("Categories", 12)
+		rows := [][]string{}
+		for _, c := range r.Categories {
+			rows = append(rows, []string{c.ID + " " + c.Name, fmtInt(c.Open), fmtInt(c.BySeverity["critical"]), fmtInt(c.BySeverity["high"]), fmtInt(c.Opened), fmtInt(c.Closed), fmtInt(c.MappedByCWE), fmtInt(c.MappedByType)})
+		}
+		d.table([]string{"Category", "Open", "Critical", "High", "Opened", "Closed", "By CWE", "By type"}, []float64{0.37, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09}, rows)
+	}
+	if u := r.Unmapped; u != nil {
+		d.paragraph(fmt.Sprintf("Unmapped: %d findings carry no CWE; %d carry CWEs outside this pack.", u.NoCWE, u.OutsidePack), 9, false)
+	}
+	for _, req := range r.Requirements {
+		d.heading("Requirement "+req.ID+": "+req.Title, 12)
+		d.paragraph(req.Evidence, 9, false)
+		keys := make([]string, 0, len(req.Metrics))
+		for k := range req.Metrics {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		rows := [][]string{}
+		for _, k := range keys {
+			raw, _ := json.Marshal(req.Metrics[k])
+			if len(raw) > 1200 {
+				raw = append(raw[:1200], []byte("...")...)
+			}
+			rows = append(rows, []string{k, string(raw)})
+		}
+		if len(rows) > 0 {
+			d.table([]string{"Metric", "Value"}, []float64{0.25, 0.75}, rows)
+		}
+	}
+	return d.bytes()
+}

@@ -45,6 +45,13 @@ func TestS3ArtifactsRoundTripAndTamper(t *testing.T) {
 	if err != nil || !bytes.Equal(plan, data) {
 		t.Fatal("plan roundtrip failed", err)
 	}
+	// The orphan sweep lists objects older than a cutoff, by prefix.
+	if old, err := a.ListObjects(ctx, "sbom/", time.Now().Add(time.Minute), 10); err != nil || len(old) != 1 || old[0] != key {
+		t.Fatalf("listing %v %v", old, err)
+	}
+	if recent, err := a.ListObjects(ctx, "sbom/", time.Now().Add(-time.Hour), 10); err != nil || len(recent) != 0 {
+		t.Fatalf("recent objects listed as old: %v %v", recent, err)
+	}
 	if _, err := a.GetSBOM(ctx, "../other-object"); err == nil {
 		t.Fatal("arbitrary object key accepted")
 	}

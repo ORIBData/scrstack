@@ -26,7 +26,7 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-015 | AES-256-GCM secrets under `SCRS_MASTER_KEY`, bound to their owner | Accepted |
 | ADR-016 | Fixed intervals and PostgreSQL locks; no cron library | Accepted |
 | ADR-017 | go-containerregistry for image pulls by digest | Accepted |
-| ADR-018 | SAST analyzers as sandboxed external processes | Proposed (M9) |
+| ADR-018 | SAST analyzers as sandboxed external processes in their own image | Accepted |
 | ADR-019 | Provider connections in encrypted rows; environment seeds the first | Accepted |
 | ADR-020 | OSV schema as the single advisory format | Accepted (amended) |
 | ADR-021 | E2E QA on an operator-hosted Karate runner, called by SCRS | Accepted |
@@ -36,6 +36,12 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-025 | Licence data: declared, then detected, then deps.dev metadata | Accepted |
 | ADR-026 | SCRS generates its SBOMs from its own component model | Accepted |
 | ADR-027 | Framework packs as versioned data with recorded mapping sources | Accepted |
+| ADR-028 | Go reachability with govulncheck on SCRS's own advisory feed | Accepted |
+| ADR-029 | Internal-use analyzer licences (Bearer, OpenGrep rules) | Accepted |
+| ADR-030 | Live events from PostgreSQL NOTIFY, not Redis Pub/Sub | Accepted |
+| ADR-031 | STIG by owner-uploaded XCCDF with an SCRS starter mapping | Accepted |
+| ADR-032 | PDF reports from a built-in, deterministic writer | Accepted |
+| ADR-033 | Dependency-Track export through a transactional upload queue | Accepted |
 
 ## ADR-001 Go module
 
@@ -47,16 +53,17 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 
 ## ADR-002 Repository and images
 
-**Decision:** SCRS lives in the fork of the ClamAV REST project, and the legacy scanner keeps working (`docs/DOKPLOY.md`). The PRD proposed two images. There are three trust boundaries:
-- the SCRS image (`deploy/Dockerfile.scrs`: API, worker, scanner, feed-sync, egress proxy);
+**Decision:** SCRS lives in the fork of the ClamAV REST project, and the legacy scanner keeps working (`docs/DOKPLOY.md`). The PRD proposed two images. There are four trust boundaries:
+- the SCRS image (`deploy/Dockerfile.scrs`: API, worker, scanner, feed-sync, egress proxies);
 - the official ClamAV image;
-- the Karate runner image (`deploy/karate-runner/Dockerfile`), which runs repository test code and holds no SCRS secrets.
+- the Karate runner image (`deploy/karate-runner/Dockerfile`), which runs repository test code and holds no SCRS secrets;
+- the SAST image (`deploy/Dockerfile.sast`), which reads repository code with bundled analyzers, has no network except Go module downloads, and holds no SCRS secrets (ADR-018).
 
-**Consequences:** two images are released (`make release`, `make release-qa-runner`). See ADR-021.
+**Consequences:** three images are released (`make release`, `make release-qa-runner`, `make release-sast`). See ADR-021 and ADR-018.
 
 ## ADR-003 Single binary with role sub-commands
 
-**Decision:** `scrs api`, `worker`, `scanner`, `feed-sync`, `egress-proxy`, `yara-install`, `init` and the maintenance commands come from one binary. The Karate runner is a separate small binary (`cmd/scrs-qa-runner`) because it ships in another image.
+**Decision:** `scrs api`, `worker`, `scanner`, `feed-sync`, `egress-proxy`, `yara-install`, `sast`, `init` and the maintenance commands come from one binary; the SAST image runs the same binary in its `sast` role. The Karate runner is a separate small binary (`cmd/scrs-qa-runner`) because it ships in another image.
 
 **Consequences:** each Compose service selects its role. Isolation comes from the container settings, not from the binary.
 
@@ -181,11 +188,40 @@ Connection rows carry a key id (`v1`) for future rotation.
 
 **Evidence:** `internal/scanner/image_test.go`.
 
-## ADR-018 SAST analyzers (proposed, M9)
+## ADR-018 SAST analyzers
 
-**Decision to build:** gosec, Bandit and Bearer as sandboxed external processes behind a Go interface, in a scanner image, never linked into SCRS.
+**Decision:** gosec, Bandit, OpenGrep and Bearer run as child processes behind one Go interface (`internal/sast`) in a separate image, `scrs-sast`, never linked into SCRS. The image runs the `scrs sast` role and serves only the worker and the API over the internal `sast` network.
 
-**Status:** not built. SARIF import covers external SAST tools meanwhile.
+**Why a separate image:**
+- the analyzers need a Python runtime, a Go toolchain and two native binaries, which would grow the scanner image;
+- SAST gets its own sandbox and budget.
+
+OpenGrep was added to the PRD's set because it is the only bundled analyzer for Kotlin and Swift, and it widens the JavaScript and TypeScript rules.
+
+**Consequences:**
+- A third image is released (`make release-sast`).
+- Results are normalised into `sast` entries, which gate only when new.
+- Inline suppressions are recorded, not lost, and a suppression added for an open entry is an integrity signal.
+
+**Evidence:** `internal/sast` tests, `TestPostgresSASTAndReachabilityPipeline`, `make sast-image-test` and spike S10.
+
+## ADR-028 Go reachability
+
+**Decision:** `govulncheck` (call graph) runs in `scrs-sast` against a vulnerability database the service builds from the OSV Go archive `scrs-feed-sync` keeps. It does not use OSV-Scanner's call analysis, which gives a yes/no answer without traces. Module sources come through `scrs-sast-egress` (go-modules profile).
+
+**Why:** traces (file and line), the import-only level, and no extra advisory source to sync.
+
+**Consequences:**
+- Failed, skipped and unsupported analyses are `unknown` or `unsupported`, never `not_reachable`.
+- Scores move by configured weights.
+- Nothing is closed for being unreachable.
+- Standard-library entries are `unknown`, because they would describe the analyzer's toolchain.
+
+## ADR-029 Internal-use analyzer licences
+
+**Decision:** the owner accepted Bearer's Elastic License 2.0 and the OpenGrep community rules' Commons Clause for internal use (PRD Q22, 2026-11-15). Both are recorded as `redistributable: false`.
+
+**Consequences:** any SCRS build distributed outside CreditChek, or offered as a service, must remove them (`SCRS_SAST_ANALYZERS=gosec,bandit` at minimum, and the image's bundled rules).
 
 ## ADR-019 Provider connections
 
@@ -196,6 +232,8 @@ Connection rows carry a key id (`v1`) for future rotation.
 **Decision:** matching runs only on OSV records, offline. NVD and CVE Program records are converted to OSV-schema records with `origin` `nvd` or `cve5`, and the original is stored verbatim (`advisory_records`). They enrich findings, adding severity sources and CWEs, but do not create matches. Aliases come from the OSV records.
 
 **Amendment:** there is no separate alias-graph table yet; findings carry OSV aliases.
+
+**Amendment (2026-11-15):** CPE matching (VUL-007) would be the first matcher outside OSV. It is deferred: SCRS has no inventory of software without a package URL (OSV-Scanner drops it, and image binaries are not identified), and the NVD sync stores no CPE applicability. Spike S14 decides it.
 
 ## ADR-021 E2E QA runner
 
@@ -265,3 +303,52 @@ Finding types without a CWE (vulnerable and malicious dependencies, integrity, s
 
 **Consequences:** reports state the pack version and source, count unmapped findings, and never compute a compliance verdict.
 
+## ADR-030 Live events
+
+**Decision:** `GET /events` streams server-sent events (OUT-004).
+- Every emitted event is also announced with `pg_notify` inside the transaction that records it.
+- Each API instance listens on one dedicated PostgreSQL connection and fans notices out to its streams.
+- The PRD named Redis Pub/Sub for this.
+
+**Why:**
+- A NOTIFY is delivered only after commit and never for a rolled-back change, so a stream cannot announce an assessment that does not exist.
+- Events are emitted inside transactions in both the API and the worker. Publishing to Redis after commit would mean changing every emitting call site.
+
+**Consequences:**
+- Delivery is fire-and-forget. Clients reload state on connect and on `resync`; webhooks remain the guaranteed path.
+- Notices carry ids only, within NOTIFY's 8000-byte limit.
+- Transactions that notify serialise briefly at commit, which is negligible at SCRS's event rate.
+- Streams are bounded per instance and per token, end after 10 minutes, and drop slow readers.
+- The schema-specific channel requires a direct PostgreSQL connection: a transaction-pooling proxy would break LISTEN.
+
+## ADR-031 STIG
+
+**Decision:** CMP-004 targets the DISA Application Security and Development STIG (answering PRD Q23).
+- An admin uploads DISA's XCCDF benchmark, and every rule becomes a category keyed by its STIG id.
+- SCRS ships a starter mapping of CWEs and finding types for the rules its scans can evidence. Admins edit the resulting pack.
+
+**Why:** SCRS bundles no DISA content, and STIG ids stay stable across releases. Starter entries missing from a release are reported, not silently ignored.
+
+**Consequences:** reports give each rule an evidence value (open findings, no open findings, not evidenced) and never a checklist status such as "Not a Finding".
+
+## ADR-032 PDF reports
+
+**Decision:** PDF is rendered in-process by a small writer in `internal/compliance` (PDF 1.4, standard Helvetica, Flate-compressed pages). It does not use a third-party library or a headless browser.
+
+**Why:**
+- No new dependency or container, and no network or file access.
+- No timestamps, so reports stay content-addressed: the same report gives the same SHA-256.
+
+**Consequences:** plain tabular layout, and Latin-1 text only (other characters print as `?`).
+
+## ADR-033 Dependency-Track export
+
+**Decision:**
+- When the export is enabled, `Complete` inserts a `dtrack_uploads` row in its own transaction (an outbox).
+- The worker leases uploads with `SKIP LOCKED` and pushes them with `PUT /api/v1/bom` through the netguard dialer, without following redirects.
+- 429, 5xx and network errors retry with exponential backoff, at most 12 attempts. Other 4xx answers fail at once.
+- The API key is sealed with the master key and is write-only.
+
+**Why:** a crash between completion and upload cannot lose a push, and Dependency-Track being down never affects an assessment (section 15).
+
+**Consequences:** uploads are visible and retryable through the API, and finished rows are pruned after 90 days.

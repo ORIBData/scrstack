@@ -1,0 +1,102 @@
+{
+  "config": {
+    "protocol_version": "v1.0.0",
+    "scanner_name": "govulncheck",
+    "scanner_version": "v1.9.0",
+    "db": "https://vuln.go.dev",
+    "db_last_modified": "2026-11-11T02:51:11Z",
+    "go_version": "go1.27.4",
+    "scan_level": "symbol",
+    "scan_mode": "source"
+  }
+}
+{
+  "progress": {
+    "message": "Fetching vulnerabilities from the database..."
+  }
+}
+{
+  "progress": {
+    "message": "Checking the code against the vulnerabilities..."
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2022-1059",
+    "fixed_version": "v0.3.8",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.7"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-5970",
+    "fixed_version": "v0.39.0",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.7"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2026-6629",
+    "fixed_version": "v0.41.0",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.7"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2022-1059",
+    "fixed_version": "v0.3.8",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.7",
+        "package": "golang.org/x/text/language"
+      }
+    ]
+  }
+}
+{
+  "finding": {
+    "osv": "GO-2022-1059",
+    "fixed_version": "v0.3.8",
+    "trace": [
+      {
+        "module": "golang.org/x/text",
+        "version": "v0.3.7",
+        "package": "golang.org/x/text/language",
+        "function": "ParseAcceptLanguage",
+        "position": {
+          "filename": "language/parse.go",
+          "offset": 5495,
+          "line": 158,
+          "column": 6
+        }
+      },
+      {
+        "module": "example.com/calls",
+        "package": "example.com/calls",
+        "function": "main",
+        "position": {
+          "filename": "main.go",
+          "offset": 122,
+          "line": 10,
+          "column": 45
+        }
+      }
+    ]
+  }
+}

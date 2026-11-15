@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +23,9 @@ func reportSchema(s string) []string {
 	return []string{
 		`CREATE TABLE IF NOT EXISTS ` + s + `.reports(id uuid PRIMARY KEY,framework text NOT NULL,scope jsonb NOT NULL,params jsonb NOT NULL DEFAULT '{}',format text NOT NULL CHECK(format IN ('json','csv','md')),status text NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','succeeded','failed')),s3_key text,sha256 text,size bigint,data_as_of timestamptz,scrs_version text,feed_freshness jsonb,summary jsonb,error text NOT NULL DEFAULT '',requested_by uuid,lease uuid,lease_until timestamptz,attempts integer NOT NULL DEFAULT 0,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),completed_at timestamptz)`,
 		`ALTER TABLE ` + s + `.reports ADD COLUMN IF NOT EXISTS since timestamptz`,
+		// P2: PDF reports.
+		`ALTER TABLE ` + s + `.reports DROP CONSTRAINT IF EXISTS reports_format_check`,
+		`ALTER TABLE ` + s + `.reports ADD CONSTRAINT reports_format_check CHECK(format IN ('json','csv','md','pdf'))`,
 		`ALTER TABLE ` + s + `.reports ADD COLUMN IF NOT EXISTS until timestamptz`,
 		`CREATE INDEX IF NOT EXISTS reports_queue_idx ON ` + s + `.reports(created_at) WHERE status IN ('queued','running')`,
 		`CREATE INDEX IF NOT EXISTS reports_created_idx ON ` + s + `.reports(created_at DESC,id DESC)`,
@@ -168,7 +172,7 @@ func (s *Store) CreateReport(ctx context.Context, r ReportRequest, actor uuid.UU
 	if r.Format == "" {
 		r.Format = "json"
 	}
-	if r.Format != "json" && r.Format != "csv" && r.Format != "md" {
+	if !slices.Contains(compliance.Formats, r.Format) {
 		return ReportJob{}, ErrInput
 	}
 	until := time.Now().UTC()

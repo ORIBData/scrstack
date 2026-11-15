@@ -10,10 +10,20 @@ import (
 	"time"
 )
 
-func allowedProxyHost(host string) bool {
-	switch strings.ToLower(host) {
-	case "api.deps.dev", "deps.dev", "registry.npmjs.org", "repo.maven.apache.org", "repo1.maven.org":
-		return true
+// RemediationHosts are the default egress profile: package metadata for
+// remediation planning.
+var RemediationHosts = []string{"api.deps.dev", "deps.dev", "registry.npmjs.org", "repo.maven.apache.org", "repo1.maven.org"}
+
+// GoModuleHosts are the go-modules profile: module downloads and checksum
+// verification for Go reachability analysis (M9). proxy.golang.org serves
+// module zips itself, so no storage host is needed.
+var GoModuleHosts = []string{"proxy.golang.org", "sum.golang.org"}
+
+func hostAllowed(list []string, host string) bool {
+	for _, h := range list {
+		if strings.EqualFold(h, host) {
+			return true
+		}
 	}
 	return false
 }
@@ -36,11 +46,15 @@ func publicAddress(ip netip.Addr) bool {
 	}
 	return true
 }
-func EgressProxy() http.Handler {
+func EgressProxy() http.Handler { return EgressProxyFor(RemediationHosts) }
+
+// EgressProxyFor is a CONNECT-only proxy to port 443 of the listed hosts,
+// refusing any that resolve to non-public addresses.
+func EgressProxyFor(hosts []string) http.Handler {
 	slots := make(chan struct{}, 8)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, port, err := net.SplitHostPort(r.Host)
-		if err != nil || r.Method != "CONNECT" || port != "443" || !allowedProxyHost(host) {
+		if err != nil || r.Method != "CONNECT" || port != "443" || !hostAllowed(hosts, host) {
 			http.Error(w, "egress destination forbidden", 403)
 			return
 		}

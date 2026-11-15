@@ -21,6 +21,9 @@ var files embed.FS
 const (
 	KindCWEMapping = "cwe_mapping"
 	KindPCIDSS     = "pci_dss"
+	// KindSTIG is a DISA STIG imported from its XCCDF benchmark (CMP-004):
+	// one category per rule, with SCRS's mapping of CWEs and finding types.
+	KindSTIG = "stig"
 )
 
 // Pack is a versioned framework data pack (CMP-001).
@@ -38,13 +41,30 @@ type Pack struct {
 	TypeCategories     map[string]string `json:"type_categories,omitempty"`
 	TypeCategoriesNote string            `json:"type_categories_note,omitempty"`
 	Requirements       []Requirement     `json:"requirements,omitempty"`
+	// Benchmark identifies the imported STIG (kind stig).
+	Benchmark *Benchmark `json:"benchmark,omitempty"`
 }
 
-// Category maps CWE ids to one framework category.
+// Benchmark identifies an imported XCCDF benchmark.
+type Benchmark struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Version string `json:"version"`
+	Release string `json:"release,omitempty"`
+}
+
+// Category maps CWE ids to one framework category. For a STIG the
+// category is one rule: id is the STIG id (for example APSC-DV-002540),
+// stable across releases.
 type Category struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	CWEs []int  `json:"cwes"`
+	// STIG rules only.
+	Severity string   `json:"severity,omitempty"`
+	VulnID   string   `json:"vuln_id,omitempty"`
+	RuleID   string   `json:"rule_id,omitempty"`
+	CCIs     []string `json:"ccis,omitempty"`
 }
 
 // Requirement is one PCI DSS evidence view.
@@ -100,8 +120,8 @@ var ErrPack = errors.New("invalid framework pack")
 
 var packID = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{2,63}$`)
 
-// ParsePack validates an uploaded CWE-mapping pack (CMP-005). Custom
-// packs cannot replace shipped ones.
+// ParsePack validates an uploaded CWE-mapping pack (CMP-005), or an edited
+// STIG pack (CMP-004). Custom packs cannot replace shipped ones.
 func ParsePack(raw []byte) (Pack, error) {
 	var p Pack
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -118,8 +138,8 @@ func ParsePack(raw []byte) (Pack, error) {
 	if _, ok := BuiltinPack(p.ID); ok {
 		return fail("id %s is a shipped pack", p.ID)
 	}
-	if p.Kind != KindCWEMapping {
-		return fail("custom packs must be kind cwe_mapping")
+	if p.Kind != KindCWEMapping && p.Kind != KindSTIG {
+		return fail("custom packs must be kind cwe_mapping or stig")
 	}
 	if p.Name == "" || len(p.Name) > 200 || p.Version == "" || len(p.Version) > 64 || len(p.Source) > 500 || len(p.URL) > 500 || len(p.TypeCategoriesNote) > 1000 {
 		return fail("name and version are required; text fields are bounded")
@@ -127,13 +147,34 @@ func ParsePack(raw []byte) (Pack, error) {
 	if p.Builtin || len(p.Requirements) > 0 {
 		return fail("builtin and requirements are not allowed")
 	}
-	if len(p.Categories) == 0 || len(p.Categories) > 200 {
-		return fail("1 to 200 categories required")
+	limit := 200
+	if p.Kind == KindSTIG {
+		limit = maxSTIGRules
+		if b := p.Benchmark; b == nil || b.ID == "" || len(b.ID) > 200 || b.Title == "" || len(b.Title) > 300 || len(b.Version) > 64 || len(b.Release) > 200 {
+			return fail("a stig pack needs its benchmark id and title")
+		}
+	} else if p.Benchmark != nil {
+		return fail("benchmark is only allowed in a stig pack")
+	}
+	if len(p.Categories) == 0 || len(p.Categories) > limit {
+		return fail("1 to %d categories required", limit)
 	}
 	ids := map[string]bool{}
 	for i, c := range p.Categories {
-		if c.ID == "" || len(c.ID) > 64 || c.Name == "" || len(c.Name) > 200 || ids[c.ID] {
+		if c.ID == "" || len(c.ID) > 64 || c.Name == "" || len(c.Name) > 500 || ids[c.ID] {
 			return fail("categories[%d] needs a unique id and a name", i)
+		}
+		if p.Kind == KindSTIG {
+			if !stigSeverity[c.Severity] || len(c.VulnID) > 64 || len(c.RuleID) > 128 || len(c.CCIs) > 50 {
+				return fail("categories[%d] needs a severity of CAT I, CAT II or CAT III; ids are bounded", i)
+			}
+			for _, cci := range c.CCIs {
+				if len(cci) > 32 {
+					return fail("categories[%d] has an invalid CCI", i)
+				}
+			}
+		} else if c.Severity != "" || c.VulnID != "" || c.RuleID != "" || len(c.CCIs) > 0 {
+			return fail("categories[%d]: severity, vuln_id, rule_id and ccis are only allowed in a stig pack", i)
 		}
 		ids[c.ID] = true
 		if len(c.CWEs) > 2000 {
