@@ -14,6 +14,7 @@ SCRS_TRAEFIK_NETWORK=dokploy-network
 SCRS_HTTP_ENTRYPOINT=web
 SCRS_HTTPS_ENTRYPOINT=websecure
 SCRS_CERT_RESOLVER=letsencrypt
+SCRS_SWAGGER_DOCS_ENABLE=true
 SCRS_DOCS_PUBLIC=true
 SCRS_CORS_ORIGINS=
 SCRS_TRUSTED_PROXY_CIDRS=
@@ -36,6 +37,14 @@ Traefik owns issuance and renewal. Labels select an existing resolver; they do n
 create it. Do not also configure a second router through Dokploy's Domains UI for
 this service. See [Dokploy's label example](https://docs.dokploy.com/docs/core/docker-compose/example)
 and [Traefik TLS routing](https://doc.traefik.io/traefik/reference/routing-configuration/http/tls/overview/).
+
+Two settings control the docs:
+- `SCRS_SWAGGER_DOCS_ENABLE=false` removes the Swagger UI, its assets and the
+  OpenAPI document altogether. Every `/scrs/v1/docs` path then returns the same
+  404 as an unknown route, with or without a token, so a production host does
+  not reveal its API contract. The default is `true`; any other value stops the
+  API at start-up.
+- `SCRS_DOCS_PUBLIC` applies only while the docs are enabled.
 
 Keep public docs enabled for normal browser access. If `SCRS_DOCS_PUBLIC=false`,
 the docs document and all assets require bearer authentication; an authenticated
