@@ -159,19 +159,23 @@ paths:
       tags: [System]
       operationId: apiDocs
       summary: Swagger UI
-      description: Interactive documentation for this API. Public unless `SCRS_DOCS_PUBLIC=false` (then any valid token).
+      description: 'Interactive documentation for this API. Served only while `SCRS_SWAGGER_DOCS_ENABLE=true` (the default); with `false`, this path, its assets and `/docs/openapi.yaml` return 404 like an unknown route, even with a valid token. When enabled, it is public unless `SCRS_DOCS_PUBLIC=false` (then any valid token).'
       security: []
       responses:
         '200': {description: HTML page, content: {text/html: {schema: {type: string}}}}
+        '401': {description: '`SCRS_DOCS_PUBLIC=false` and no valid token'}
+        '404': {description: 'Docs disabled (`SCRS_SWAGGER_DOCS_ENABLE=false`)'}
   /docs/openapi.yaml:
     get:
       tags: [System]
       operationId: openAPIDocument
       summary: OpenAPI document
-      description: This contract in YAML, for client generation (for example openapi-typescript or orval).
+      description: 'This contract in YAML, for client generation (for example openapi-typescript or orval). Served only while `SCRS_SWAGGER_DOCS_ENABLE=true`, under the same access rule as `/docs`.'
       security: []
       responses:
         '200': {description: OpenAPI 3.1 YAML, content: {application/yaml: {schema: {type: string}}}}
+        '401': {description: '`SCRS_DOCS_PUBLIC=false` and no valid token'}
+        '404': {description: 'Docs disabled (`SCRS_SWAGGER_DOCS_ENABLE=false`)'}
 
   # ---------------------------------------------------------------- Tokens
   /tokens:

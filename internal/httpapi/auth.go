@@ -37,12 +37,16 @@ type Security struct {
 		GetSBOM(context.Context, string) ([]byte, error)
 	}
 	// Mirrors opens stored git bundles; nil disables bundle download.
-	Mirrors        MirrorReader
-	Notify         *notify.Store
-	Logger         *slog.Logger
-	Store          TokenStore
-	Redis          *redis.Client
-	DocsPublic     bool
+	Mirrors    MirrorReader
+	Notify     *notify.Store
+	Logger     *slog.Logger
+	Store      TokenStore
+	Redis      *redis.Client
+	DocsPublic bool
+	// DocsDisabled removes the Swagger UI and the OpenAPI document
+	// (SCRS_SWAGGER_DOCS_ENABLE=false): every /docs path is then answered
+	// like an unknown route, with or without a token.
+	DocsDisabled   bool
 	TrustedProxies []netip.Prefix
 	Origins        []string
 	// GitHubHooks overrides the GitHub API for the delivery check; tests only.
@@ -87,12 +91,15 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.HandleFunc("GET "+BasePath+"/system/healthz", health)
 	mux.Handle("GET "+BasePath+"/system/readyz", readiness(check))
 	// Reuse the embedded docs-only mux; protect all its assets consistently.
-	docsHandler := Handler()
-	if !security.DocsPublic {
-		docsHandler = security.protect("", docsHandler)
+	// Disabled docs are not routed at all, so they 404 like any unknown path.
+	if !security.DocsDisabled {
+		docsHandler := Handler()
+		if !security.DocsPublic {
+			docsHandler = security.protect("", docsHandler)
+		}
+		mux.Handle(BasePath+"/docs", docsHandler)
+		mux.Handle(BasePath+"/docs/", docsHandler)
 	}
-	mux.Handle(BasePath+"/docs", docsHandler)
-	mux.Handle(BasePath+"/docs/", docsHandler)
 	handler := connectionHandler{store: store, providerSlots: make(chan struct{}, 4)}
 	mux.Handle(BasePath+"/connections", security.protect("admin", handler))
 	mux.Handle(BasePath+"/connections/", security.protect("admin", handler))

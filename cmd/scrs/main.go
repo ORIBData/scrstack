@@ -142,6 +142,11 @@ func main() {
 	}
 	rateClient := redis.NewClient(redisOptions)
 	defer rateClient.Close()
+	docsEnabled := os.Getenv("SCRS_SWAGGER_DOCS_ENABLE") != "false"
+	if value := os.Getenv("SCRS_SWAGGER_DOCS_ENABLE"); value != "" && value != "true" && value != "false" {
+		fmt.Fprintln(os.Stderr, "SCRS_SWAGGER_DOCS_ENABLE must be true or false")
+		os.Exit(2)
+	}
 	docsPublic := os.Getenv("SCRS_DOCS_PUBLIC") == "true"
 	if value := os.Getenv("SCRS_DOCS_PUBLIC"); value != "" && value != "true" && value != "false" {
 		fmt.Fprintln(os.Stderr, "SCRS_DOCS_PUBLIC must be true or false")
@@ -192,7 +197,7 @@ func main() {
 	}
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

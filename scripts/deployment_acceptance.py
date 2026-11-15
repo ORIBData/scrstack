@@ -44,9 +44,15 @@ def main():
     check('/system/readyz', 200)
     check('/assessments', 401)
     check('/assessments', 200, True, lambda b: isinstance(json.loads(b).get('items'), list))
-    private_docs = os.environ.get('SCRS_DOCS_PUBLIC', 'true').lower() == 'false'
-    check('/docs', 200, private_docs)
-    check('/docs/openapi.yaml', 200, private_docs, lambda b: b'url: /scrs/v1' in b and b'/assessments:' in b)
+    if os.environ.get('SCRS_SWAGGER_DOCS_ENABLE', 'true').lower() == 'false':
+        # Disabled docs must not exist for anyone, token or not.
+        for path in ('/docs', '/docs/openapi.yaml', '/docs/swagger-ui-bundle.js'):
+            check(path, 404)
+            check(path, 404, True)
+    else:
+        private_docs = os.environ.get('SCRS_DOCS_PUBLIC', 'true').lower() == 'false'
+        check('/docs', 200, private_docs)
+        check('/docs/openapi.yaml', 200, private_docs, lambda b: b'url: /scrs/v1' in b and b'/assessments:' in b)
     check('/remediation/capabilities', 200, True, lambda b: json.loads(b).get('enabled') is True)
     print('HTTPS API acceptance passed. Certificate renewal, restart recovery, load and disaster recovery require separate operational evidence.')
 

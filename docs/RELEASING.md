@@ -63,8 +63,25 @@ headless Chromium; Java 21). It follows the same tag rules:
 ```sh
 make qa-runner-image                       # local build
 make qa-runner-image-test                  # API, UI and load runs in a hardened container
-make release-qa-runner SCRS_QA_RUNNER_IMAGE=organization/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256} PLATFORMS=linux/amd64,linux/arm64
+make qa-runner-image-reference             # print the resolved tag
+make release-qa-runner PLATFORMS=linux/amd64,linux/arm64
 ```
+
+`release-qa-runner` and `release-sast` read `SCRS_QA_RUNNER_IMAGE` and
+`SCRS_SAST_IMAGE` from `.env`, as `release` reads `SCRS_IMAGE`; a value on the
+make command line wins. `make sast-image-reference` and
+`make qa-runner-image-reference` print the resolved tags for Dokploy. Tags must
+begin `scrs_`. When the three images share one repository, give each its own
+prefix so their tags never collide:
+
+```dotenv
+SCRS_IMAGE=organization/repository:scrs_YYYY_MM_DD_v{shortSHA256}
+SCRS_SAST_IMAGE=organization/repository:scrs_sast_YYYY_MM_DD_v{shortSHA256}
+SCRS_QA_RUNNER_IMAGE=organization/repository:scrs_qa_runner_YYYY_MM_DD_v{shortSHA256}
+```
+
+`make clean` then keeps only the newest local `scrs_*` image of that repository,
+so rebuild the other two locally if needed; registry images are never deleted.
 
 Set the resolved reference as `SCRS_QA_RUNNER_IMAGE` in Dokploy. Bump
 `KARATE_VERSION`, `KARATE_SHA256` and the karate-cli digests in the Dockerfile

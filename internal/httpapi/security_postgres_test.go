@@ -81,6 +81,37 @@ func TestPostgresManagedSecurityAndLifecycle(t *testing.T) {
 	}
 	mustStatus(request("GET", "/docs", "", ""), 401)
 	mustStatus(request("GET", "/docs", admin, ""), 200)
+	// SCRS_SWAGGER_DOCS_ENABLE=false: every docs path answers exactly like an
+	// unknown route, with or without a token; the rest of the API is unchanged.
+	disabled := HandlerWithSecurity(nil, store, Security{Store: store, Redis: client, Assessments: jobs, DocsDisabled: true})
+	serve := func(path, token string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", BasePath+path, nil)
+		r.RemoteAddr = "192.0.2.1:1234"
+		if token != "" {
+			r.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		disabled.ServeHTTP(w, r)
+		return w
+	}
+	unknown := serve("/no-such-route", admin)
+	if unknown.Code != 404 {
+		t.Fatalf("unknown route %d", unknown.Code)
+	}
+	for _, path := range []string{"/docs", "/docs/", "/docs/openapi.yaml", "/docs/swagger-ui.css", "/docs/swagger-ui-bundle.js", "/docs/init.js"} {
+		for _, token := range []string{"", admin} {
+			w := serve(path, token)
+			if w.Code != 404 || w.Body.String() != unknown.Body.String() || w.Header().Get("Content-Type") != unknown.Header().Get("Content-Type") {
+				t.Fatalf("disabled docs %s (token %v): %d %q", path, token != "", w.Code, w.Body)
+			}
+		}
+	}
+	if w := serve("/assets", admin); w.Code != 200 {
+		t.Fatalf("API with docs disabled: %d", w.Code)
+	}
+	if w := serve("/system/healthz", ""); w.Code != 200 {
+		t.Fatalf("health with docs disabled: %d", w.Code)
+	}
 	w := request("POST", "/tokens", admin, `{"name":"reader","scopes":["read"],"ip_allow_list":["192.0.2.0/24"]}`)
 	mustStatus(w, 201)
 	var issued struct {
