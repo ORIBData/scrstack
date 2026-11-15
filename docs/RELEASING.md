@@ -13,7 +13,8 @@ Do not leave `{Container_Registry_Organization_Name}` in a deployment value.
 ```sh
 make image-reference
 make image
-make release PLATFORMS=linux/amd64,linux/arm64
+make release                                   # linux/amd64 (the staging VPS)
+make release PLATFORMS=linux/amd64,linux/arm64 # multi-architecture, when needed
 make clean-dry-run
 make clean
 ```
@@ -29,6 +30,22 @@ day uses the same tag; registries can enforce immutability if required.
 can explicitly override the tag; legacy `DOCKERHUB_REPO=namespace/name` remains
 supported. `make image-reference` prints the concrete reference. Copy that
 reference into Dokploy's `SCRS_IMAGE`; Compose does not expand the template.
+
+Releases build `linux/amd64` by default (`PLATFORMS` adds `linux/arm64`). Each
+release creates a temporary Buildx `docker-container` builder, because the
+default `docker` driver cannot attach the SBOM and provenance attestations, and
+removes it on exit together with the temporary login. From an Apple Silicon Mac
+the amd64 image builds under emulation, so the Rust YARA-X stage takes much
+longer than a native build.
+
+**Docker Build Cloud.** Set `SCRS_BUILD_CLOUD=ORG/BUILDER` (for example
+`oribdata/creditchek-stg-ci`) in `.env`, or on the make command line, to build
+on that cloud builder:
+- Builds run on native amd64 and arm64 machines, so there is no emulation.
+- The release creates a temporary reference to the builder and removes it on exit. The cloud builder itself is untouched.
+- Build Cloud signs in with the release's Docker Hub login, so the image must be on Docker Hub and the username must belong to the builder's organisation.
+- The build context is uploaded to Docker's builders. `.dockerignore` keeps `.env`, `.git`, `bin` and `artifacts` out of it.
+- Builds use the organisation's Build Cloud minutes.
 
 Docker Hub releases prompt for a username and PAT. GAR releases select the
 `oauth2accesstoken` username and prompt for a fresh access token (obtain one
@@ -64,7 +81,7 @@ headless Chromium; Java 21). It follows the same tag rules:
 make qa-runner-image                       # local build
 make qa-runner-image-test                  # API, UI and load runs in a hardened container
 make qa-runner-image-reference             # print the resolved tag
-make release-qa-runner PLATFORMS=linux/amd64,linux/arm64
+make release-qa-runner
 ```
 
 `release-qa-runner` and `release-sast` read `SCRS_QA_RUNNER_IMAGE` and
