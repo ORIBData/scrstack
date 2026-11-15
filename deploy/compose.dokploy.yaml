@@ -50,6 +50,11 @@ services:
       SCRS_RETENTION_DEFAULT_AUDIT_LOG_DAYS: ${SCRS_RETENTION_DEFAULT_AUDIT_LOG_DAYS:-}
       SCRS_QA_RUNNER_URL: ${SCRS_QA_RUNNER_URL:-http://scrs-qa-runner:8090}
       SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN to 32+ random characters}
+      # SAST analyzers (M9): the API lists them and validates custom rules.
+      SCRS_SAST_URL: ${SCRS_SAST_URL:-http://scrs-sast:8083}
+      SCRS_SAST_API_TOKEN: ${SCRS_SAST_API_TOKEN:?Set SCRS_SAST_API_TOKEN to 32+ random characters}
+      SCRS_SAST_ENABLED: ${SCRS_SAST_ENABLED:-false}
+      SCRS_REACHABILITY_ENABLED: ${SCRS_REACHABILITY_ENABLED:-false}
       SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
       SCRS_LLM_PRIVATE_HOSTS: ${SCRS_LLM_PRIVATE_HOSTS:-}
       SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
@@ -68,6 +73,7 @@ services:
       - default
       - proxy
       - qa
+      - sast
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=${SCRS_TRAEFIK_NETWORK:-dokploy-network}"
@@ -122,6 +128,14 @@ services:
       # the LLM providers added through the API.
       SCRS_QA_RUNNER_URL: ${SCRS_QA_RUNNER_URL:-http://scrs-qa-runner:8090}
       SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN}
+      # SAST and Go reachability in scrs-sast over the internal sast network.
+      # Off by default; enable per deployment here or per asset (PUT /assets/{id}/sast).
+      SCRS_SAST_URL: ${SCRS_SAST_URL:-http://scrs-sast:8083}
+      SCRS_SAST_API_TOKEN: ${SCRS_SAST_API_TOKEN:?Set SCRS_SAST_API_TOKEN}
+      SCRS_SAST_ENABLED: ${SCRS_SAST_ENABLED:-false}
+      SCRS_REACHABILITY_ENABLED: ${SCRS_REACHABILITY_ENABLED:-false}
+      SCRS_SAST_TIMEOUT: ${SCRS_SAST_TIMEOUT:-10m}
+      SCRS_REACHABILITY_WEIGHTS: ${SCRS_REACHABILITY_WEIGHTS:-10,-15}
       SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
       SCRS_QA_MAX_ACTIVE: ${SCRS_QA_MAX_ACTIVE:-4}
       # NVD and CVE Program advisory sync (0 disables); retention defaults.
@@ -156,7 +170,7 @@ services:
         condition: service_completed_successfully
       scrs-scanner:
         condition: service_healthy
-    networks: [default, scanning, qa]
+    networks: [default, scanning, qa, sast]
     read_only: true
     # YARA patterns from TAXII feeds compile in a scratch directory.
     tmpfs: ["/tmp:size=67108864,mode=1777,noexec,nosuid"]
@@ -248,6 +262,57 @@ services:
     pids_limit: 32
     labels: ["traefik.enable=false"]
 
+  # Go module downloads for reachability analysis: proxy.golang.org and
+  # sum.golang.org only (SCRS_EGRESS_PROFILE=go-modules).
+  scrs-sast-egress:
+    image: ${SCRS_IMAGE:?Set SCRS_IMAGE}
+    command: ["egress-proxy"]
+    restart: unless-stopped
+    environment:
+      SCRS_EGRESS_PROFILE: go-modules
+    networks: [default, sast]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    pids_limit: 32
+    labels: ["traefik.enable=false"]
+
+  # SAST analyzers and Go reachability (its own image, deploy/Dockerfile.sast).
+  # It reads repository code but never runs it, holds no SCRS secrets except
+  # its own bearer token, and sits only on the internal sast network: its one
+  # route out is scrs-sast-egress. It is not published through Traefik.
+  scrs-sast:
+    image: ${SCRS_SAST_IMAGE:?Set SCRS_SAST_IMAGE to your published scrs-sast image reference}
+    command: ["sast"]
+    restart: unless-stopped
+    environment:
+      SCRS_SAST_API_TOKEN: ${SCRS_SAST_API_TOKEN:?Set SCRS_SAST_API_TOKEN}
+      SCRS_SAST_ANALYZERS: ${SCRS_SAST_ANALYZERS:-gosec,bandit,opengrep,bearer}
+      SCRS_SAST_SLOTS: ${SCRS_SAST_SLOTS:-1}
+      SCRS_SAST_GO_PROXY: http://scrs-sast-egress:8082
+      SCRS_OSV_DB: /feeds/current
+      SCRS_WORK_ROOT: /work
+    networks: [sast]
+    volumes: ["scrs-feeds:/feeds:ro"]
+    tmpfs:
+      # Source, analyzer scratch, Go module cache and the govulncheck database.
+      - /work:size=${SCRS_SAST_WORK_SIZE:-4g},mode=1777,nosuid
+      - /tmp:size=256m,mode=1777,noexec,nosuid
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: ${SCRS_SAST_MEMORY:-4g}
+    cpus: 2
+    pids_limit: 512
+    labels: ["traefik.enable=false"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/scrs", "sast-healthcheck"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+
   scrs-feed-sync:
     image: ${SCRS_IMAGE:?Set SCRS_IMAGE}
     command: ["feed-sync", "--loop"]
@@ -332,6 +397,9 @@ networks:
     internal: true
   # API and worker <-> Karate runner only; no route out.
   qa:
+    internal: true
+  # Worker and API <-> scrs-sast <-> scrs-sast-egress; no other route out.
+  sast:
     internal: true
   proxy:
     external: true

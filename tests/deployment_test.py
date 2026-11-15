@@ -27,6 +27,8 @@ class DeploymentTest(unittest.TestCase):
             'SCRS_QA_RUNNER_TOKEN': 'synthetic-runner-token-at-least-32-characters',
             'SCRS_QA_DOMAIN': 'qa-runner.staging.example.com',
             'SCRS_QA_ROUTER_NAME': 'scrs-qa-staging',
+            'SCRS_SAST_IMAGE': 'example/scrs-sast:scrs_2026_11_15_v123456abcdef',
+            'SCRS_SAST_API_TOKEN': 'synthetic-sast-token-at-least-32-characters',
         }
         with tempfile.NamedTemporaryFile(mode='w') as env:
             env.write('\n'.join(f'{key}={value}' for key,value in values.items())); env.flush()
@@ -71,3 +73,23 @@ class DeploymentTest(unittest.TestCase):
         self.assertTrue(runner['read_only'])
         self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_QA_RUNNER_URL'], 'http://scrs-qa-runner:8090')
         self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_QA_RUNNER_TOKEN'], runner['environment']['SCRS_QA_RUNNER_TOKEN'])
+
+        # The SAST analyzers: internal sast network only, out only through the
+        # go-modules egress proxy, no SCRS secrets, never published.
+        sast=config['services']['scrs-sast']
+        self.assertEqual(sast['image'], 'example/scrs-sast:scrs_2026_11_15_v123456abcdef')
+        self.assertEqual(set(sast['networks']), {'sast'})
+        self.assertTrue(config['networks']['sast']['internal'])
+        self.assertNotIn('ports', sast)
+        self.assertEqual(sast['labels']['traefik.enable'], 'false')
+        self.assertEqual(sast['cap_drop'], ['ALL'])
+        self.assertTrue(sast['read_only'])
+        self.assertFalse(set(sast['environment']) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN', 'SCRS_SCANNER_API_TOKEN', 'SCRS_QA_RUNNER_TOKEN'})
+        self.assertEqual(sast['environment']['SCRS_SAST_GO_PROXY'], 'http://scrs-sast-egress:8082')
+        egress=config['services']['scrs-sast-egress']
+        self.assertEqual(egress['environment']['SCRS_EGRESS_PROFILE'], 'go-modules')
+        self.assertEqual(set(egress['networks']), {'default', 'sast'})
+        self.assertIn('sast', config['services']['scrs-worker']['networks'])
+        self.assertIn('sast', api['networks'])
+        self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_SAST_API_TOKEN'], sast['environment']['SCRS_SAST_API_TOKEN'])
+        self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_SAST_ENABLED'], 'false')

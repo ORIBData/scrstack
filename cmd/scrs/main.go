@@ -24,7 +24,7 @@ import (
 )
 
 func main() {
-	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy" || os.Args[1] == "yara-install") {
+	if len(os.Args) > 1 && (os.Args[1] == "worker" || os.Args[1] == "scanner" || os.Args[1] == "feed-sync" || os.Args[1] == "scanner-healthcheck" || os.Args[1] == "egress-proxy" || os.Args[1] == "yara-install" || os.Args[1] == "sast" || os.Args[1] == "sast-healthcheck") {
 		if err := pipelineCommand(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -176,9 +176,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(2)
 	}
+	sastClient, sastDefaults, _, err := sastFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
+		os.Exit(2)
+	}
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

@@ -375,14 +375,39 @@ The deployment test asserts the runner's labels, networks and lack of secrets. `
 
 **Not verified:** live deps.dev at volume, and counsel review of `corporate-default`.
 
-## Current status and remaining work (2026-11-14)
+## Addendum 2026-11-15: M9
 
-Delivered: M0–M8, the threat-intelligence module, and E2E QA (Karate). Remaining:
+**Delivered** (details in [SAST.md](SAST.md)):
+- **The `scrs-sast` image**: gosec, Bandit, OpenGrep and Bearer, pinned by hash or `go.sum`, as child processes behind one interface.
+- **Normalised `sast` entries** with CWE ids, location, data-flow steps and a code hash, with no snippet stored.
+- **A diff-aware gate**, inline suppressions recorded, and an integrity entry when a suppression is added for an open entry.
+- **Disabled rules, excludes and analyzer selection** globally and per asset, plus custom OpenGrep rulesets compiled before they are stored.
+- **Go reachability** with govulncheck: traces, `imported_only` and `not_reachable`, scoring, and `unknown` on failure.
+- **Lease renewal** for long analyzer runs.
 
-1. **M9 (next):** SAST analyzers (gosec, Bandit, Bearer), Go reachability and taint traces (spikes S10–S12).
-2. **P2:** Dependency-Track push, CPE matching (VUL-007), server-sent events, STIG (CMP-004) and PDF reports, outbound licence compatibility (LIC-005).
-3. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
-4. **Acceptance:**
+**Decisions and safeguards:**
+- **The analyzers have no network.** Go module downloads go only to `proxy.golang.org` and `sum.golang.org`, through a dedicated egress proxy.
+- **git configuration is ignored**, cgo is off, and no build, install or generate step runs.
+- **A failed analyzer or a breached budget makes the assessment incomplete.**
+- **Bearer and the OpenGrep rules are internal-use only** (ADR-029).
+- **Shield is a no-go for now** (S11).
+
+**Verified:**
+- the `internal/sast` and `internal/worker` unit tests and `make qa`;
+- spike S10 against the real image: every tool offline, and the hostile repository inert.
+
+**To finish verifying:**
+- `TestPostgresSASTAndReachabilityPipeline` and `make sast-image-test`. Both were written while Docker on the development machine was out of disk space; run `make database-test` and `make sast-image-test`.
+
+**Not verified:** run time on large repositories, and a false-negative study of reachability on our own services.
+
+## Current status and remaining work (2026-11-15)
+
+Delivered: M0–M9, the threat-intelligence module, and E2E QA (Karate). Remaining:
+
+1. **P2:** Dependency-Track push, CPE matching (VUL-007), server-sent events, STIG (CMP-004) and PDF reports, outbound licence compatibility (LIC-005).
+2. **Measurements left from M0:** OSV and ClamAV throughput, mobile sample repositories, NVD volumes.
+3. **Acceptance:**
    - live Dokploy deployment with TLS;
    - real provider, registry, TAXII, NVD and LLM accounts;
    - the runner on the VPS;

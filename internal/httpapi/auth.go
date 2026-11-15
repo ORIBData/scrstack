@@ -16,6 +16,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
+	"github.com/ORIBData/scrstack/internal/sast"
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
@@ -58,6 +59,10 @@ type Security struct {
 	QAReports       QAReportReader
 	QARunner        *qa.Runner
 	LLMPrivateHosts map[string]bool
+	// SAST is the scrs-sast service client (M9); SASTDefaults are the
+	// deployment defaults for SAST and reachability.
+	SAST         *sast.Client
+	SASTDefaults assessments.SASTDefaults
 }
 
 var tokenWindow = redis.NewScript(`
@@ -214,6 +219,18 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/schemas/{name}", security.protect("read|write|trigger", http.HandlerFunc(schemaDocuments)))
 		sboms := assessmentHandler{store: security.Assessments, artifacts: security.Artifacts}
 		mux.Handle("GET "+BasePath+"/sboms/{id}/download", security.protect("read|write", http.HandlerFunc(sboms.sbomDownload)))
+		// M9: SAST analyzers, settings, rulesets and reachability.
+		sastAPI := security.protect("read|write", sastHandler{store: security.Assessments, client: security.SAST, defaults: security.SASTDefaults})
+		mux.Handle("GET "+BasePath+"/sast/analyzers", sastAPI)
+		mux.Handle("GET "+BasePath+"/reachability/capabilities", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/settings", sastAPI)
+		mux.Handle("PUT "+BasePath+"/sast/settings", sastAPI)
+		mux.Handle("GET "+BasePath+"/assets/{id}/sast", sastAPI)
+		mux.Handle("PUT "+BasePath+"/assets/{id}/sast", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/rulesets", sastAPI)
+		mux.Handle("POST "+BasePath+"/sast/rulesets", sastAPI)
+		mux.Handle("GET "+BasePath+"/sast/rulesets/{id}", sastAPI)
+		mux.Handle("DELETE "+BasePath+"/sast/rulesets/{id}", sastAPI)
 		mux.Handle("GET "+BasePath+"/audit", security.protect("admin", auditHandler{security.Assessments}))
 		mux.Handle("GET "+BasePath+"/schemas/events", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))
 		mux.Handle("GET "+BasePath+"/schemas/events/{type}/{version}", security.protect("read|write|trigger", http.HandlerFunc(eventSchemas)))

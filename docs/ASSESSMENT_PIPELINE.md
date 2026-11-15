@@ -202,8 +202,8 @@ SHA-256 object-format repositories are not supported.
 
 The full list, by PRD milestone, is in the README roadmap. For this pipeline:
 
-- Built-in SAST and reachability analysis (M9). SARIF import covers external SAST
-  tools meanwhile.
+- SAST and Go reachability run in `scrs-sast` when enabled (M9, see [SAST.md](SAST.md));
+  reachability beyond Go is unsupported.
 - NVD, CVE Program and VEX/CSAF advisory sources, and the source registry with per-source health (M4).
 - Retention classes beyond raw inbound events and the webhook delivery log, and the
   reset/rebuild/sensor-update maintenance actions (M5).

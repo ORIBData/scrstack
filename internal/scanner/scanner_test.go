@@ -180,3 +180,20 @@ func TestRealFeedArchiveValidates(t *testing.T) {
 		t.Fatal("feed index empty")
 	}
 }
+
+// The go-modules profile (scrs-sast-egress) allows module downloads only.
+func TestGoModuleEgressProfile(t *testing.T) {
+	proxy := EgressProxyFor(GoModuleHosts)
+	for _, target := range []string{"api.deps.dev:443", "registry.npmjs.org:443", "proxy.golang.org:80", "github.com:443", "storage.googleapis.com:443"} {
+		r := httptest.NewRequest("CONNECT", "http://"+target, nil)
+		r.Host = target
+		w := httptest.NewRecorder()
+		proxy.ServeHTTP(w, r)
+		if w.Code != 403 {
+			t.Fatalf("go-modules profile allowed %s", target)
+		}
+	}
+	if !hostAllowed(GoModuleHosts, "PROXY.golang.org") || hostAllowed(RemediationHosts, "proxy.golang.org") {
+		t.Fatal("profile host lists")
+	}
+}

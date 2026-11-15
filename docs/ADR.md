@@ -26,7 +26,7 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-015 | AES-256-GCM secrets under `SCRS_MASTER_KEY`, bound to their owner | Accepted |
 | ADR-016 | Fixed intervals and PostgreSQL locks; no cron library | Accepted |
 | ADR-017 | go-containerregistry for image pulls by digest | Accepted |
-| ADR-018 | SAST analyzers as sandboxed external processes | Proposed (M9) |
+| ADR-018 | SAST analyzers as sandboxed external processes in their own image | Accepted |
 | ADR-019 | Provider connections in encrypted rows; environment seeds the first | Accepted |
 | ADR-020 | OSV schema as the single advisory format | Accepted (amended) |
 | ADR-021 | E2E QA on an operator-hosted Karate runner, called by SCRS | Accepted |
@@ -36,6 +36,8 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-025 | Licence data: declared, then detected, then deps.dev metadata | Accepted |
 | ADR-026 | SCRS generates its SBOMs from its own component model | Accepted |
 | ADR-027 | Framework packs as versioned data with recorded mapping sources | Accepted |
+| ADR-028 | Go reachability with govulncheck on SCRS's own advisory feed | Accepted |
+| ADR-029 | Internal-use analyzer licences (Bearer, OpenGrep rules) | Accepted |
 
 ## ADR-001 Go module
 
@@ -47,16 +49,17 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 
 ## ADR-002 Repository and images
 
-**Decision:** SCRS lives in the fork of the ClamAV REST project, and the legacy scanner keeps working (`docs/DOKPLOY.md`). The PRD proposed two images. There are three trust boundaries:
-- the SCRS image (`deploy/Dockerfile.scrs`: API, worker, scanner, feed-sync, egress proxy);
+**Decision:** SCRS lives in the fork of the ClamAV REST project, and the legacy scanner keeps working (`docs/DOKPLOY.md`). The PRD proposed two images. There are four trust boundaries:
+- the SCRS image (`deploy/Dockerfile.scrs`: API, worker, scanner, feed-sync, egress proxies);
 - the official ClamAV image;
-- the Karate runner image (`deploy/karate-runner/Dockerfile`), which runs repository test code and holds no SCRS secrets.
+- the Karate runner image (`deploy/karate-runner/Dockerfile`), which runs repository test code and holds no SCRS secrets;
+- the SAST image (`deploy/Dockerfile.sast`), which reads repository code with bundled analyzers, has no network except Go module downloads, and holds no SCRS secrets (ADR-018).
 
-**Consequences:** two images are released (`make release`, `make release-qa-runner`). See ADR-021.
+**Consequences:** three images are released (`make release`, `make release-qa-runner`, `make release-sast`). See ADR-021 and ADR-018.
 
 ## ADR-003 Single binary with role sub-commands
 
-**Decision:** `scrs api`, `worker`, `scanner`, `feed-sync`, `egress-proxy`, `yara-install`, `init` and the maintenance commands come from one binary. The Karate runner is a separate small binary (`cmd/scrs-qa-runner`) because it ships in another image.
+**Decision:** `scrs api`, `worker`, `scanner`, `feed-sync`, `egress-proxy`, `yara-install`, `sast`, `init` and the maintenance commands come from one binary; the SAST image runs the same binary in its `sast` role. The Karate runner is a separate small binary (`cmd/scrs-qa-runner`) because it ships in another image.
 
 **Consequences:** each Compose service selects its role. Isolation comes from the container settings, not from the binary.
 
@@ -181,11 +184,40 @@ Connection rows carry a key id (`v1`) for future rotation.
 
 **Evidence:** `internal/scanner/image_test.go`.
 
-## ADR-018 SAST analyzers (proposed, M9)
+## ADR-018 SAST analyzers
 
-**Decision to build:** gosec, Bandit and Bearer as sandboxed external processes behind a Go interface, in a scanner image, never linked into SCRS.
+**Decision:** gosec, Bandit, OpenGrep and Bearer run as child processes behind one Go interface (`internal/sast`) in a separate image, `scrs-sast`, never linked into SCRS. The image runs the `scrs sast` role and serves only the worker and the API over the internal `sast` network.
 
-**Status:** not built. SARIF import covers external SAST tools meanwhile.
+**Why a separate image:**
+- the analyzers need a Python runtime, a Go toolchain and two native binaries, which would grow the scanner image;
+- SAST gets its own sandbox and budget.
+
+OpenGrep was added to the PRD's set because it is the only bundled analyzer for Kotlin and Swift, and it widens the JavaScript and TypeScript rules.
+
+**Consequences:**
+- A third image is released (`make release-sast`).
+- Results are normalised into `sast` entries, which gate only when new.
+- Inline suppressions are recorded, not lost, and a suppression added for an open entry is an integrity signal.
+
+**Evidence:** `internal/sast` tests, `TestPostgresSASTAndReachabilityPipeline`, `make sast-image-test` and spike S10.
+
+## ADR-028 Go reachability
+
+**Decision:** `govulncheck` (call graph) runs in `scrs-sast` against a vulnerability database the service builds from the OSV Go archive `scrs-feed-sync` keeps. It does not use OSV-Scanner's call analysis, which gives a yes/no answer without traces. Module sources come through `scrs-sast-egress` (go-modules profile).
+
+**Why:** traces (file and line), the import-only level, and no extra advisory source to sync.
+
+**Consequences:**
+- Failed, skipped and unsupported analyses are `unknown` or `unsupported`, never `not_reachable`.
+- Scores move by configured weights.
+- Nothing is closed for being unreachable.
+- Standard-library entries are `unknown`, because they would describe the analyzer's toolchain.
+
+## ADR-029 Internal-use analyzer licences
+
+**Decision:** the owner accepted Bearer's Elastic License 2.0 and the OpenGrep community rules' Commons Clause for internal use (PRD Q22, 2026-11-15). Both are recorded as `redistributable: false`.
+
+**Consequences:** any SCRS build distributed outside CreditChek, or offered as a service, must remove them (`SCRS_SAST_ANALYZERS=gosec,bandit` at minimum, and the image's bundled rules).
 
 ## ADR-019 Provider connections
 

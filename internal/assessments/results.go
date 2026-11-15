@@ -33,6 +33,11 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		if stage.Name == "yara_x" && stage.Status != "ok" && stage.Status != "skipped" {
 			r.Complete = false
 		}
+		// SAST runs only where enabled; when it runs, a failed analyzer or a
+		// breached budget leaves the assessment incomplete (SAST-011).
+		if stage.Name == "sast" && stage.Status != "ok" {
+			r.Complete = false
+		}
 	}
 	for _, ok := range required {
 		if !ok {
@@ -179,6 +184,20 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		}
 		unique = append(unique, f)
 	}
+	// An inline suppression added for an open SAST entry is an integrity signal.
+	added, err := s.suppressionsAdded(ctx, tx, baseline, unique)
+	if err != nil {
+		return err
+	}
+	for _, f := range added {
+		f.Fingerprint = fingerprint(a, f)
+		if seen[f.Fingerprint] || len(unique) >= 10000 {
+			continue
+		}
+		seen[f.Fingerprint] = true
+		f.Change = "new"
+		unique = append(unique, f)
+	}
 	fingerprints := make([]string, len(unique))
 	for i, f := range unique {
 		fingerprints[i] = f.Fingerprint
@@ -239,7 +258,7 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	// Change records (workflow changes, provider events) need human review and
 	// are never closed by absence.
 	if closable := closableTypes(r.Stages); len(closable) > 0 && !r.RefMoved && a.Request.Target.Ref != "" {
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id<>'SCRS-WORKFLOW-CHANGE' AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id NOT IN ('SCRS-WORKFLOW-CHANGE','SCRS-SAST-SUPPRESSION-ADDED') AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable)
 		if err != nil {
 			return err
 		}

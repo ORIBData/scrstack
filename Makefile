@@ -9,6 +9,7 @@ GO ?= go
 DOCKER ?= docker
 VERSION ?=
 SCRS_IMAGE ?=
+SCRS_SAST_IMAGE ?=
 IMAGE_NAME ?= scrs
 PLATFORMS ?= linux/amd64,linux/arm64
 DOCKERHUB_REPO ?=
@@ -20,6 +21,7 @@ help:
 	@echo 'build           Build the SCRS API binary locally'
 	@echo 'test            Run Go tests and the race detector'
 	@echo 'scanner-test    Run pinned upstream OSV against adversarial offline fixtures'
+	@echo 'sast-image-test Build scrs-sast and run AT-27 to AT-29 on an internal-only network'
 	@echo 'lint            Format check and go vet'
 	@echo 'contract-check  Validate the published OpenAPI route paths'
 	@echo 'image           Build a local SCRS API image'
@@ -128,6 +130,10 @@ release-qa-runner:
 	@test -n "$(SCRS_QA_RUNNER_IMAGE)" || { echo 'Set SCRS_QA_RUNNER_IMAGE=registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}' >&2; exit 2; }
 	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
 
+release-sast:
+	@test -n "$(SCRS_SAST_IMAGE)" || { echo 'Set SCRS_SAST_IMAGE=registry/namespace/scrs-sast:scrs_YYYY_MM_DD_v{shortSHA256}' >&2; exit 2; }
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_SAST_IMAGE)" SCRS_DOCKERFILE=deploy/Dockerfile.sast PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+
 qa-runner-test:
 	@mkdir -p bin
 	@test -f bin/karate-2.1.4.jar || curl -fsSL -o bin/karate-2.1.4.jar $(KARATE_JAR_URL)
@@ -152,6 +158,14 @@ legacy-integration:
 
 # Build the exact dependency graph used in the shipped scanner, then run a real
 # offline scan against synthetic advisories. Does not use .env or live stores.
+.PHONY: sast-image sast-image-test release-sast
+sast-image:
+	$(DOCKER) build -f deploy/Dockerfile.sast -t scrs-sast:dev .
+
+sast-image-test: sast-image
+	$(DOCKER) build -f deploy/Dockerfile.scrs -t scrs:dev .
+	DOCKER=$(DOCKER) GO=$(GO) bash scripts/test_sast_image.sh
+
 .PHONY: scanner-test
 scanner-test:
 	@mkdir -p bin

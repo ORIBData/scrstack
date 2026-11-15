@@ -314,6 +314,29 @@ Tables `vulnerability_sources`, `advisory_records`, `vex_documents`,
 **Outbound access** from `scrs-worker` also includes
 `services.nvd.nist.gov` and `cveawg.mitre.org`.
 
+## SAST analyzers and reachability (M9)
+
+`scrs-sast` is a third image (`make release-sast SCRS_SAST_IMAGE=...`) in the same stack:
+- It sits on the internal `sast` network with the API and worker.
+- Its one route out is `scrs-sast-egress` (`SCRS_EGRESS_PROFILE=go-modules`: `proxy.golang.org` and `sum.golang.org` only).
+- It mounts `scrs-feeds` read-only for the Go advisory archive.
+- It is not published through Traefik.
+
+Tables `sast_settings`, `asset_sast_settings` and `sast_rulesets` are created by `scrs-storage-init`.
+
+| Variable | Service | Purpose |
+| --- | --- | --- |
+| `SCRS_SAST_IMAGE` | stack | Published scrs-sast image reference |
+| `SCRS_SAST_API_TOKEN` | API, worker, scrs-sast | Shared bearer token (32 or more random characters) |
+| `SCRS_SAST_URL` | API, worker | Default `http://scrs-sast:8083` |
+| `SCRS_SAST_ENABLED`, `SCRS_REACHABILITY_ENABLED` | API, worker | Deployment defaults (false); assets override them with `PUT /assets/{id}/sast` |
+| `SCRS_SAST_ANALYZERS` | scrs-sast | Analyzers allowed (default `gosec,bandit,opengrep,bearer`) |
+| `SCRS_SAST_TIMEOUT` | worker | Per-analyzer budget (default `10m`); a breach makes the assessment incomplete |
+| `SCRS_REACHABILITY_WEIGHTS` | worker | Score change for reachable and not reachable (default `10,-15`) |
+| `SCRS_SAST_SLOTS`, `SCRS_SAST_MEMORY`, `SCRS_SAST_WORK_SIZE` | scrs-sast | Concurrent analyses (1), memory (4g), tmpfs work area (4g) |
+
+**Outbound access** from `scrs-sast-egress`: `proxy.golang.org` and `sum.golang.org`. See [SAST.md](SAST.md).
+
 ## Licences, SBOM exports and compliance reports (M8)
 
 Tables `policies`, `license_category_versions`, `package_metadata`,

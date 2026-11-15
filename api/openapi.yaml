@@ -86,6 +86,8 @@ tags:
     description: Licence inventory, normalisation, categories and policy by distribution model, third-party notices. A policy aid, not legal advice.
   - name: Compliance reports
     description: OWASP Top 10, CWE Top 25 and PCI DSS evidence reports from framework packs. Evidence for assessors, not certification.
+  - name: SAST
+    description: Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, run in the scrs-sast sandbox without SCRS secrets.
   - name: LLM providers
     description: Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests (admin).
 paths:
@@ -2045,6 +2047,158 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  # ---------------------------------------------------------------- SAST and reachability (M9)
+  /sast/analyzers:
+    get:
+      tags: [SAST]
+      operationId: listSASTAnalyzers
+      summary: Bundled analyzers
+      description: The analyzers in the scrs-sast image (SAST-009) with version, languages, licence, rules licence, whether they may leave CreditChek (`redistributable`), rule count and whether this deployment enables them (`SCRS_SAST_ANALYZERS`), plus the reachability tool. Read live from the service; `service` is `unconfigured` or `unavailable` when it cannot be asked, and then only static metadata is returned. Scope `read` or `write`.
+      responses:
+        '200': {description: Analyzers, content: {application/json: {schema: {type: object, properties: {service: {type: string, enum: [ok, unavailable, unconfigured]}, enabled_by_default: {type: boolean}, analyzers: {type: array, items: {$ref: '#/components/schemas/SASTAnalyzer'}}, reachability: {$ref: '#/components/schemas/SASTAnalyzer'}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /reachability/capabilities:
+    get:
+      tags: [SAST]
+      operationId: reachabilityCapabilities
+      summary: Reachability capabilities
+      description: Ecosystems, methods and tool versions for reachability (REA-007). Go uses the govulncheck call graph; every other ecosystem reports `unsupported`. A failed or skipped analysis is `unknown`, never `not_reachable` (REA-003). Scope `read` or `write`.
+      responses:
+        '200': {description: Capabilities, content: {application/json: {schema: {type: object, properties: {enabled_by_default: {type: boolean}, capabilities: {type: array, items: {type: object}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /sast/settings:
+    get:
+      tags: [SAST]
+      operationId: getSASTSettings
+      summary: Deployment SAST settings
+      description: Rules disabled everywhere (`tool:rule`, globs allowed, for example `bearer:javascript_express_helmet_missing` or `gosec:G104`) and paths excluded everywhere (globs such as `docs/**`). Scope `read` or `write`.
+      responses:
+        '200':
+          description: Settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/SASTSettings'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [SAST]
+      operationId: setSASTSettings
+      summary: Replace deployment SAST settings
+      description: Replaces the disabled rules and excludes; `If-Match` carries the revision (0 before the first change). Audited as `sast_settings.updated`. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, properties: {disabled_rules: {type: array, maxItems: 500, items: {type: string}}, excludes: {type: array, maxItems: 200, items: {type: string}}}}}}}
+      responses:
+        '200':
+          description: Settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/SASTSettings'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/sast:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [SAST]
+      operationId: getAssetSAST
+      summary: Asset SAST settings
+      description: The asset's overrides (null fields inherit `SCRS_SAST_ENABLED` and `SCRS_REACHABILITY_ENABLED`) and the effective settings the next assessment uses, including enabled custom rulesets (SAST-002, REA-011). Scope `read` or `write`.
+      responses:
+        '200':
+          description: Settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {type: object, properties: {settings: {$ref: '#/components/schemas/AssetSAST'}, effective: {type: object}}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [SAST]
+      operationId: setAssetSAST
+      summary: Replace asset SAST settings
+      description: Turns SAST and reachability on or off for the asset, selects analyzers, and adds disabled rules and excludes. `If-Match` carries the revision (0 before the first change). Audited. Scope `write`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/AssetSAST'}}}}
+      responses:
+        '200':
+          description: Settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/AssetSAST'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /sast/rulesets:
+    get:
+      tags: [SAST]
+      operationId: listSASTRulesets
+      summary: Custom OpenGrep rulesets
+      description: Uploaded rulesets without their bodies. Enabled rulesets run with the bundled OpenGrep rules on every SAST assessment (SAST-007). Scope `read` or `write`.
+      responses:
+        '200': {description: Rulesets, content: {application/json: {schema: {type: object, properties: {items: {type: array, items: {$ref: '#/components/schemas/SASTRuleset'}}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [SAST]
+      operationId: saveSASTRuleset
+      summary: Upload a custom ruleset
+      description: Stores or replaces (by name) an OpenGrep/Semgrep rule document after the scrs-sast service compiles it (`opengrep validate`). Audited as `sast_ruleset.saved`. Scope `write`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, rules]
+              properties:
+                name: {type: string, pattern: '^[a-z0-9][a-z0-9_-]{0,62}$'}
+                description: {type: string, maxLength: 500}
+                enabled: {type: boolean, default: true}
+                rules: {type: string, maxLength: 1048576, description: OpenGrep rule YAML}
+      responses:
+        '201': {description: Stored, content: {application/json: {schema: {$ref: '#/components/schemas/SASTRuleset'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '422': {description: Rules do not compile, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '502': {description: Validation service failed, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: SAST service not configured, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /sast/rulesets/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [SAST]
+      operationId: getSASTRuleset
+      summary: Get a ruleset
+      description: One ruleset with its rule YAML. Scope `read` or `write`.
+      responses:
+        '200': {description: Ruleset, content: {application/json: {schema: {$ref: '#/components/schemas/SASTRuleset'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [SAST]
+      operationId: deleteSASTRuleset
+      summary: Delete a ruleset
+      description: Removes a ruleset. Audited. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   # ---------------------------------------------------------------- Licences (M8)
   /policies/gate:
     get:
@@ -3371,6 +3525,49 @@ components:
         path: {type: string}
         dependency_groups: {type: array, items: {type: string}, description: 'Lockfile dependency groups, such as dev'}
         license: {$ref: '#/components/schemas/ComponentLicense'}
+    SASTAnalyzer:
+      type: object
+      properties:
+        name: {type: string, enum: [gosec, bandit, opengrep, bearer, govulncheck]}
+        version: {type: string}
+        languages: {type: array, items: {type: string}}
+        license: {type: string}
+        rules_license: {type: string}
+        redistributable: {type: boolean, description: 'false: internal use only (Elastic License 2.0, Commons Clause); excluded from any build that leaves CreditChek (SAST-010)'}
+        needs_network: {type: boolean}
+        executes_project_code: {type: boolean}
+        rule_count: {type: integer, description: -1 when the tool does not report it}
+        enabled: {type: boolean}
+    SASTSettings:
+      type: object
+      properties:
+        disabled_rules: {type: array, items: {type: string}}
+        excludes: {type: array, items: {type: string}}
+        revision: {type: integer}
+        updated_at: {type: string, format: date-time}
+    AssetSAST:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled: {type: [boolean, 'null'], description: null inherits SCRS_SAST_ENABLED}
+        reachability: {type: [boolean, 'null'], description: null inherits SCRS_REACHABILITY_ENABLED}
+        analyzers: {type: [array, 'null'], items: {type: string, enum: [gosec, bandit, opengrep, bearer]}, description: null runs every enabled analyzer}
+        disabled_rules: {type: array, maxItems: 500, items: {type: string}}
+        excludes: {type: array, maxItems: 200, items: {type: string}}
+        revision: {type: integer, readOnly: true}
+    SASTRuleset:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        description: {type: string}
+        sha256: {type: string}
+        enabled: {type: boolean}
+        revision: {type: integer}
+        size: {type: integer}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        body: {type: string, description: Rule YAML (single ruleset only)}
     Distribution:
       type: string
       enum: [internal, saas, distributed]
@@ -3575,7 +3772,7 @@ components:
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns'}
+        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license, sast], description: 'Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns. `sast` entries (advisory id `<tool>:<rule>`, evidence with tool, rule, CWE ids, path and lines, code hash, data-flow steps and `suppressed_in_code`; no code) gate only when new: a new critical fails, a new high warns; inline-suppressed entries never gate, and a suppression added for an open entry raises integrity entry `SCRS-SAST-SUPPRESSION-ADDED`. Vulnerability evidence carries `reachability` (status reachable, imported_only, not_reachable, unknown or unsupported; method, tool, confidence, file-and-line trace) when reachability ran; reachable adds 10 to the score and not reachable subtracts 15, known-exploited entries keep at least 45, and nothing is closed for being unreachable'}
         advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
         severity: {type: string, enum: [critical, high, medium, low, info, unknown]}

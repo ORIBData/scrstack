@@ -48,7 +48,13 @@ func assessmentError(w http.ResponseWriter, err error) {
 	}
 }
 func readBody(w http.ResponseWriter, r *http.Request, value any) bool {
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	return readBodyLimit(w, r, value, 64<<10)
+}
+
+// readBodyLimit decodes one JSON value of at most limit bytes, rejecting
+// unknown fields and trailing data.
+func readBodyLimit(w http.ResponseWriter, r *http.Request, value any, limit int64) bool {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(value) != nil || decoder.Decode(new(any)) != io.EOF {
 		writeError(w, 400, "invalid request body")

@@ -40,6 +40,10 @@ func TestVerdictGate(t *testing.T) {
 		{"ioc hunt never gates", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_hunt", Severity: "critical", Change: "new"}}}, nil, "pass"},
 		{"new critical ioc alert fails", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "critical", Change: "new"}}}, nil, "fail"},
 		{"existing ioc alert high does not gate", Result{Complete: true, Findings: []Finding{{Fingerprint: "c", Type: "ioc_alert", Severity: "high", Change: "existing"}}}, nil, "pass"},
+		{"new high SAST entry warns", Result{Complete: true, Findings: []Finding{sastEntry("s", "high", "new", false)}}, nil, "warn"},
+		{"new critical SAST entry fails", Result{Complete: true, Findings: []Finding{sastEntry("s", "critical", "new", false)}}, nil, "fail"},
+		{"existing critical SAST entry does not gate", Result{Complete: true, Findings: []Finding{sastEntry("s", "critical", "existing", false)}}, nil, "pass"},
+		{"suppressed-in-code SAST entry never gates", Result{Complete: true, Findings: []Finding{sastEntry("s", "critical", "new", true)}}, nil, "pass"},
 		{"report-only licence deny warns", Result{Complete: true, Findings: []Finding{licenseEntry("l", "deny", false)}}, nil, "warn"},
 		{"report-only licence review does not gate", Result{Complete: true, Findings: []Finding{licenseEntry("l", "review", false)}}, nil, "pass"},
 		{"enforcing licence deny fails, existing too", Result{Complete: true, Findings: []Finding{withChange(licenseEntry("l", "deny", true), "existing")}}, nil, "fail"},
@@ -77,4 +81,9 @@ func TestClosableTypesRequireProducingStages(t *testing.T) {
 func licenseEntry(fingerprint, effect string, enforcing bool) Finding {
 	evidence, _ := json.Marshal(licenseEvidence{Enforcing: enforcing, Decision: license.Decision{Effect: effect}})
 	return Finding{Fingerprint: fingerprint, Type: "license", Severity: "high", Change: "new", Evidence: evidence}
+}
+
+func sastEntry(fingerprint, severity, change string, suppressed bool) Finding {
+	evidence, _ := json.Marshal(map[string]any{"suppressed_in_code": suppressed})
+	return Finding{Fingerprint: fingerprint, Type: "sast", Severity: severity, Change: change, Evidence: evidence}
 }

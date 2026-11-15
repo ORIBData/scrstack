@@ -18,9 +18,9 @@ The PRD planned spikes S1–S13 before M2. Most questions were answered while bu
 | S7 | YARA engine | YARA-X CLI for rulesets; ClamAV YARA subset for starter rules (ADR-006) | Verified |
 | S8 | Archive by commit, fork PR head, relay body integrity | Archives by immutable commit with redirects refused; PR scans pin the head commit; relay signatures over the exact body are verified | Verified (archive, relay); fork PR head Observed |
 | S9 | NVD full-sync volume; NVD, CVE and OSV overlap; licence detector | Targeted sync instead of a full mirror; licence detector `google/licensecheck` (ADR-025) | Verified (detector); volumes Open |
-| S10 | SAST sandboxing | Not started (M9) | Open |
-| S11 | Zennoxa Shield evaluation | Not started (M9) | Open |
-| S12 | Reachability beyond Go | Not started (M9) | Open |
+| S10 | SAST sandboxing | Every analyzer runs offline in `scrs-sast`; nothing in a hostile repository executes | Verified (spike); `make sast-image-test` |
+| S11 | Zennoxa Shield evaluation | No-go for now; revisit conditions recorded | Decided |
+| S12 | Reachability beyond Go | Go by govulncheck call graph; every other ecosystem unsupported | Verified (Go); others Open |
 | S13 | GitLab, Docker Hub and GAR adapters | `:test` and `:discover` for every provider | Verified |
 
 ## S1 OSV-Scanner integration
@@ -107,9 +107,44 @@ The PRD planned spikes S1–S13 before M2. Most questions were answered while bu
 
 **Licence detector (M8):** `github.com/google/licensecheck` (BSD-3-Clause, pure Go, the detector pkg.go.dev uses), embedded in the scanner. ScanCode Toolkit was not chosen: it is a Python runtime with a large data set in the scanner image. Detection only covers licence files next to a package; declared data and deps.dev metadata come first (ADR-025). Tested in `internal/license` and `internal/scanner/licenses_test.go`.
 
-## S10–S12 SAST, Shield, reachability
+## S10 SAST sandboxing
 
-Not started; they belong to M9 and will be recorded here when done.
+**Outcome:** gosec 2.30.0, Bandit 1.9.4, OpenGrep 2.0.0 and Bearer 2.1.3 run in a separate image (`deploy/Dockerfile.sast`), with no network, a read-only root, no capabilities and a non-root user.
+
+**What each tool needed:**
+- **Bearer** downloads its default rules at start-up, so its rules (v0.48.4) are bundled and pinned. It needs `git`, whose configuration is never read, so a hostile repository cannot point `core.fsmonitor` at a program.
+- **OpenGrep** needs writable cache and config directories.
+- **gosec** type-checks with the Go toolchain under `CGO_ENABLED=0` and `GOPROXY=off`.
+
+**Hostile repository:** a cgo preamble, `go:generate`, and a `setup.py` that writes a canary and calls out. No tool created a canary, because none of them runs a build, install, generate or cgo step.
+
+**Run time:** about one to three seconds per tool on the samples.
+
+**Evidence:** the spike runs of 2026-11-15; `make sast-image-test` repeats them against the release image on an internal-only network.
+
+**Open:** run time and memory on a large monorepo.
+
+## S11 Zennoxa Shield
+
+**Outcome: no-go for now.** The CLI repository holds release binaries only, and its scanning engine is a separate proprietary product, free only during its beta. The project is young, and its own comparison page says it has no inter-procedural data flow. SCRS already bundles four analyzers with pinned versions and known licences.
+
+**Revisit when:**
+- the engine has published licence terms after the beta;
+- signed releases are pinned by hash;
+- it is shown not to make network calls in offline mode;
+- it shows better results than the bundled set on our repositories.
+
+It would then be one more optional analyzer behind the same interface.
+
+## S12 Reachability beyond Go
+
+**Outcome:**
+- **Go:** `govulncheck` 1.9.0 against a database built from the OSV Go feed SCRS already syncs. Its traces give file and line, and it separates calls (`reachable`), imports (`imported_only`) and required-only modules (`not_reachable`). On the samples it matched OSV-Scanner's own call analysis.
+- **Module downloads** go through a proxy that allows `proxy.golang.org` and `sum.golang.org` only; private modules report `unknown`.
+- **Rust** analysis compiles code, so it is not offered (REA-006).
+- **Java/Kotlin, Python, C# and JavaScript:** no verified open-source call-graph analyzer, so they report `unsupported`.
+
+**Open:** a false-negative study on our own Go services, and import-level fallbacks (REA-005, P2).
 
 ## S13 Provider adapters
 

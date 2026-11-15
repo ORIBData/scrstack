@@ -289,7 +289,8 @@ func fingerprint(a Assessment, f Finding) string {
 // source's mode in the type: yara_match and ioc_match block like malware,
 // yara_alert and ioc_alert gate by severity like a vulnerability, and
 // yara_hunt and ioc_hunt never gate. E2E QA findings (qa_*) are
-// report-only. Licence entries follow the licence policy: while it is
+// report-only. SAST entries gate only when new (a new critical fails, a new
+// high warns) and never when suppressed in code. Licence entries follow the licence policy: while it is
 // report-only a deny warns; once enforcing, deny fails and review warns.
 func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 	failing, warning := false, false
@@ -322,6 +323,13 @@ func verdict(r Result, waived map[string]bool) (string, map[string]int) {
 			failing = true
 		case f.Type == "integrity":
 			warning = warning || serious || !existing
+		case f.Type == "sast":
+			// Only new SAST entries gate; inline-suppressed ones never do.
+			fail, warn, suppressed := sastGate(f)
+			if suppressed {
+				counts["suppressed_in_code"]++
+			}
+			failing, warning = failing || fail, warning || warn
 		case f.Type == "license":
 			// Licence entries gate by policy result, new or existing.
 			counts["license"]++
@@ -377,6 +385,7 @@ func closableTypes(stages []Stage) []string {
 		"yara_hunt":            {"yara_x"},
 		"qa_unconfigured":      {"integrity"},
 		"license":              {"inventory", "license"},
+		"sast":                 {"sast"},
 	}
 	types := []string{}
 	for kind, needed := range producers {
