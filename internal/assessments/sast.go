@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -377,4 +378,97 @@ func (s *Store) suppressionsAdded(ctx context.Context, tx pgx.Tx, baseline uuid.
 		out = append(out, Finding{Type: "integrity", AdvisoryID: "SCRS-SAST-SUPPRESSION-ADDED", Title: "Inline suppression added for an open static-analysis finding", Severity: "medium", Score: 30, Component: Component{Path: f.Component.Path}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Confirm the suppression was reviewed: a comment such as #nosec or nosemgrep silences the analyzer for this line. If it was not intended, remove it and fix the finding.","automatic_changes":false}`)})
 	}
 	return out, nil
+}
+
+// suppressConfigured marks open SAST entries that this run's disabled rules
+// or path excludes now hide as "suppressed" (with the filter as the reason)
+// before absence-based closure runs: the analyzer stopped reporting them
+// because it was told to, which is not evidence of a fix (D6).
+func (s *Store) suppressConfigured(ctx context.Context, tx pgx.Tx, a Assessment, r Result) error {
+	if len(r.SASTDisabledRules) == 0 && len(r.SASTExcludes) == 0 {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT id,evidence FROM `+s.schema+`.findings WHERE asset_id=$1 AND ref=$2 AND type='sast' AND last_assessment_id<>$3 AND status IN ('open','triaged','in_progress')`, a.AssetID, a.Request.Target.Ref, a.ID)
+	if err != nil {
+		return err
+	}
+	type hit struct {
+		id     uuid.UUID
+		filter string
+	}
+	var hits []hit
+	for rows.Next() {
+		var id uuid.UUID
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			rows.Close()
+			return err
+		}
+		var e sastEvidence
+		if json.Unmarshal(raw, &e) != nil {
+			continue
+		}
+		if filter := configuredFilter(e, r.SASTDisabledRules, r.SASTExcludes); filter != "" {
+			hits = append(hits, hit{id, filter})
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, h := range hits {
+		details, _ := json.Marshal(map[string]string{"assessment_id": a.ID.String(), "filter": h.filter})
+		if _, err := tx.Exec(ctx, `WITH u AS (UPDATE `+s.schema+`.findings SET status='suppressed',revision=revision+1 WHERE id=$1 RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'suppressed_by_configuration',$2 FROM u`, h.id, details); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// configuredFilter returns the disabled rule ("tool:rule", globs) or path
+// exclude that hides an entry, or "".
+func configuredFilter(e sastEvidence, rules, excludes []string) string {
+	for _, d := range rules {
+		tool, rule, qualified := strings.Cut(d, ":")
+		if !qualified {
+			tool, rule = "*", d
+		}
+		toolOK, _ := path.Match(tool, e.Tool)
+		ruleOK, _ := path.Match(rule, e.RuleID)
+		if toolOK && ruleOK {
+			return "disabled rule " + d
+		}
+	}
+	for _, glob := range excludes {
+		if matchPathGlob(glob, e.Path) || (strings.HasSuffix(glob, "/**") && strings.HasPrefix(e.Path, strings.TrimSuffix(glob, "**"))) {
+			return "excluded path " + glob
+		}
+	}
+	return ""
+}
+
+// matchPathGlob matches slash-separated paths; "**" spans directories.
+func matchPathGlob(pattern, name string) bool {
+	return globSegments(strings.Split(pattern, "/"), strings.Split(name, "/"))
+}
+
+func globSegments(pattern, name []string) bool {
+	for len(pattern) > 0 {
+		if pattern[0] == "**" {
+			for i := 0; i <= len(name); i++ {
+				if globSegments(pattern[1:], name[i:]) {
+					return true
+				}
+			}
+			return false
+		}
+		if len(name) == 0 {
+			return false
+		}
+		if ok, _ := path.Match(pattern[0], name[0]); !ok {
+			return false
+		}
+		pattern, name = pattern[1:], name[1:]
+	}
+	return len(name) == 0
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/scanner"
@@ -59,12 +60,14 @@ func (s *Server) Handler(token string) http.Handler {
 		case r.Method == "POST" && r.URL.Path == "/analyze":
 			select {
 			case slots <- struct{}{}:
-				defer func() { <-slots }()
 			default:
 				http.Error(w, "analyzer busy", 429)
 				return
 			}
-			s.analyze(w, r)
+			var once sync.Once
+			release := func() { once.Do(func() { <-slots }) }
+			defer release()
+			s.analyze(w, r, release)
 		default:
 			http.Error(w, "not found", 404)
 		}
@@ -77,7 +80,7 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 
 // analyze reads a multipart body: "request" (JSON) then "archive" (tar.gz).
-func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
+func (s *Server) analyze(w http.ResponseWriter, r *http.Request, release func()) {
 	r.Body = http.MaxBytesReader(w, r.Body, 72<<20)
 	reader, err := r.MultipartReader()
 	if err != nil {
@@ -132,7 +135,11 @@ func (s *Server) analyze(w http.ResponseWriter, r *http.Request) {
 	// The request budget covers every analyzer plus reachability.
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Minute)
 	defer cancel()
-	writeJSON(w, s.Engine.Analyze(ctx, source, scratch, req))
+	resp := s.Engine.Analyze(ctx, source, scratch, req)
+	// Free the slot before replying, so the caller's next request is not
+	// refused as busy while this response is still being written.
+	release()
+	writeJSON(w, resp)
 }
 
 // validate compiles uploaded OpenGrep rules without scanning anything.
@@ -168,13 +175,29 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	_, stderr, err := execute(ctx, work, isolatedEnv(work), []int{0}, og.Bin, "validate", "--config", file, "--quiet")
+	// "opengrep validate" downloads lint rules from semgrep.dev, which the
+	// sandbox blocks; a strict scan of an empty directory compiles the rules
+	// offline and fails on any schema or pattern error.
+	empty := filepath.Join(work, "empty")
+	_ = os.Mkdir(empty, 0o700)
+	out, stderr, err := execute(ctx, work, isolatedEnv(work, "SEMGREP_SEND_METRICS=off"), []int{0}, og.Bin, "scan", "--config", file, "--strict", "--quiet", "--json", "--disable-version-check", empty)
 	result := map[string]any{"valid": err == nil}
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
+		var report struct {
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
 			result["error"] = "validation timed out"
-		} else {
+		case json.Unmarshal(out, &report) == nil && len(report.Errors) > 0:
+			result["error"] = strings.Join(strings.Fields(report.Errors[0].Message), " ")
+		default:
 			result["error"] = strings.TrimSpace(firstLine(string(stderr)))
+		}
+		if result["error"] == "" {
+			result["error"] = "rules do not compile"
 		}
 	}
 	writeJSON(w, result)

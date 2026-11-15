@@ -72,7 +72,11 @@ SCRS bundles open-source static analyzers and a Go reachability tool (ADR-018). 
 
 **Suppressions added in code:** an entry that was open in the baseline but is now silenced by an inline comment raises an integrity entry, `SCRS-SAST-SUPPRESSION-ADDED` (medium). It stays open until someone reviews it (AT-27).
 
-**Closure:** entries close when a complete SAST run of the ref no longer reports them.
+**Closure:** an entry closes when a complete SAST run of the ref no longer reports it, and only if *its own* analyzer ran with full coverage. An analyzer deselected for the asset, skipped, partial or failed did not look, so its entries stay open.
+
+**Disabled rules and excludes:** an open entry hidden by a disabled rule or an excluded path becomes `suppressed`, with a `suppressed_by_configuration` event naming the filter. It is never marked `fixed`, because the code did not change. It is reopened if the filter is removed and the analyzer reports it again.
+
+**Coverage gaps count:** gosec reports Go packages it could not load (type errors, missing modules, cgo). Its run is then `partial` and the assessment `incomplete`. To keep dependencies loadable, gosec downloads modules through the same go-modules proxy as reachability.
 
 ## Reachability (REA-001 to REA-007)
 
@@ -102,7 +106,7 @@ SCRS bundles open-source static analyzers and a Go reachability tool (ADR-018). 
 | Analyzers allowed in the deployment | `SCRS_SAST_ANALYZERS` | all four |
 | Analyzers for one asset | `analyzers` | all allowed |
 | Disabled rules (`tool:rule`, globs) and excluded paths (globs) | `PUT /sast/settings` (admin) plus per asset | none |
-| Custom OpenGrep rules | `POST /sast/rulesets` (write; compiled by the service first); `DELETE` (admin) | none |
+| Custom OpenGrep rules | `POST /sast/rulesets` (write; compiled offline by the service first, with a strict scan of an empty directory); `DELETE` (admin) | none |
 
 All changes need `If-Match` and are audited.
 
@@ -125,7 +129,7 @@ The service is not published through Traefik. See [DOKPLOY.md](DOKPLOY.md).
 | `internal/sast` unit tests | Parsers fed the real outputs of the pinned tools, govulncheck classification, workspace and suppression identity, correlation, budgets and selection |
 | `internal/worker` | Reachability mapping and scores, entry mapping and stage status |
 | `TestPostgresSASTAndReachabilityPipeline` | New against existing entries, the suppression-added integrity entry, closure, a failed analyzer leaving the assessment incomplete, settings, rulesets and audit records |
-| `make sast-image-test` | Starts the real image on an internal-only network with the go-modules proxy, and runs AT-27, AT-28 (canary check) and AT-29 |
+| `make sast-image-test` | Starts the real image on an internal-only network with the go-modules proxy, and runs AT-27, AT-28 and AT-29. The canary check runs from the host, not inside the container under test |
 
 **Spike results (2026-11-15):**
 - Every analyzer ran offline.

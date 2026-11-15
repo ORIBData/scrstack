@@ -2,6 +2,7 @@ package sast
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,6 +67,16 @@ func TestParsers(t *testing.T) {
 		if _, err := ParseSARIF("x", bad, nil); err == nil {
 			t.Fatal("invalid SARIF accepted")
 		}
+	}
+	// gosec's report of packages it could not load is a coverage gap.
+	gap := []byte(`{"Golang errors":{".":[{"line":0,"column":0,"error":"importing dir \".\": main.go: malformed #cgo argument"}]},"Issues":[],"Stats":{}}`)
+	findings, err := ParseGosec(gap)
+	var partial *PartialError
+	if !errors.As(err, &partial) || len(findings) != 0 || !strings.Contains(partial.Detail, "malformed #cgo") {
+		t.Fatalf("gosec load errors: %v %v", findings, err)
+	}
+	if f, err := ParseGosec([]byte(`{"Golang errors":{},"Issues":[]}`)); err != nil || len(f) != 0 {
+		t.Fatalf("clean gosec report: %v", err)
 	}
 	if got := cwes("CWE-79: XSS", "external/cwe/cwe-079", "OWASP-A03"); len(got) != 1 || got[0] != "CWE-79" {
 		t.Fatalf("cwes %v", got)

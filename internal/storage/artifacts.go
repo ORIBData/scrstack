@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"regexp"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 )
@@ -246,4 +247,24 @@ func (a *Artifacts) DeleteObject(ctx context.Context, key string) error {
 		return errors.New("object key is not a purgeable artifact")
 	}
 	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})
+}
+
+// ListObjects returns up to limit keys under prefix last modified before
+// the cutoff (the orphan sweep reads candidates with it).
+func (a *Artifacts) ListObjects(ctx context.Context, prefix string, before time.Time, limit int) ([]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	out := []string{}
+	for object := range a.client.ListObjects(ctx, a.bucket, minio.ListObjectsOptions{Prefix: prefix, Recursive: true}) {
+		if object.Err != nil {
+			return out, object.Err
+		}
+		if object.LastModified.Before(before) {
+			out = append(out, object.Key)
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
 }

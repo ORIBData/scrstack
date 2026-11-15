@@ -95,7 +95,12 @@ var semverLike = regexp.MustCompile(`v?([0-9]+\.[0-9]+\.[0-9]+)`)
 // Gosec analyses Go modules (Apache-2.0). It type-checks with the Go
 // toolchain offline: modules that are not vendored still produce findings
 // for the code that type-checks.
-type Gosec struct{ Bin string }
+type Gosec struct {
+	Bin string
+	// Proxy, when set, lets the Go toolchain download modules through the
+	// go-modules egress proxy so dependencies type-check.
+	Proxy string
+}
 
 func (g Gosec) Meta() Meta {
 	return Meta{Name: "gosec", Languages: []string{"go"}, License: "Apache-2.0", Redistributable: true}
@@ -111,17 +116,30 @@ func (g Gosec) Run(ctx context.Context, ws *Workspace, opts Options) ([]Finding,
 		modules = []string{"."}
 	}
 	out := []Finding{}
+	env := isolatedEnv(opts.Scratch)
+	if g.Proxy != "" {
+		env = append(env, goProxyEnv(g.Proxy)...)
+	}
+	var gaps []string
 	for _, dir := range modules {
-		// -nosec=true ignores #nosec: SCRS records suppressions itself.
-		data, _, err := execute(ctx, filepath.Join(ws.Root, dir), isolatedEnv(opts.Scratch), []int{0, 1}, g.Bin, "-quiet", "-fmt=json", "-nosec=true", "-exclude-generated", "./...")
+		// -nosec=true ignores #nosec: SCRS records suppressions itself. No
+		// -quiet: gosec then prints nothing when it finds nothing, and its
+		// report of packages it could not load would be lost.
+		data, _, err := execute(ctx, filepath.Join(ws.Root, dir), env, []int{0, 1}, g.Bin, "-fmt=json", "-nosec=true", "-exclude-generated", "./...")
 		if err != nil {
 			return out, err
 		}
 		findings, err := ParseGosec(data)
-		if err != nil {
+		var partial *PartialError
+		if errors.As(err, &partial) {
+			gaps = append(gaps, dir+": "+partial.Detail)
+		} else if err != nil {
 			return out, err
 		}
 		out = append(out, findings...)
+	}
+	if len(gaps) > 0 {
+		return out, &PartialError{Detail: strings.Join(gaps, "; ")}
 	}
 	return out, nil
 }

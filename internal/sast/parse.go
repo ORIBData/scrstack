@@ -3,10 +3,12 @@ package sast
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -41,9 +43,13 @@ func severity(raw string) string {
 	return "info"
 }
 
-// ParseGosec reads gosec JSON (-fmt=json).
+// ParseGosec reads gosec JSON (-fmt=json). Packages gosec could not load
+// (type errors, missing modules, cgo) are returned as a coverage gap.
 func ParseGosec(data []byte) ([]Finding, error) {
 	var out struct {
+		Errors map[string][]struct {
+			Error string `json:"error"`
+		} `json:"Golang errors"`
 		Issues []struct {
 			Severity   string `json:"severity"`
 			Confidence string `json:"confidence"`
@@ -68,8 +74,26 @@ func ParseGosec(data []byte) ([]Finding, error) {
 		}
 		findings = append(findings, f)
 	}
+	if len(out.Errors) > 0 {
+		dirs := make([]string, 0, len(out.Errors))
+		for dir := range out.Errors {
+			dirs = append(dirs, dir)
+		}
+		sort.Strings(dirs)
+		detail := "load error"
+		if errs := out.Errors[dirs[0]]; len(errs) > 0 {
+			detail = firstLine(errs[0].Error)
+		}
+		return findings, &PartialError{Detail: fmt.Sprintf("%d Go package(s) could not be loaded, for example %s: %s", len(dirs), dirs[0], detail)}
+	}
 	return findings, nil
 }
+
+// PartialError reports findings from an analyzer that covered only part of
+// the workspace; the run is "partial", so the assessment is incomplete.
+type PartialError struct{ Detail string }
+
+func (e *PartialError) Error() string { return e.Detail }
 
 // lineRange parses "13" or "13-15".
 func lineRange(s string) (int, int) {

@@ -270,6 +270,14 @@ type Result struct {
 	SBOMKey    string
 	SBOMSHA256 string
 	Complete   bool
+	// SASTTools are the analyzers that ran with full coverage; only their
+	// entries can close by absence (an analyzer deselected for the asset
+	// did not look, so its entries stay open).
+	SASTTools []string
+	// SASTDisabledRules and SASTExcludes are the filters applied to this
+	// run: entries they hide are suppressed by configuration, not fixed.
+	SASTDisabledRules []string
+	SASTExcludes      []string
 }
 
 func Hash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }

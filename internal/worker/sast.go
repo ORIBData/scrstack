@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -22,13 +23,13 @@ const (
 // analyzeSource sends the repository archive to scrs-sast when SAST or
 // reachability applies to the asset, adds SAST entries and sets the
 // reachability of vulnerability entries (M9).
-func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, archive []byte, output *scanner.Output) []assessments.Stage {
+func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, archive []byte, output *scanner.Output, result *assessments.Result) ([]assessments.Stage, error) {
 	if w.SAST == nil {
-		return nil
+		return nil, nil
 	}
 	settings, err := w.Store.EffectiveSASTSettings(ctx, a.AssetID, w.SASTDefaults)
 	if err != nil || (!settings.Enabled && !settings.Reachability) {
-		return nil
+		return nil, nil
 	}
 	req := sast.Request{Analyzers: settings.Analyzers, DisabledRules: settings.DisabledRules, Excludes: settings.Excludes, CustomRules: settings.CustomRules, Reachability: settings.Reachability, Timeout: w.SASTTimeout}
 	if !settings.Enabled {
@@ -49,8 +50,26 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 			}
 		}
 	}()
-	resp, err := w.SAST.Analyze(ctx, archive, req)
+	// A busy service serves another assessment: wait for a slot for up to
+	// three minutes, then requeue the job without spending an attempt.
+	var resp sast.Response
+	for wait := time.Now().Add(3 * time.Minute); ; {
+		resp, err = w.SAST.Analyze(ctx, archive, req)
+		if !errors.Is(err, sast.ErrBusy) || time.Now().After(wait) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
 	stopRenew()
+	if errors.Is(err, sast.ErrBusy) {
+		return nil, errScannerBusy
+	}
 	stages := []assessments.Stage{}
 	if err != nil {
 		if settings.Enabled {
@@ -60,7 +79,7 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 			applyReachability(output.Findings, &sast.Reachability{Status: "failed", Detail: err.Error()}, w.weights())
 			stages = append(stages, assessments.Stage{Name: "reachability", Status: "failed", Detail: "analysis unavailable; vulnerability entries are unknown"})
 		}
-		return stages
+		return stages, nil
 	}
 	if settings.Enabled {
 		added := 0
@@ -72,6 +91,12 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 			added++
 		}
 		stages = append(stages, sastStage(resp, added))
+		result.SASTDisabledRules, result.SASTExcludes = settings.DisabledRules, settings.Excludes
+		for _, run := range resp.Runs {
+			if run.Status == "ok" {
+				result.SASTTools = append(result.SASTTools, run.Analyzer)
+			}
+		}
 	}
 	if settings.Reachability {
 		r := resp.Reachability
@@ -85,7 +110,16 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 		}
 		stages = append(stages, assessments.Stage{Name: "reachability", Status: status, Detail: fmt.Sprintf("%s %s: reachable %d, imported only %d, not reachable %d, unknown %d, unsupported %d", r.Tool, r.Version, counts[sast.Reachable], counts[sast.ImportedOnly], counts[sast.NotReachable], counts[sast.Unknown], counts[sast.Unsupported])})
 	}
-	return stages
+	return stages, nil
+}
+
+// sastDeadline bounds a repository job with SAST: the scan, every analyzer
+// at its budget, reachability, and enrichment, within one hour.
+func sastDeadline(budget time.Duration) time.Duration {
+	if budget <= 0 {
+		budget = sast.DefaultTimeout
+	}
+	return min(5*time.Minute+5*budget+2*time.Minute, time.Hour)
 }
 
 func (w Worker) weights() [2]int {

@@ -105,12 +105,17 @@ func TestSASTImageAcceptance(t *testing.T) {
 
 	// AT-28: the hostile repository (cgo preamble, go:generate, setup.py)
 	// completes; the Makefile target checks no canary file was created.
+	// gosec cannot load the cgo package, so its run is partial (the
+	// assessment would be incomplete, never pass); nothing fails or hangs.
 	hostile, err := client.Analyze(ctx, archive(t, "testdata/hostile"), Request{Reachability: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, run := range hostile.Runs {
-		if run.Status != "ok" && run.Status != "skipped" {
+		switch {
+		case run.Analyzer == "gosec" && run.Status == "partial" && strings.Contains(run.Detail, "cgo"):
+		case run.Status == "ok" || run.Status == "skipped":
+		default:
 			t.Fatalf("hostile run %+v", run)
 		}
 	}

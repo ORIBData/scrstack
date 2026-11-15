@@ -396,8 +396,17 @@ The deployment test asserts the runner's labels, networks and lack of secrets. `
 - the `internal/sast` and `internal/worker` unit tests and `make qa`;
 - spike S10 against the real image: every tool offline, and the hostile repository inert.
 
-**To finish verifying:**
-- `TestPostgresSASTAndReachabilityPipeline` and `make sast-image-test`. Both were written while Docker on the development machine was out of disk space; run `make database-test` and `make sast-image-test`.
+**Verified on 2026-11-15:** `make database-test` (including `TestPostgresSASTAndReachabilityPipeline`) and `make sast-image-test` (AT-27, AT-28 and AT-29 against the real image).
+
+**Fixed by that verification and a review against the design decisions:**
+- **Busy slot:** the service freed its slot only after writing a response, so back-to-back requests were refused as busy. A busy service now makes the worker wait up to three minutes and then requeue the job without spending an attempt, as it does for the scanner.
+- **Job deadline:** repository jobs had a five-minute deadline, which would have cut every SAST run short. The deadline now covers the analyzer budgets, up to one hour, with the lease renewed meanwhile.
+- **Silent gosec gaps:** with `-quiet`, gosec printed nothing when clean and hid packages it could not load. Load failures now make its run `partial`, and gosec fetches modules through the go-modules proxy.
+- **Rule validation:** `opengrep validate` downloads lint rules from the internet; custom rules now compile offline.
+- **Closure:** an `ok` run closed the entries of analyzers that had been deselected. Only an entry's own analyzer can close it now.
+- **Canary check:** the hostile-repository check ran inside the container under test. It now runs from the host.
+- **Configured suppression:** disabling a SAST rule or excluding a path marked hidden entries `fixed`. They are now `suppressed` with the filter recorded.
+- **Orphan objects:** artifacts uploaded before a completion that never committed were never deleted. A daily, audited orphan sweep now removes unreferenced objects older than 24 hours.
 
 **Not verified:** run time on large repositories, and a false-negative study of reachability on our own services.
 

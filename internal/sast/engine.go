@@ -2,6 +2,7 @@ package sast
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ const DefaultTimeout = 10 * time.Minute
 
 // New builds the engine from the bundled tool paths.
 func New(p Paths, feed, proxy string, enabled []string) *Engine {
-	e := &Engine{Analyzers: []Analyzer{Gosec{Bin: p.Gosec}, Bandit{Bin: p.Bandit}, &OpenGrep{Bin: p.OpenGrep, RuleDir: p.OpenGrepRules}, &Bearer{Bin: p.Bearer, RuleDir: p.BearerRules}}, Enabled: map[string]bool{}}
+	e := &Engine{Analyzers: []Analyzer{Gosec{Bin: p.Gosec, Proxy: proxy}, Bandit{Bin: p.Bandit}, &OpenGrep{Bin: p.OpenGrep, RuleDir: p.OpenGrepRules}, &Bearer{Bin: p.Bearer, RuleDir: p.BearerRules}}, Enabled: map[string]bool{}}
 	if p.Govulncheck != "" {
 		e.Reacher = &Reacher{Bin: p.Govulncheck, GoBin: p.Go, Feed: feed, Proxy: proxy}
 	}
@@ -87,7 +88,11 @@ func (e *Engine) Analyze(ctx context.Context, root, scratch string, req Request)
 		findings, err := a.Run(actx, ws, Options{Scratch: dir, CustomRules: map[bool]string{true: custom}[m.Name == "opengrep"]})
 		cancel()
 		run.Seconds = time.Since(started).Seconds()
+		var partial *PartialError
 		switch {
+		case errors.As(err, &partial):
+			// Findings are kept; the coverage gap makes the assessment incomplete.
+			run.Status, run.Detail = "partial", partial.Detail
 		case actx.Err() == context.DeadlineExceeded:
 			// A breached budget is skipped, so the verdict is incomplete (SAST-011).
 			run.Status, run.Detail = "skipped", fmt.Sprintf("time budget of %s exceeded", timeout)

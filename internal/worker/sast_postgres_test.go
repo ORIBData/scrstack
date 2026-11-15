@@ -83,7 +83,7 @@ func TestPostgresSASTAndReachabilityPipeline(t *testing.T) {
 	var requests []sast.Request
 	sqli := sast.Finding{Tool: "gosec", ToolVersion: "2.30.0", RuleID: "G701", Title: "SQL injection", Severity: "high", CWE: []string{"CWE-89"}, Path: "svc/db.go", StartLine: 13, EndLine: 13, CodeHash: strings.Repeat("a", 64)}
 	weak := sast.Finding{Tool: "bandit", ToolVersion: "1.9.4", RuleID: "B303", Title: "MD5", Severity: "medium", CWE: []string{"CWE-327"}, Path: "app/hash.py", StartLine: 4, EndLine: 4, CodeHash: strings.Repeat("b", 64)}
-	respond := sast.Response{Runs: []sast.Run{{Analyzer: "gosec", Version: "2.30.0", Status: "ok", Findings: 2}}, Findings: []sast.Finding{sqli, weak}, Reachability: &sast.Reachability{Tool: "govulncheck", Version: "v1.9.0", Status: "ok", Modules: []string{"."}, Verdicts: []sast.Verdict{{Advisory: "GO-2022-1059", Module: "golang.org/x/text", Status: sast.Reachable, Method: "call_graph", Trace: []sast.Step{{Path: "main.go", Line: 10}}}}}}
+	respond := sast.Response{Runs: []sast.Run{{Analyzer: "gosec", Version: "2.30.0", Status: "ok", Findings: 2}, {Analyzer: "bandit", Version: "1.9.4", Status: "ok"}}, Findings: []sast.Finding{sqli, weak}, Reachability: &sast.Reachability{Tool: "govulncheck", Version: "v1.9.0", Status: "ok", Modules: []string{"."}, Verdicts: []sast.Verdict{{Advisory: "GO-2022-1059", Module: "golang.org/x/text", Status: sast.Reachable, Method: "call_graph", Trace: []sast.Step{{Path: "main.go", Line: 10}}}}}}
 	token := strings.Repeat("t", 40)
 	service := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer "+token || r.URL.Path != "/analyze" {
@@ -207,6 +207,56 @@ func TestPostgresSASTAndReachabilityPipeline(t *testing.T) {
 		t.Fatalf("closure: B303 %s, signal %s (verdict %s)", weakStatus, signalStatus, third.Verdict)
 	}
 
+	// Round 3b: a new bandit entry; then the asset deselects bandit. The
+	// next ok run did not look with bandit, so the entry stays open.
+	mu.Lock()
+	respond.Runs = []sast.Run{{Analyzer: "gosec", Version: "2.30.0", Status: "ok"}, {Analyzer: "bandit", Version: "1.9.4", Status: "ok"}}
+	respond.Findings = []sast.Finding{silenced, {Tool: "bandit", ToolVersion: "1.9.4", RuleID: "B602", Title: "shell", Severity: "low", Path: "app/run.py", StartLine: 2, EndLine: 2, CodeHash: strings.Repeat("c", 64)}}
+	mu.Unlock()
+	run("sast-3b")
+	mu.Lock()
+	respond.Runs = []sast.Run{{Analyzer: "gosec", Version: "2.30.0", Status: "ok"}, {Analyzer: "bandit", Status: "skipped", Detail: "not selected for this asset"}}
+	respond.Findings = []sast.Finding{silenced}
+	mu.Unlock()
+	run("sast-3c")
+	var shellStatus string
+	_ = pool.QueryRow(ctx, `SELECT status FROM `+schema+`.findings WHERE advisory_id='bandit:B602'`).Scan(&shellStatus)
+	if shellStatus != "open" {
+		t.Fatalf("entry of an analyzer that did not run was closed: %s", shellStatus)
+	}
+
+	// Round 3d: an admin disables bandit:B602 and the next run no longer
+	// reports it; the entry is suppressed by configuration, not fixed (D6).
+	if _, err := jobs.SetGlobalSASTSettings(ctx, assessments.GlobalSAST{DisabledRules: []string{"bandit:B6*"}}, 0, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	respond.Runs = []sast.Run{{Analyzer: "gosec", Version: "2.30.0", Status: "ok"}, {Analyzer: "bandit", Version: "1.9.4", Status: "ok"}}
+	mu.Unlock()
+	run("sast-3d")
+	var reason string
+	_ = pool.QueryRow(ctx, `SELECT f.status||' '||(e.details->>'filter') FROM `+schema+`.findings f JOIN `+schema+`.finding_events e ON e.finding_id=f.id AND e.action='suppressed_by_configuration' WHERE f.advisory_id='bandit:B602'`).Scan(&reason)
+	if reason != "suppressed disabled rule bandit:B6*" {
+		t.Fatalf("configured suppression: %q", reason)
+	}
+
+	// Round 3e: the filter is removed and bandit reports B602 again; the
+	// configured suppression is lifted.
+	if _, err := jobs.SetGlobalSASTSettings(ctx, assessments.GlobalSAST{}, 1, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	respond.Findings = []sast.Finding{silenced, {Tool: "bandit", ToolVersion: "1.9.4", RuleID: "B602", Title: "shell", Severity: "low", Path: "app/run.py", StartLine: 2, EndLine: 2, CodeHash: strings.Repeat("c", 64)}}
+	mu.Unlock()
+	run("sast-3e")
+	_ = pool.QueryRow(ctx, `SELECT status FROM `+schema+`.findings WHERE advisory_id='bandit:B602'`).Scan(&shellStatus)
+	if shellStatus != "open" {
+		t.Fatalf("filter removed but entry still %s", shellStatus)
+	}
+	mu.Lock()
+	respond.Findings = []sast.Finding{silenced}
+	mu.Unlock()
+
 	// Round 4: an analyzer failure leaves the assessment incomplete and
 	// closes nothing.
 	mu.Lock()
@@ -222,7 +272,7 @@ func TestPostgresSASTAndReachabilityPipeline(t *testing.T) {
 
 	// Settings: the asset turns SAST off (reachability only) and excludes a
 	// path; deployment-wide disabled rules and enabled rulesets are sent.
-	if _, err := jobs.SetGlobalSASTSettings(ctx, assessments.GlobalSAST{DisabledRules: []string{"gosec:G104"}, Excludes: []string{"docs/**"}}, 0, uuid.New()); err != nil {
+	if _, err := jobs.SetGlobalSASTSettings(ctx, assessments.GlobalSAST{DisabledRules: []string{"gosec:G104"}, Excludes: []string{"docs/**"}}, 2, uuid.New()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := jobs.SaveSASTRuleset(ctx, "no-eval", "team rule", "rules: []\n", true, uuid.New()); err != nil {
@@ -255,7 +305,7 @@ func TestPostgresSASTAndReachabilityPipeline(t *testing.T) {
 	}
 	var audits int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.audit_log WHERE action IN ('sast_settings.updated','sast_ruleset.saved','asset.sast_settings_updated')`).Scan(&audits)
-	if audits != 3 {
+	if audits != 5 {
 		t.Fatalf("audit records %d", audits)
 	}
 }

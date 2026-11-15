@@ -262,6 +262,10 @@ func (w Worker) Run(ctx context.Context) error {
 		deadline := 5 * time.Minute
 		if a.Request.Target.Type == "image" {
 			deadline = 9 * time.Minute // registry download plus scan; lease is 10 minutes
+		} else if w.SAST != nil {
+			// Analyzers run one after another, then reachability; the lease is
+			// renewed meanwhile (analyzeSource).
+			deadline = sastDeadline(w.SASTTimeout)
 		}
 		jobCtx, cancel := context.WithTimeout(ctx, deadline)
 		err = w.run(jobCtx, &a)
@@ -438,13 +442,18 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	stages = append(stages, output.Stages...)
 	// SAST entries and reachability before enrichment: safe versions and
 	// the SBOM are computed from the final findings.
-	stages = append(stages, w.analyzeSource(ctx, a, archive, &output)...)
+	var sastResult assessments.Result
+	analysed, err := w.analyzeSource(ctx, a, archive, &output, &sastResult)
+	if err != nil {
+		return err
+	}
+	stages = append(stages, analysed...)
 	extra, key, digest, err := w.enrich(ctx, *a, &output, commit)
 	if err != nil {
 		return err
 	}
 	stages = append(stages, extra...)
-	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true})
+	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: commit, RefMoved: moved, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: digest, Complete: true, SASTTools: sastResult.SASTTools, SASTDisabledRules: sastResult.SASTDisabledRules, SASTExcludes: sastResult.SASTExcludes})
 }
 
 // Maintain runs retention, idempotency expiry and optional default-branch

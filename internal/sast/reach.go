@@ -213,8 +213,7 @@ func (r *Reacher) Analyze(ctx context.Context, ws *Workspace, scratch string) *R
 	}
 	env := isolatedEnv(scratch)
 	if r.Proxy != "" {
-		// Only module downloads leave the sandbox, through the egress proxy.
-		env = append(env, "GOPROXY=https://proxy.golang.org", "GOSUMDB=sum.golang.org", "HTTPS_PROXY="+r.Proxy, "https_proxy="+r.Proxy, "NO_PROXY=", "GOFLAGS=-mod=mod")
+		env = append(env, goProxyEnv(r.Proxy)...)
 	}
 	for _, dir := range modules {
 		out.Modules = append(out.Modules, dir)
@@ -340,4 +339,10 @@ func ParseGovulncheck(data []byte, moduleDir string) ([]Verdict, error) {
 		out = append(out, best[k])
 	}
 	return out, nil
+}
+
+// goProxyEnv lets the Go toolchain download modules, checksum-verified,
+// through the egress proxy; nothing else leaves the sandbox.
+func goProxyEnv(proxy string) []string {
+	return []string{"GOPROXY=https://proxy.golang.org", "GOSUMDB=sum.golang.org", "HTTPS_PROXY=" + proxy, "https_proxy=" + proxy, "NO_PROXY=", "GOFLAGS=-mod=mod"}
 }

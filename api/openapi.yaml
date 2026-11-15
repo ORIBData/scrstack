@@ -3919,6 +3919,7 @@ components:
         purged: {type: object, additionalProperties: {type: integer}, description: Rows removed per retention class}
         objects_deleted: {type: integer}
         object_errors: {type: integer}
+        orphans_deleted: {type: integer, description: 'Unreferenced artifacts older than 24 hours removed by the daily orphan sweep (an upload whose database write never committed)'}
     AuditEntry:
       type: object
       properties:
