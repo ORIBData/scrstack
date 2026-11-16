@@ -125,7 +125,7 @@ If an HTTP node port is needed for local VPS diagnostics, add
 only and forwards it to the container's port 7000, e.g. `curl http://127.0.0.1:7000/scrs/v1/system/readyz`.
 Probes: `/system/healthz` and `/system/readyz` are public and answer only `ok` or `unavailable` (load balancers).
 A frontend status page should call `GET /system/status` with a `read` token. It reports `api`, `postgres`, `redis`,
-`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast` and `qa_runner` as `ok`, `degraded`, `down` or `not_configured`,
+`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast`, `qa_runner` and `dependency_track` (only while the export is on) as `ok`, `degraded`, `down` or `not_configured`,
 and always answers `200`, so read its `status` field. The QA runner's own `/healthz` returns 503 with the names of
 failed prerequisites (`karate`, `work_dir`, `java`, `gatling_classpath`), which makes Docker mark it unhealthy.
 
@@ -272,8 +272,12 @@ How the two services connect:
 - **Public router.** Traefik gives the runner its own router (`SCRS_QA_ROUTER_NAME`),
   certificate and hostname, with an http→https redirect. Every call also needs the
   runner's bearer token.
+- **Operator route.** The public router exists for operators who run standalone QA,
+  performance and load jobs on the runner. These jobs are independent of SCRS
+  assessments and of supply-chain checks, and SCRS does not record them. See
+  [QA_TESTING.md](QA_TESTING.md#standalone-operator-use).
 - **Allowlist.** The default `SCRS_QA_RUNNER_ALLOWED_CIDRS=127.0.0.1/32` lets nobody
-  in from outside. Add the CIDRs of tools that should call the runner directly.
+  in from outside. Add the CIDRs of the operators and tools that should call the runner directly.
 - **Ports.** Each service has its own container port (7000 and 8090), and both are
   published on 443 by hostname. Neither binds a host port.
 - **DNS.** Create a record for `SCRS_QA_DOMAIN` pointing at the VPS.

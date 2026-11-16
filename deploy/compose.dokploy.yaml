@@ -340,8 +340,9 @@ services:
 
   # E2E QA Karate runner (its own image, deploy/karate-runner/Dockerfile).
   # SCRS reaches it privately at http://scrs-qa-runner:8090 on the internal
-  # qa network; Traefik also publishes it at SCRS_QA_DOMAIN for external
-  # callers, limited to SCRS_QA_RUNNER_ALLOWED_CIDRS and the bearer token.
+  # qa network; Traefik also publishes it at SCRS_QA_DOMAIN for operators who
+  # run standalone QA/performance jobs, limited to SCRS_QA_RUNNER_ALLOWED_CIDRS
+  # and the bearer token. The runner never handles SBOMs or vulnerability data.
   # It runs repository test code: it holds no SCRS secrets and is kept off
   # the default network. See docs/QA_TESTING.md for the host firewall rules.
   scrs-qa-runner:

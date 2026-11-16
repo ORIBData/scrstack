@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/dtrack"
 	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/sast"
 )
@@ -26,6 +27,13 @@ const (
 type statusStore interface {
 	SchedulerRuns(context.Context) ([]assessments.SchedulerRun, error)
 	VulnerabilitySources(context.Context) ([]assessments.VulnSource, error)
+}
+
+// dtrackStatusStore is what the Dependency-Track component reads; the
+// assessments store provides it.
+type dtrackStatusStore interface {
+	DTrackSettings(context.Context) (assessments.DTrackSettings, error)
+	DTrackSummary(context.Context) (assessments.DTrackSummary, error)
 }
 
 // componentStatus is one dependency's state. Detail is a short fixed
@@ -52,6 +60,7 @@ type PlatformStatus struct {
 	store        statusStore
 	sast         *sast.Client
 	runner       *qa.Runner
+	dtHTTP       *http.Client
 
 	mu     sync.Mutex
 	latest platformStatus
@@ -63,6 +72,13 @@ type PlatformStatus struct {
 // Redis and S3 one by one (keys postgres, redis, s3; nil means healthy).
 func NewPlatformStatus(dependencies func(context.Context) map[string]error, store statusStore, sastClient *sast.Client, runner *qa.Runner) *PlatformStatus {
 	return &PlatformStatus{dependencies: dependencies, store: store, sast: sastClient, runner: runner}
+}
+
+// WithDependencyTrack adds the dependency_track component. private lists the
+// hosts allowed to resolve to private addresses (SCRS_DTRACK_PRIVATE_HOSTS).
+func (h *PlatformStatus) WithDependencyTrack(private map[string]bool) *PlatformStatus {
+	h.dtHTTP = dtrack.NewHTTPClient(private)
+	return h
 }
 
 // current returns the cached status, probing again when it is older than 10 s.
@@ -128,6 +144,7 @@ func (h *PlatformStatus) collect(parent context.Context) platformStatus {
 		"scheduler": func() { h.worker(ctx, set) },
 		"sast":      func() { set("sast", h.sastStatus(ctx)) },
 		"qa_runner": func() { set("qa_runner", h.runnerStatus(ctx)) },
+		"dtrack":    func() { set("dependency_track", h.dtrackStatus(ctx)) },
 	}
 	for _, probe := range probes {
 		wg.Add(1)
@@ -236,6 +253,48 @@ func (h *PlatformStatus) runnerStatus(ctx context.Context) componentStatus {
 		return componentStatus{Status: statusDown, Detail: "runner unreachable"}
 	}
 	return componentStatus{Status: statusOK, Info: map[string]any{"karate": info.Karate, "gatling": info.Gatling, "slots": info.Slots, "queued": info.Queued, "running": info.Running}}
+}
+
+// dtrackStatus reports the optional Dependency-Track export. It is not
+// configured while the export is off; when on, the server's public version
+// endpoint shows reachability, and the upload table shows the backlog and
+// recent failures (uploads rejected, or accepted but not imported).
+func (h *PlatformStatus) dtrackStatus(ctx context.Context) componentStatus {
+	store, ok := h.store.(dtrackStatusStore)
+	if !ok || h.dtHTTP == nil {
+		return componentStatus{Status: statusNotConfigured}
+	}
+	settings, err := store.DTrackSettings(ctx)
+	if err != nil {
+		return componentStatus{Status: statusDown, Detail: "export state unreadable"}
+	}
+	if !settings.Enabled {
+		return componentStatus{Status: statusNotConfigured, Detail: "export is off"}
+	}
+	summary, err := store.DTrackSummary(ctx)
+	if err != nil {
+		return componentStatus{Status: statusDown, Detail: "export state unreadable"}
+	}
+	info := map[string]any{"queued_uploads": summary.Queued, "failed_uploads_24h": summary.FailedLast24h, "import_failures_24h": summary.ProcessingFailed24h, "unverified_uploads": summary.Unverified}
+	if summary.LastUploadedAt != nil {
+		info["last_upload_at"] = summary.LastUploadedAt
+	}
+	if summary.LastProcessedAt != nil {
+		info["last_import_confirmed_at"] = summary.LastProcessedAt
+	}
+	version, err := dtrack.Client{BaseURL: settings.URL, HTTP: h.dtHTTP}.Version(ctx)
+	if err != nil {
+		return componentStatus{Status: statusDown, Detail: "server unreachable", Info: info}
+	}
+	info["version"] = version
+	c := componentStatus{Status: statusOK, Info: info}
+	switch {
+	case summary.FailedLast24h > 0 || summary.ProcessingFailed24h > 0:
+		c.Status, c.Detail = statusDegraded, "uploads failed in the last 24 hours; see GET /integrations/dependency-track/uploads"
+	case summary.OldestQueued != nil && time.Since(*summary.OldestQueued) > 15*time.Minute:
+		c.Status, c.Detail = statusDegraded, "uploads have been waiting for over 15 minutes"
+	}
+	return c
 }
 
 // overall is down when a backing service the API needs is down, degraded when

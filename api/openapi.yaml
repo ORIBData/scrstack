@@ -17,7 +17,11 @@ info:
     **E2E QA.** Repositories with a QA profile get Karate API, UI and load runs against their
     deployed environment after each successful assessment, on a runner the operator hosts. Results,
     OpenAPI coverage and report-only `qa_*` findings are stored with the assessment; LLM providers
-    (OpenAI, Anthropic, Gemini, Azure OpenAI and compatible APIs) draft tests for approval.
+    (OpenAI, Anthropic, Gemini, Azure OpenAI and compatible APIs) draft tests for approval. The
+    runner is a separate service from supply-chain scanning: it never sees SBOMs, MBOMs,
+    vulnerabilities, malware or integrity results. Operators can also call the runner directly (its
+    own hostname, its own token, `POST /v1/jobs`) to run functional or performance jobs that are
+    independent of any assessment; those jobs are not stored, scored or announced by this API.
 
     **Automation.** External services such as n8n trigger assessments with `POST /assessments`
     (inbound) and receive results through signed outbound webhooks. Put correlation data in
@@ -95,7 +99,10 @@ tags:
   - name: Operations
     description: Maintenance, inbound event log and retention (admin).
   - name: E2E QA
-    description: Karate API, integration, UI and load testing of each assessed repository against its deployed environment, with API coverage, report-only findings and LLM-drafted tests.
+    description: |
+      Karate API, integration, UI and load testing of each assessed repository against its deployed environment, with API coverage, report-only findings and LLM-drafted tests.
+
+      **Two ways to use the runner.** (1) Through this API: a successful assessment queues a run, and results, coverage and `qa_*` findings are stored here. (2) Directly, by an operator: the runner is also published on its own hostname (limited to an IP allowlist, `Authorization: Bearer` with the runner token, not an API token) and accepts `POST /v1/jobs` (multipart `spec` and `bundle`), `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/report`, `DELETE /v1/jobs/{id}` and `GET /v1/info` for standalone functional (Karate API, UI) and performance (Gatling) jobs. Direct jobs use the runner's slots but are not recorded by this API: no run, finding, event or archive. The runner does no vulnerability, malware, SBOM or MBOM work, and has no lint job kind. Contract and examples: `docs/QA_TESTING.md`.
   - name: Licences
     description: Licence inventory, normalisation, categories and policy by distribution model, third-party notices. A policy aid, not legal advice.
   - name: Compliance reports
@@ -135,7 +142,7 @@ paths:
       operationId: platformStatus
       security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Platform status
-      description: 'Per-component state for a frontend status view: `api`, `postgres`, `redis`, `s3`, `worker` (last heartbeat; down after 15 minutes of silence), `scanner`, `feeds` (stale enabled vulnerability sources), `sast` and `qa_runner`. Each is `ok`, `degraded`, `down` or `not_configured`. The overall `status` is `down` when PostgreSQL, Redis or S3 is down, `degraded` when any other configured component is not `ok`, and `ok` otherwise. The call always answers `200`; read `status`. A change of overall status is also pushed as the `system.degraded` and `system.recovered` events, announced once after it holds for about 90 seconds. Details are fixed phrases without addresses or error text. Probes run concurrently and the answer is cached for 10 seconds. Scope `read` or `write`.'
+      description: 'Per-component state for a frontend status view: `api`, `postgres`, `redis`, `s3`, `worker` (last heartbeat; down after 15 minutes of silence), `scanner`, `feeds` (stale enabled vulnerability sources), `sast`, `qa_runner` and `dependency_track` (the optional export: `not_configured` while it is off, `down` when the server is unreachable, `degraded` after failed uploads in the last 24 hours or a backlog older than 15 minutes). Each is `ok`, `degraded`, `down` or `not_configured`. The overall `status` is `down` when PostgreSQL, Redis or S3 is down, `degraded` when any other configured component is not `ok`, and `ok` otherwise. The call always answers `200`; read `status`. A change of overall status is also pushed as the `system.degraded` and `system.recovered` events, announced once after it holds for about 90 seconds. Details are fixed phrases without addresses or error text. Probes run concurrently and the answer is cached for 10 seconds. Scope `read` or `write`.'
       responses:
         '200': {description: Platform status, content: {application/json: {schema: {$ref: '#/components/schemas/PlatformStatus'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -1146,7 +1153,7 @@ paths:
       operationId: githubWebhook
       summary: GitHub webhook (direct)
       description: Same as `/ingest/github` in direct mode. Requires `X-Hub-Signature-256` (secret `SCRS_GITHUB_WEBHOOK_SECRET`).
-      security: []
+      security: [{}]
       parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
       requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
@@ -2740,9 +2747,9 @@ paths:
       operationId: testDependencyTrack
       security: [{bearerAuth: [admin]}]
       summary: Test the Dependency-Track connection
-      description: Reads the server version, then checks the stored key holds BOM upload permission. Sends no SBOM. Scope `admin`.
+      description: Reads the server version, then reads the stored key's team permissions (`GET /api/v1/team/self`) and requires `BOM_UPLOAD` and `PROJECT_CREATION_UPLOAD`. `ok` is false and `missing_permissions` names what the key's team lacks. A valid key without those permissions is reported here instead of failing its first upload. `VIEW_PORTFOLIO` is optional, but without it an upload can only end as `unconfirmed`. Sends no SBOM. Scope `admin`.
       responses:
-        '200': {description: Result, content: {application/json: {schema: {type: object, properties: {ok: {type: boolean}, version: {type: string}, error: {type: string}}}}}}
+        '200': {description: Result, content: {application/json: {schema: {type: object, properties: {ok: {type: boolean}, version: {type: string}, permissions: {type: array, items: {type: string}, description: Permissions of the key's team}, missing_permissions: {type: array, items: {type: string}}, required_permissions: {type: array, items: {type: string}}, error: {type: string}}}}}}
         '409': {description: No URL or key stored, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -2753,7 +2760,7 @@ paths:
       operationId: listDependencyTrackUploads
       security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List SBOM uploads
-      description: Uploads, newest first; finished ones are kept 90 days. Scope `read` or `write`.
+      description: Uploads, newest first; finished ones are kept 90 days. `status` is SCRS's side (queued, sending, uploaded, failed). For an `uploaded` one, `processing` is Dependency-Track's side. Scope `read` or `write`.
       parameters:
         - {name: status, in: query, schema: {type: string, enum: [queued, sending, uploaded, failed]}}
         - {name: cursor, in: query, schema: {type: string, format: uuid}}
@@ -3136,7 +3143,7 @@ paths:
       operationId: qaRunnerStatus
       security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Karate runner status
-      description: Whether the API process has a runner configured and can reach it, with the runner's Karate version, Gatling support, slots and queue. Scope `read`, `write` or `trigger`.
+      description: Whether the API process has a runner configured and can reach it, with the runner's Karate version, Gatling support, slots and queue. This is Core's view of the runner it calls over the internal network; operators who call the runner directly use its own `/v1/info` with the runner token. Scope `read`, `write` or `trigger`.
       responses:
         '200': {description: Runner status, content: {application/json: {schema: {$ref: '#/components/schemas/QARunnerStatus'}}}}
         '502': {description: Runner unreachable, content: {application/json: {schema: {$ref: '#/components/schemas/QARunnerStatus'}}}}
@@ -4071,7 +4078,10 @@ components:
         token: {type: string, description: Dependency-Track processing token}
         error: {type: string}
         created_at: {type: string, format: date-time}
-        uploaded_at: {type: string, format: date-time}
+        uploaded_at: {type: string, format: date-time, description: When Dependency-Track accepted the BOM. Accepted is not imported; see `processing`}
+        processing: {type: string, enum: [pending, processed, unconfirmed, failed], description: 'Dependency-Track processes an accepted BOM afterwards, and the worker checks the outcome about every 30 seconds for up to ten minutes. `pending`: not yet checked or still running. `processed`: finished and the project''s last BOM import is newer than the upload. `unconfirmed`: finished, but the key cannot read projects (`VIEW_PORTFOLIO`) or the check ran out of time. `failed`: finished without importing the BOM; emits `dependency_track.upload_failed`'}
+        processing_error: {type: string, description: Why `processing` is `unconfirmed` or `failed`}
+        processed_at: {type: string, format: date-time}
     FrameworkPack:
       type: object
       description: A versioned framework data pack (CMP-001). Uploads use kind `cwe_mapping`, or `stig` for an edited imported STIG; schema at `GET /schemas/framework-pack`.
@@ -4208,12 +4218,13 @@ components:
               assessment_id: {type: string, format: uuid}
     EventType:
       type: string
-      enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, finding.rescored, malicious_dependency.reported, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, system.degraded, system.recovered, ping]
+      enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, finding.rescored, malicious_dependency.reported, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, dependency_track.upload_failed, system.degraded, system.recovered, ping]
       description: |
         `assessment.completed` and `assessment.failed`: an assessment finished. `finding.created`, `finding.status_changed`,
         `finding.rescored`, `malicious_dependency.reported`: risk register changes. `integrity.alert`: a repository integrity rule fired.
         `feed.stale`: a vulnerability, advisory or threat-intelligence source stopped updating. `connection.degraded`: a provider
         connection check failed. `maintenance.completed`: scheduled maintenance ran. `qa.completed`, `qa.failed`: an E2E QA run finished.
+        `dependency_track.upload_failed`: an SBOM upload to Dependency-Track was rejected for good, or Dependency-Track accepted it but did not import it (`stage` is `upload` or `processing`).
         `system.degraded`: the platform status (see `GET /system/status`) left `ok` or changed between `degraded` and `down`; lists the
         failing components. `system.recovered`: the status returned to `ok`, with how long it was not ok. `ping`: sent by a webhook test.
     AuthHeader:

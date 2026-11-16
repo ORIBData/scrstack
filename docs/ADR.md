@@ -245,6 +245,8 @@ OpenGrep was added to the PRD's set because it is the only bundled analyzer for 
 
 It can run in the Dokploy stack on an internal network or on its own VM. Keploy was evaluated and rejected because it needs root and eBPF and records traffic.
 
+**Amendment (2026-11-16):** The runner is a QA, performance and load service only. It never handles SBOMs, MBOMs, vulnerabilities, malware or integrity data. Traefik publishes it for operators who run standalone jobs; those jobs are not recorded by SCRS. Lint is not a job kind.
+
 **Evidence:** `make qa-runner-test`, `make qa-runner-image-test`, `TestPostgresQAPipeline`.
 
 ## ADR-022 LLM adapter
@@ -352,3 +354,8 @@ Finding types without a CWE (vulnerable and malicious dependencies, integrity, s
 **Why:** a crash between completion and upload cannot lose a push, and Dependency-Track being down never affects an assessment (section 15).
 
 **Consequences:** uploads are visible and retryable through the API, and finished rows are pruned after 90 days.
+
+**Amendment (2026-11-16):**
+- `uploaded` only means Dependency-Track accepted the BOM, which it processes afterwards. The worker checks the event token (`GET /api/v1/event/token/{token}`), then the project's `lastBomImport` (`GET /api/v1/project/lookup`), and records `processing` as `processed`, `unconfirmed` or `failed`.
+- `:test` reads the key's team permissions (`GET /api/v1/team/self`) and requires `BOM_UPLOAD` and `PROJECT_CREATION_UPLOAD`. The earlier probe (`GET /api/v1/event/token/{random}`) only proved the key was valid.
+- A permanent upload failure, or an import that did not happen, emits `dependency_track.upload_failed`, and `GET /system/status` reports a `dependency_track` component.

@@ -76,6 +76,9 @@ var eventData = map[string]map[string]any{
 		"connection_id": str(), "name": str(), "provider": str(), "check": str(), "state": str(), "problems": array(str()), "link": str(),
 	}),
 	"maintenance.completed": object([]string{"trigger", "report"}, map[string]any{"trigger": str(), "report": map[string]any{"type": "object"}}),
+	"dependency_track.upload_failed": object([]string{"upload_id", "project", "version", "stage", "error"}, map[string]any{
+		"upload_id": str(), "assessment_id": str(), "asset_id": str(), "project": str(), "version": str(), "stage": enum("upload", "processing"), "error": str(),
+	}),
 	"system.degraded": object([]string{"status", "previous_status", "components", "since"}, map[string]any{
 		"status": enum("degraded", "down"), "previous_status": enum("ok", "degraded", "down"), "since": map[string]any{"type": "string", "format": "date-time"},
 		"components": array(object([]string{"name", "status"}, map[string]any{"name": str(), "status": enum("degraded", "down"), "detail": str()})),

@@ -117,8 +117,8 @@ func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			client = dtrack.NewHTTPClient(h.hosts)
 			defer client.CloseIdleConnections()
 		}
-		version, err := dtrack.Client{BaseURL: settings.URL, APIKey: string(key), HTTP: client}.Check(ctx)
-		result := map[string]any{"ok": err == nil, "version": version}
+		check, err := dtrack.Client{BaseURL: settings.URL, APIKey: string(key), HTTP: client}.Check(ctx)
+		result := map[string]any{"ok": err == nil, "version": check.Version, "permissions": nonNil(check.Permissions), "missing_permissions": nonNil(check.Missing), "required_permissions": dtrack.RequiredPermissions}
 		if err != nil {
 			result["error"] = err.Error()
 		}
@@ -166,4 +166,12 @@ func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, 405, "method not allowed")
 	}
+}
+
+// nonNil makes an empty list encode as [] rather than null.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
 }

@@ -30,21 +30,22 @@ const SchemaVersion = 1
 
 // Events lists every event type a subscription may select.
 var Events = map[string]bool{
-	"assessment.completed":          true,
-	"assessment.failed":             true,
-	"finding.created":               true,
-	"finding.status_changed":        true,
-	"finding.rescored":              true,
-	"malicious_dependency.reported": true,
-	"integrity.alert":               true,
-	"feed.stale":                    true,
-	"connection.degraded":           true,
-	"maintenance.completed":         true,
-	"qa.completed":                  true,
-	"qa.failed":                     true,
-	"system.degraded":               true,
-	"system.recovered":              true,
-	"ping":                          true,
+	"assessment.completed":           true,
+	"assessment.failed":              true,
+	"finding.created":                true,
+	"finding.status_changed":         true,
+	"finding.rescored":               true,
+	"malicious_dependency.reported":  true,
+	"integrity.alert":                true,
+	"feed.stale":                     true,
+	"connection.degraded":            true,
+	"maintenance.completed":          true,
+	"qa.completed":                   true,
+	"qa.failed":                      true,
+	"dependency_track.upload_failed": true,
+	"system.degraded":                true,
+	"system.recovered":               true,
+	"ping":                           true,
 }
 
 var (

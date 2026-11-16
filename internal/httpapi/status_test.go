@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -175,5 +176,85 @@ func TestStatusMonitorDebouncesAndAnnounces(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	if got := announcer.seen(); len(got) != 3 {
 		t.Fatal("blip announced", got)
+	}
+}
+
+type fakeDTrackStore struct {
+	fakeStatusStore
+	settings assessments.DTrackSettings
+	summary  assessments.DTrackSummary
+}
+
+func (f fakeDTrackStore) DTrackSettings(context.Context) (assessments.DTrackSettings, error) {
+	return f.settings, nil
+}
+func (f fakeDTrackStore) DTrackSummary(context.Context) (assessments.DTrackSummary, error) {
+	return f.summary, nil
+}
+
+func TestSystemStatusDependencyTrack(t *testing.T) {
+	healthy := func(context.Context) map[string]error {
+		return map[string]error{"postgres": nil, "redis": nil, "s3": nil}
+	}
+	now := time.Now()
+	heartbeat := assessments.SchedulerRun{Job: "feed_monitor", LastFinishedAt: &now, LastStatus: "ok"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/version" && r.Header.Get("X-Api-Key") == "" {
+			_, _ = w.Write([]byte(`{"version":"4.14.6"}`))
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	defer server.Close()
+	private := map[string]bool{"127.0.0.1": true}
+	status := func(store fakeDTrackStore) componentStatus {
+		store.runs = []assessments.SchedulerRun{heartbeat}
+		return fetchStatus(t, NewPlatformStatus(healthy, store, nil, nil).WithDependencyTrack(private)).Components["dependency_track"]
+	}
+	enabled := assessments.DTrackSettings{Enabled: true, URL: server.URL}
+
+	// Off until the export is enabled, and without the option the component
+	// still appears.
+	if c := status(fakeDTrackStore{}); c.Status != statusNotConfigured {
+		t.Fatalf("export off: %+v", c)
+	}
+	if c := fetchStatus(t, NewPlatformStatus(healthy, fakeStatusStore{runs: []assessments.SchedulerRun{heartbeat}}, nil, nil)).Components["dependency_track"]; c.Status != statusNotConfigured {
+		t.Fatalf("not wired: %+v", c)
+	}
+
+	ok := status(fakeDTrackStore{settings: enabled, summary: assessments.DTrackSummary{Queued: 1}})
+	if ok.Status != statusOK || ok.Info["version"] != "4.14.6" || ok.Info["queued_uploads"] != float64(1) {
+		t.Fatalf("healthy export: %+v", ok)
+	}
+	old := now.Add(-time.Hour)
+	for name, summary := range map[string]assessments.DTrackSummary{
+		"a rejected upload": {FailedLast24h: 1},
+		"a failed import":   {ProcessingFailed24h: 1},
+		"a stuck queue":     {Queued: 3, OldestQueued: &old},
+	} {
+		if c := status(fakeDTrackStore{settings: enabled, summary: summary}); c.Status != statusDegraded || c.Detail == "" {
+			t.Fatalf("%s: %+v", name, c)
+		}
+	}
+	// A recent queue is normal.
+	recent := now.Add(-time.Minute)
+	if c := status(fakeDTrackStore{settings: enabled, summary: assessments.DTrackSummary{Queued: 1, OldestQueued: &recent}}); c.Status != statusOK {
+		t.Fatalf("recent queue: %+v", c)
+	}
+
+	// An unreachable server is down for the component, only degraded overall,
+	// and neither its address nor an error string reaches the body.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	body := httptest.NewRecorder()
+	h := NewPlatformStatus(healthy, fakeDTrackStore{fakeStatusStore: fakeStatusStore{runs: []assessments.SchedulerRun{heartbeat}}, settings: assessments.DTrackSettings{Enabled: true, URL: deadURL}}, nil, nil).WithDependencyTrack(private)
+	h.serve(body, httptest.NewRequest("GET", "/", nil))
+	var out platformStatus
+	if err := json.Unmarshal(body.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Components["dependency_track"].Status != statusDown || out.Status != statusDegraded || strings.Contains(body.Body.String(), "127.0.0.1") {
+		t.Fatalf("unreachable: %s", body.Body)
 	}
 }

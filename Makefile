@@ -122,6 +122,9 @@ qa-runner-image-reference:
 image-audit:
 	@DOCKER="$(DOCKER)" SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py python3 scripts/audit_image.py
 
+api-reference:
+	UPDATE_API_REFERENCE=1 $(GO) test ./api -run TestAPIReferenceIsCurrent -count=1
+
 qa: test lint contract-check
 	$(GO) test -race . -run 'TestLegacySecurity|TestMalformedMultipart'
 	python3 -m unittest discover -s tests -p '*_test.py'

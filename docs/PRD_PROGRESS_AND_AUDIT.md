@@ -87,24 +87,52 @@ are not yet delivered. Provider network calls are bounded but synchronous; a dur
 assessment queue now exists in PostgreSQL; complete provider capability/backoff/event contracts remain absent. Provider payload and
 response/error OpenAPI schemas also need fuller typing and contract acceptance.
 
-## Product requirements still blocking full sign-off
+## Product milestone status (reconciled 2026-11-16)
 
-| PRD milestone | Current status |
+Earlier versions of this table lagged the code. It now follows the delivery records in
+[PRODUCTION_READINESS_AUDIT.md](PRODUCTION_READINESS_AUDIT.md) and the contract.
+
+| PRD milestone | Status |
 | --- | --- |
-| M0 Foundations/spikes | Partial; required spike/ADR acceptance is incomplete. |
-| M1 Platform core | Authentication/lifecycle substantially extended; owners, observability and broader migration/acceptance work remain. |
-| M2 Repository scan MVP | Partial: immutable GitHub archive acquisition, authenticated assessment API, durable jobs, recursive upstream inventory, CycloneDX, offline OSV and finding register delivered. Direct/relay ingestion, full advisory mirror, integrity and provider acceptance remain. |
-| M3 Malware/malicious dependencies | Legacy ClamAV verified separately; YARA/ClamAV orchestration, IOC and full malicious-response gates remain. OSV MAL records are matched through configured offline feeds. |
-| M4 Threat feeds | Not implemented. |
-| M5 Retention/maintenance/outbound | Not implemented. Developer image cleanup is not product retention. |
-| M6 Images/registries | Docker Hub/GAR discovery only; digest pull/assessment/layer attribution and remaining adapters absent. |
-| M7 Remediation/hardening | Opt-in npm in-place advice adapter, job persistence, artifact retrieval and isolated egress implemented; actual fix/provider acceptance, Maven, VEX and resilience gates remain. |
-| M8 Licences/compliance | Implemented 2026-11-14: see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). STIG and PDF reports were added in P2. |
-| M9 SAST/reachability | Implemented 2026-11-15: see [SAST.md](SAST.md). Reachability beyond Go remains P2. |
-| P2 | Implemented 2026-11-15: Dependency-Track export (ADR-033), live events OUT-004 (ADR-030), ASD STIG import CMP-004 (ADR-031, answers Q23), PDF reports (ADR-032), outbound licence compatibility LIC-005. CPE matching VUL-007 deferred to spike S14. |
+| M0 Foundations/spikes | Delivered: ADR-001 to ADR-033 ([ADR.md](ADR.md)) and spikes S1 to S13 ([SPIKES.md](SPIKES.md)). Measurements left: OSV and ClamAV throughput, mobile sample repositories, NVD volumes. |
+| M1 Platform core | Delivered: auth and bootstrap token, scoped tokens, owners, audit log, health, readiness, `/system/status`, metrics, request ids. |
+| M2 Repository scan MVP | Delivered for GitHub and GitLab: archive acquisition, durable jobs, recursive inventory, CycloneDX SBOM and MBOM, offline OSV, register, direct and relay ingest, integrity events. Needs acceptance with real accounts. |
+| M3 Malware/malicious dependencies | Delivered: ClamAV, starter YARA, IOC matching, OSV `MAL-` records. YARA is limited to ClamAV's subset (no modules). |
+| M4 Threat feeds | Delivered: indicator sources, STIX, CSV and TAXII, vulnerability-source registry, NVD and CVE Program, KEV and EPSS, vendor VEX. Needs live NVD and TAXII acceptance. |
+| M5 Retention/maintenance/outbound | Delivered: retention classes, maintenance, signed webhooks and schemas, mirrors, last known good, agent payloads. |
+| M6 Images/registries | Delivered: Docker Hub, GAR, Harbor and OCI adapters, layer-level scanning, registry push events, Trivy parity run ([TRIVY_PARITY.md](TRIVY_PARITY.md)). |
+| M7 Remediation/hardening | Delivered as advice-only plans for npm (`package-lock.json`) and Maven (`pom.xml`) with isolated egress; no repository writes. Provider acceptance remains. |
+| M8 Licences/compliance | Delivered 2026-11-14 ([LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md)); STIG and PDF reports added in P2. |
+| M9 SAST/reachability | Delivered 2026-11-15 ([SAST.md](SAST.md)). Reachability beyond Go remains P2. |
+| E2E QA (Karate) and LLM test generation | Delivered ([QA_TESTING.md](QA_TESTING.md)). Scope decision 2026-11-16: the runner is a QA, performance and load service with an operator route for standalone jobs, separate from supply-chain risk. A lint job kind is not implemented. |
+| P2 | Delivered 2026-11-15: Dependency-Track export (ADR-033), live events (ADR-030), ASD STIG import (ADR-031), PDF reports (ADR-032), outbound licence compatibility. CPE matching (VUL-007) deferred to spike S14. |
+| Platform status | Delivered 2026-11-16: `GET /system/status`, `system.degraded` and `system.recovered` events, a deeper QA runner `/healthz`, scopes on every operation checked against the router, and [STACK.md](STACK.md) with the generated [API_REFERENCE.md](API_REFERENCE.md). |
 
-These are engineering deliverables, not items that can be closed through deployment
-configuration or documentation. The repository is not a complete supply-chain scanner.
+## Open PRD requirements (audited 2026-11-16)
+
+These requirements have no implementation in the contract or code. The audit searched the
+contract, routes and source for each; it does not prove absence of every partial behaviour.
+None blocks the delivered modules above, and the PRD marks most as P1 or P2.
+
+| Area | Requirement | Gap |
+| --- | --- | --- |
+| Assets | AST-001, ING-006 | No `uploaded` asset type or `POST /uploads`; assets come from connection discovery. No `POST /assets`, `DELETE /assets/{id}`, `POST /assets:import` or `GET /assets/{id}/revisions`. |
+| Register | RR-008, RR-010, RR-012, RR-014 | No finding comments or assignment endpoints; no register export (CSV or VEX download), summary, timeseries or top-assets aggregates. Triage and waivers go through `PATCH /register/{id}`; VEX is per assessment. |
+| SBOM | SBM-005 | Component changes are recorded per assessment (`change` on findings and components); there is no `sbom-diff` endpoint between two revisions. |
+| Advisories | OSV-008 | No API to create local `x_SCRS-*` advisories, and no advisory search; `GET /intel/vulnerabilities/{id}` reads one. |
+| Malicious dependencies | MAL-004, MAL-005, MAL-006 | No `introduced_by` tagging, minimum-release-age policy (P2) or typosquat heuristic (P2). |
+| Integrity | INT-003, INT-012, INT-014, INT-015, INT-018 | No behavioural author signals, large-addition heuristic, Actions inventory, run-number gap detection or incident sweep (`/incidents`, P2). Force-push, branch-churn, mass-deletion, visibility and membership rules exist. |
+| Connections | CON-012 | No image-to-source link (`built_from`). |
+| Remediation | REM-002 | Isolated egress and no repository writes, but not the full sandbox worker profile. |
+| Operations | | No `/jobs` inspection endpoint; scheduled jobs appear in `GET /maintenance/schedule`. |
+| Vulnerability matching | VUL-007 | CPE matching, spike S14. |
+| Reachability | REA-005, REA-012 | Ecosystems beyond Go. |
+
+## Before declaring the PRD complete
+
+1. Decide for each open row whether it is in version 1 or is formally descoped in an ADR; the PRD still lists
+   them. Nothing here changes the stack's connections or scopes.
+2. Complete the external acceptance list below.
 
 ## External release acceptance still required
 

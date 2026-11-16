@@ -80,8 +80,8 @@ was added on top. The full product specification is in
 | **Risk register** | Findings deduplicated by fingerprint across assessments, with lifecycle `open → triaged → in_progress → fixed`. Time-boxed waivers (`accepted`), suppressions and false positives, with full event history. |
 | **E2E QA testing (Karate)** | After each successful assessment, a repository's Karate suites (API, integration, headless-Chromium UI, mocks) run against its deployed staging or preview environment on a runner you host, with optional karate-gatling load runs and thresholds. SCRS records scenarios, OpenAPI coverage and report-only findings (failing scenarios, untested operations, breached thresholds, setup gaps), and can draft Karate features and unit tests with your own LLM key (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible endpoint), for human approval. Commits that fail the security gate never reach the runner. See [docs/QA_TESTING.md](docs/QA_TESTING.md). |
 | **Guided remediation** | npm `package-lock.json` (in-place) and Maven `pom.xml` (override) plans generated in an isolated sandbox. Advice only: SCRS never writes to repositories. OpenVEX export reflects register triage. |
-| **Automation API** | Token-scoped REST API (`admin`, `read`, `write`, `trigger`, `ingest:relay`). Inbound: idempotent and batch triggers carrying caller context, provider and registry webhooks. Outbound: signed event webhooks. Plus long-poll, latest-by-commit lookup, last-known-good revisions, Swagger UI and an OpenAPI contract. Every operation lists the scopes that may call it in its `security` requirement (any one is enough; `admin` always passes), a scope guide opens the contract, and a test checks the contract against the router. |
-| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `finding.rescored`, `malicious_dependency.reported`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`, `qa.completed`, `qa.failed`, `system.degraded`, `system.recovered`, each with a published JSON Schema (`/schemas/events`). `summary`, `full` and AI-`agent` payload profiles; subscriptions can be scoped to connections. |
+| **Automation API** | Token-scoped REST API (`admin`, `read`, `write`, `trigger`, `ingest:relay`). Inbound: idempotent and batch triggers carrying caller context, provider and registry webhooks. Outbound: signed event webhooks. Plus long-poll, latest-by-commit lookup, last-known-good revisions, Swagger UI and an OpenAPI contract. See [docs/STACK.md](docs/STACK.md) for how Core, the scanner, SAST and the QA runner connect and [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for every endpoint by module. Every operation lists the scopes that may call it in its `security` requirement (any one is enough; `admin` always passes), a scope guide opens the contract, and a test checks the contract against the router. |
+| **Outbound webhooks** | Signed (`X-SCRS-Signature`, plus `X-SCRS-Auth` for header-auth receivers such as n8n) events delivered from a transactional outbox with retries, dead-letter and redelivery: `assessment.completed`, `assessment.failed`, `finding.created`, `finding.status_changed`, `finding.rescored`, `malicious_dependency.reported`, `integrity.alert`, `feed.stale`, `connection.degraded`, `maintenance.completed`, `qa.completed`, `qa.failed`, `dependency_track.upload_failed`, `system.degraded`, `system.recovered`, each with a published JSON Schema (`/schemas/events`). `summary`, `full` and AI-`agent` payload profiles; subscriptions can be scoped to connections. |
 | **Operations** | Owners and asset attributes, Prometheus metrics, request IDs and access logs, a queryable audit log (`/audit`), hourly maintenance (retention, key expiry, optional default-branch rescans), scoped resets, rebuilds, sensor updates, a schedule and versions view, inbound-event log with replay, opt-in source snapshots for restore. |
 | **Retention** | Per data class (raw events, delivery log, closed findings, superseded scan artifacts, SBOMs and snapshots, remediation plans, QA reports, compliance reports, expired indicators, audit log), previewable, audited, with environment defaults. Keeps forever unless set. Open register entries, current revisions and assets on legal hold are never purged; the audit log keeps at least 365 days. |
 
@@ -138,7 +138,7 @@ has its own image (`deploy/karate-runner/Dockerfile`).
 | `scrs-yara-rules` | One-shot: installs the embedded YARA ruleset into ClamAV's volume and reloads clamd | Internal |
 | `scrs-feed-sync` | Downloads and validates OSV archives, CISA KEV and EPSS every 6 h | Outbound to the OSV bucket, cisa.gov and the EPSS host |
 | `scrs-egress-proxy` | Allow-listed proxy for remediation (npm registry, deps.dev) | Internal |
-| `scrs-qa-runner` | Karate runner: runs repository test suites against staging URLs (API, UI, load) | Internal `qa` network to SCRS; Traefik at `SCRS_QA_DOMAIN` behind an IP allowlist; outbound to systems under test |
+| `scrs-qa-runner` | Karate runner: runs repository test suites against staging URLs (API, UI, load) | Internal `qa` network to SCRS; Traefik at `SCRS_QA_DOMAIN` behind an IP allowlist and the runner token, for operators running standalone QA and performance jobs (no supply-chain data); outbound to systems under test |
 
 PostgreSQL, Redis and S3 are external services you provide. The pipeline itself
 is described in [docs/ASSESSMENT_PIPELINE.md](docs/ASSESSMENT_PIPELINE.md).
@@ -312,7 +312,7 @@ SCRS can push every scan's SBOM to Dependency-Track itself:
    `{"enabled":true,"url":"https://dtrack.example.com","api_key":"..."}`. The key
    is sealed with the master key and never returned. An internal server on
    http must be listed in `SCRS_DTRACK_PRIVATE_HOSTS`.
-3. Check it with `POST /integrations/dependency-track:test`.
+3. Check it with `POST /integrations/dependency-track:test`. It reads the key's team permissions and reports `missing_permissions`; add `VIEW_PORTFOLIO` too, so SCRS can confirm each import.
 
 How pushes work:
 - Each completed scan with an SBOM is queued in the same database transaction.
@@ -322,7 +322,12 @@ How pushes work:
 - Transient failures retry with backoff for about two days. Rejected keys or
   permissions fail at once and can be retried after a fix
   (`POST /integrations/dependency-track/uploads/{id}/retry`).
-- `GET /integrations/dependency-track/uploads` lists uploads.
+- `GET /integrations/dependency-track/uploads` lists uploads. `uploaded` means
+  Dependency-Track accepted the BOM. The worker then checks its processing about every
+  30 seconds for up to ten minutes: `processing` becomes `processed`, `unconfirmed`
+  (the key cannot read projects, or time ran out) or `failed` (finished without importing).
+- A rejected upload, or an import that failed, emits `dependency_track.upload_failed`
+  and shows as `dependency_track` in `GET /system/status`.
 - An unreachable Dependency-Track never affects an assessment.
 
 ### Live events for a frontend

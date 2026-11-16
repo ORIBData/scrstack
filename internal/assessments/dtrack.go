@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -22,6 +23,16 @@ func dtrackSchema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.dtrack_uploads(id uuid PRIMARY KEY,assessment_id uuid NOT NULL UNIQUE,asset_id uuid,project_name text NOT NULL,project_version text NOT NULL,sbom_key text NOT NULL,status text NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','sending','uploaded','failed')),attempts integer NOT NULL DEFAULT 0,next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),lease uuid,lease_until timestamptz,token text NOT NULL DEFAULT '',error text NOT NULL DEFAULT '',created_at timestamptz NOT NULL DEFAULT clock_timestamp(),uploaded_at timestamptz)`,
 		`CREATE INDEX IF NOT EXISTS dtrack_uploads_due_idx ON ` + s + `.dtrack_uploads(next_attempt_at) WHERE status IN ('queued','sending')`,
 		`CREATE INDEX IF NOT EXISTS dtrack_uploads_created_idx ON ` + s + `.dtrack_uploads(created_at DESC,id DESC)`,
+		// Processing state: an upload is accepted by Dependency-Track, which
+		// then processes the BOM on its own; the worker checks the outcome.
+		`ALTER TABLE ` + s + `.dtrack_uploads ADD COLUMN IF NOT EXISTS processing text NOT NULL DEFAULT 'pending' CHECK(processing IN ('pending','processed','unconfirmed','failed'))`,
+		`ALTER TABLE ` + s + `.dtrack_uploads ADD COLUMN IF NOT EXISTS processing_attempts integer NOT NULL DEFAULT 0`,
+		`ALTER TABLE ` + s + `.dtrack_uploads ADD COLUMN IF NOT EXISTS processing_next_at timestamptz NOT NULL DEFAULT clock_timestamp()`,
+		`ALTER TABLE ` + s + `.dtrack_uploads ADD COLUMN IF NOT EXISTS processing_error text NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s + `.dtrack_uploads ADD COLUMN IF NOT EXISTS processed_at timestamptz`,
+		// Uploads from before this check, or still unchecked after a day, are not verified.
+		`UPDATE ` + s + `.dtrack_uploads SET processing='unconfirmed' WHERE status='uploaded' AND processing='pending' AND uploaded_at<clock_timestamp()-interval '1 day'`,
+		`CREATE INDEX IF NOT EXISTS dtrack_uploads_verify_idx ON ` + s + `.dtrack_uploads(processing_next_at) WHERE status='uploaded' AND processing='pending'`,
 	}
 }
 
@@ -115,15 +126,24 @@ type DTrackUpload struct {
 	Error          string     `json:"error,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	UploadedAt     *time.Time `json:"uploaded_at,omitempty"`
-	SBOMKey        string     `json:"-"`
-	Lease          uuid.UUID  `json:"-"`
+	// Processing is Dependency-Track's side after the upload was accepted:
+	// pending (not yet checked), processed (finished and the project's last
+	// BOM import is newer than the upload), unconfirmed (finished, but the
+	// key cannot read projects or the check ran out of time) or failed
+	// (finished without importing the BOM).
+	Processing         string     `json:"processing,omitempty"`
+	ProcessingError    string     `json:"processing_error,omitempty"`
+	ProcessedAt        *time.Time `json:"processed_at,omitempty"`
+	ProcessingAttempts int        `json:"-"`
+	SBOMKey            string     `json:"-"`
+	Lease              uuid.UUID  `json:"-"`
 }
 
-const dtrackColumns = `id,assessment_id,asset_id,project_name,project_version,status,attempts,next_attempt_at,token,error,created_at,uploaded_at,sbom_key,COALESCE(lease,'00000000-0000-0000-0000-000000000000'::uuid)`
+const dtrackColumns = `id,assessment_id,asset_id,project_name,project_version,status,attempts,next_attempt_at,token,error,created_at,uploaded_at,sbom_key,COALESCE(lease,'00000000-0000-0000-0000-000000000000'::uuid),processing,processing_error,processed_at,processing_attempts`
 
 func scanDTrack(row pgx.Row) (DTrackUpload, error) {
 	var u DTrackUpload
-	err := row.Scan(&u.ID, &u.AssessmentID, &u.AssetID, &u.ProjectName, &u.ProjectVersion, &u.Status, &u.Attempts, &u.NextAttemptAt, &u.Token, &u.Error, &u.CreatedAt, &u.UploadedAt, &u.SBOMKey, &u.Lease)
+	err := row.Scan(&u.ID, &u.AssessmentID, &u.AssetID, &u.ProjectName, &u.ProjectVersion, &u.Status, &u.Attempts, &u.NextAttemptAt, &u.Token, &u.Error, &u.CreatedAt, &u.UploadedAt, &u.SBOMKey, &u.Lease, &u.Processing, &u.ProcessingError, &u.ProcessedAt, &u.ProcessingAttempts)
 	return u, err
 }
 
@@ -176,20 +196,123 @@ func (s *Store) ClaimDTrack(ctx context.Context) (DTrackUpload, error) {
 // with the backoff below).
 const dtrackMaxAttempts = 12
 
+// dtrackVerifyDelay is how long after an accepted upload the first
+// processing check runs.
+const dtrackVerifyDelay = 15 * time.Second
+
 // FinishDTrack records an attempt under its lease: uploaded, retried later
-// (transient), or failed (permanent or out of attempts).
+// (transient), or failed (permanent or out of attempts). A failure that ends
+// retries also emits dependency_track.upload_failed.
 func (s *Store) FinishDTrack(ctx context.Context, u DTrackUpload, token string, uploadErr error, permanent bool) error {
-	var err error
 	switch {
 	case uploadErr == nil:
-		_, err = s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='uploaded',token=$3,error='',uploaded_at=clock_timestamp(),lease=NULL,lease_until=NULL WHERE id=$1 AND lease=$2`, u.ID, u.Lease, token)
+		_, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='uploaded',token=$3,error='',uploaded_at=clock_timestamp(),lease=NULL,lease_until=NULL,processing='pending',processing_attempts=0,processing_next_at=clock_timestamp()+($4*interval '1 second') WHERE id=$1 AND lease=$2`, u.ID, u.Lease, token, int64(dtrackVerifyDelay.Seconds()))
+		return err
 	case permanent || u.Attempts >= dtrackMaxAttempts:
-		_, err = s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='failed',error=left($3,500),lease=NULL,lease_until=NULL WHERE id=$1 AND lease=$2`, u.ID, u.Lease, uploadErr.Error())
+		tx, err := s.pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='failed',error=left($3,500),lease=NULL,lease_until=NULL WHERE id=$1 AND lease=$2`, u.ID, u.Lease, uploadErr.Error())
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 1 {
+			if err := s.emitDTrackFailed(ctx, tx, u, "upload", uploadErr.Error()); err != nil {
+				return err
+			}
+		}
+		return tx.Commit(ctx)
 	default:
 		backoff := time.Duration(1<<min(u.Attempts, 9)) * time.Minute
-		_, err = s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='queued',error=left($3,500),next_attempt_at=clock_timestamp()+($4*interval '1 second'),lease=NULL,lease_until=NULL WHERE id=$1 AND lease=$2`, u.ID, u.Lease, uploadErr.Error(), int64(backoff.Seconds()))
+		_, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET status='queued',error=left($3,500),next_attempt_at=clock_timestamp()+($4*interval '1 second'),lease=NULL,lease_until=NULL WHERE id=$1 AND lease=$2`, u.ID, u.Lease, uploadErr.Error(), int64(backoff.Seconds()))
+		return err
 	}
+}
+
+// emitDTrackFailed announces an upload that will not reach, or was not
+// imported by, Dependency-Track. stage is "upload" or "processing".
+func (s *Store) emitDTrackFailed(ctx context.Context, tx pgx.Tx, u DTrackUpload, stage, detail string) error {
+	if len(detail) > 500 {
+		detail = detail[:500]
+	}
+	data := map[string]any{"upload_id": u.ID, "assessment_id": u.AssessmentID, "project": u.ProjectName, "version": u.ProjectVersion, "stage": stage, "error": detail}
+	if u.AssetID != nil {
+		data["asset_id"] = *u.AssetID
+	}
+	_, err := notify.Emit(ctx, tx, s.schema, "dependency_track.upload_failed", data, nil)
 	return err
+}
+
+// Processing check bounds: a check every 30 s, about ten minutes in all.
+const (
+	DTrackVerifyEvery    = 30 * time.Second
+	DTrackVerifyAttempts = 20
+)
+
+// ClaimDTrackVerify picks an accepted upload whose processing is unchecked and
+// due, while the export is enabled; ErrNotFound when none is due. The claim
+// only pushes the next check back, so a crashed worker is retried and
+// DTrackVerifyAttempts bounds the whole thing.
+func (s *Store) ClaimDTrackVerify(ctx context.Context) (DTrackUpload, error) {
+	u, err := scanDTrack(s.pool.QueryRow(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET processing_attempts=processing_attempts+1,processing_next_at=clock_timestamp()+($1*interval '1 second') WHERE id=(SELECT u.id FROM `+s.schema+`.dtrack_uploads u,`+s.schema+`.dtrack_settings d WHERE d.id=1 AND d.enabled AND u.status='uploaded' AND u.processing='pending' AND u.processing_next_at<=clock_timestamp() ORDER BY u.processing_next_at LIMIT 1 FOR UPDATE OF u SKIP LOCKED) RETURNING `+dtrackColumns, int64(DTrackVerifyEvery.Seconds())))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return u, ErrNotFound
+	}
+	return u, err
+}
+
+// FinishDTrackVerify records a processing check. outcome is "pending" (still
+// running; checked again later), "processed", "unconfirmed" or "failed";
+// detail explains the last three. A "failed" outcome emits
+// dependency_track.upload_failed.
+func (s *Store) FinishDTrackVerify(ctx context.Context, u DTrackUpload, outcome, detail string) error {
+	if outcome == "pending" {
+		_, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET processing_error=left($2,500) WHERE id=$1 AND processing='pending'`, u.ID, detail)
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `UPDATE `+s.schema+`.dtrack_uploads SET processing=$2,processing_error=left($3,500),processed_at=clock_timestamp() WHERE id=$1 AND processing='pending'`, u.ID, outcome, detail)
+	if err != nil {
+		return err
+	}
+	if outcome == "failed" && tag.RowsAffected() == 1 {
+		if err := s.emitDTrackFailed(ctx, tx, u, "processing", detail); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// DTrackSummary is the state of the export for the status view.
+type DTrackSummary struct {
+	Queued              int
+	FailedLast24h       int
+	ProcessingFailed24h int
+	Unverified          int
+	OldestQueued        *time.Time
+	LastUploadedAt      *time.Time
+	LastProcessedAt     *time.Time
+}
+
+// DTrackSummary counts the export's backlog and recent failures.
+func (s *Store) DTrackSummary(ctx context.Context) (DTrackSummary, error) {
+	var d DTrackSummary
+	err := s.pool.QueryRow(ctx, `SELECT
+ count(*) FILTER (WHERE status IN ('queued','sending')),
+ count(*) FILTER (WHERE status='failed' AND created_at>clock_timestamp()-interval '24 hours'),
+ count(*) FILTER (WHERE processing='failed' AND processed_at>clock_timestamp()-interval '24 hours'),
+ count(*) FILTER (WHERE status='uploaded' AND processing='pending'),
+ min(created_at) FILTER (WHERE status IN ('queued','sending')),
+ max(uploaded_at),
+ max(processed_at) FILTER (WHERE processing='processed')
+ FROM `+s.schema+`.dtrack_uploads`).Scan(&d.Queued, &d.FailedLast24h, &d.ProcessingFailed24h, &d.Unverified, &d.OldestQueued, &d.LastUploadedAt, &d.LastProcessedAt)
+	return d, err
 }
 
 // PruneDTrack deletes finished uploads older than the given age.
