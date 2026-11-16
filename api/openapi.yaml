@@ -26,10 +26,24 @@ info:
     `/ingest/<provider>/<connection>` (registries: `/ingest/registry/<provider>/<connection>`).
     Outbound subscriptions can be scoped to connections.
 
-    **Authentication.** Send `Authorization: Bearer <token>`. Token scopes:
-    `read` (view), `write` (trigger, triage, edit assets), `trigger` (trigger and view own
-    assessments only), `ingest:relay` (automation relays) and `admin` (everything). Each operation
-    states the scope it needs; `admin` satisfies every scope.
+    **Authentication and scopes.** Send `Authorization: Bearer <token>`. Create tokens with
+    `POST /tokens` (admin). Every operation lists the scopes that may call it in its `security`
+    requirement: a token needs **any one** of the listed scopes. The scope is a minimum; where a
+    request can need more (for example `admin` to waive a finding) the description says so.
+    `admin` satisfies every requirement. A missing or invalid token is `401`; a valid token
+    without a needed scope is `403`.
+
+    | Scope | Grants | Typical holder |
+    | --- | --- | --- |
+    | `read` | View assessments, findings, registers, SBOMs, reports, QA runs, feeds, SAST settings, live events and `GET /system/status`. | Dashboards, frontends, auditors |
+    | `write` | Everything in `read`, plus trigger assessments, triage findings, edit assets, owners, QA, SAST and threat-intel settings that stay in `hunt` mode, and request reports. | CI pipelines, engineers, n8n |
+    | `trigger` | Queue assessments and QA runs and read assessments and QA runs; nothing else. | Narrow automation that only starts scans |
+    | `ingest:relay` | Forward GitHub, GitLab and registry webhooks to the shared `/ingest/*` receivers (needs `SCRS_RELAY_ENABLED=true`). | A relay in front of SCRS |
+    | `admin` | Everything: tokens, connections, webhooks, retention, audit log, waivers, enforcing modes, provider and integration secrets, maintenance. | Platform owners only |
+
+    Public routes (`security: []`): `/system/healthz`, `/system/readyz`, `/docs` (unless disabled or
+    protected) and the webhook receivers that verify a signature or a connection secret instead of a
+    token.
 
     **Limits and errors.** 120 requests per token per sliding minute (`429` with `Retry-After`).
     Errors are `{"error": "<message>"}`. If Redis or the token store is unavailable, requests fail
@@ -101,7 +115,7 @@ paths:
       tags: [System]
       operationId: health
       summary: Liveness probe
-      description: Returns `ok` while the process is serving. No authentication.
+      description: Returns `ok` while the process is serving. No authentication. For per-component state use `GET /system/status`.
       security: []
       responses:
         '200': {description: Process is alive, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
@@ -115,10 +129,23 @@ paths:
       responses:
         '200': {description: Backing services reachable, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
         '503': {description: A backing service is unavailable, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+  /system/status:
+    get:
+      tags: [System]
+      operationId: platformStatus
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Platform status
+      description: 'Per-component state for a frontend status view: `api`, `postgres`, `redis`, `s3`, `worker` (last heartbeat; down after 15 minutes of silence), `scanner`, `feeds` (stale enabled vulnerability sources), `sast` and `qa_runner`. Each is `ok`, `degraded`, `down` or `not_configured`. The overall `status` is `down` when PostgreSQL, Redis or S3 is down, `degraded` when any other configured component is not `ok`, and `ok` otherwise. The call always answers `200`; read `status`. A change of overall status is also pushed as the `system.degraded` and `system.recovered` events, announced once after it holds for about 90 seconds. Details are fixed phrases without addresses or error text. Probes run concurrently and the answer is cached for 10 seconds. Scope `read` or `write`.'
+      responses:
+        '200': {description: Platform status, content: {application/json: {schema: {$ref: '#/components/schemas/PlatformStatus'}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /system/metrics:
     get:
       tags: [System]
       operationId: metrics
+      security: [{bearerAuth: [read]}]
       summary: Prometheus metrics
       description: Request, queue-depth, verdict, trigger and webhook-delivery metrics in Prometheus text format. Scope `read`.
       responses:
@@ -130,6 +157,7 @@ paths:
     get:
       tags: [System]
       operationId: githubWebhookChecks
+      security: [{bearerAuth: [read]}]
       summary: GitHub webhook delivery check state
       description: |
         Latest delivery check of each GitHub connection. GitHub never retries a failed webhook delivery, so SCRS reads its own
@@ -146,6 +174,7 @@ paths:
     post:
       tags: [System]
       operationId: runGitHubWebhookCheck
+      security: [{bearerAuth: [admin]}]
       summary: Run the GitHub webhook delivery check now
       description: Runs the scheduled delivery check immediately and returns its result. Returns 409 while another replica is checking. Scope `admin`.
       responses:
@@ -182,6 +211,7 @@ paths:
     get:
       tags: [Tokens]
       operationId: listTokens
+      security: [{bearerAuth: [admin]}]
       summary: List API tokens
       description: Token metadata only; secrets are never returned after creation. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/Cursor'}]
@@ -195,6 +225,7 @@ paths:
     post:
       tags: [Tokens]
       operationId: createToken
+      security: [{bearerAuth: [admin]}]
       summary: Create an API token
       description: Returns the token secret once. Optionally restrict client IPs (`ip_allow_list`) and set an expiry. Scope `admin`.
       requestBody:
@@ -230,6 +261,7 @@ paths:
     delete:
       tags: [Tokens]
       operationId: revokeToken
+      security: [{bearerAuth: [admin]}]
       summary: Revoke an API token
       description: Revocation is immediate. The bootstrap token is rotated through the environment instead. Scope `admin`.
       responses:
@@ -244,6 +276,7 @@ paths:
     get:
       tags: [Connections]
       operationId: listConnections
+      security: [{bearerAuth: [admin]}]
       summary: List connections
       description: Connections without credentials, ordered by name. The next page cursor is in `X-Next-Cursor`. Scope `admin`.
       parameters:
@@ -260,6 +293,7 @@ paths:
     post:
       tags: [Connections]
       operationId: createConnection
+      security: [{bearerAuth: [admin]}]
       summary: Create a connection
       description: |
         Stores provider config and an AES-GCM encrypted credential. `config` and `credential` depend on the provider:
@@ -294,6 +328,7 @@ paths:
     get:
       tags: [Connections]
       operationId: getConnection
+      security: [{bearerAuth: [admin]}]
       summary: Get a connection
       description: Configuration, scope and last check status; never the credential. Scope `admin`.
       responses:
@@ -305,6 +340,7 @@ paths:
     patch:
       tags: [Connections]
       operationId: updateConnection
+      security: [{bearerAuth: [admin]}]
       summary: Change scope or enable/disable
       description: Changing scope or disabling invalidates queued work for the old configuration. Send at least one field. Scope `admin`.
       requestBody:
@@ -328,6 +364,7 @@ paths:
     delete:
       tags: [Connections]
       operationId: disableConnection
+      security: [{bearerAuth: [admin]}]
       summary: Disable a connection
       description: Soft delete. The connection is disabled and its history kept as audit evidence. Scope `admin`.
       responses:
@@ -341,6 +378,7 @@ paths:
     post:
       tags: [Connections]
       operationId: rotateConnectionCredential
+      security: [{bearerAuth: [admin]}]
       summary: Replace the stored credential
       description: Validates the credential shape for the provider and re-encrypts it. Scope `admin`.
       requestBody:
@@ -365,6 +403,7 @@ paths:
     post:
       tags: [Connections]
       operationId: setConnectionWebhook
+      security: [{bearerAuth: [admin]}]
       summary: Set or rotate a connection's webhook secret
       description: |
         Each GitHub, GitLab, Harbor, Docker Hub, GAR and OCI connection has its own inbound webhook secret and receiver URL. The secret is sealed with `SCRS_MASTER_KEY`, separately from the provider credential, so rotating it re-scopes no assets and invalidates no assessments.
@@ -401,6 +440,7 @@ paths:
     post:
       tags: [Connections]
       operationId: testConnection
+      security: [{bearerAuth: [admin]}]
       summary: Test provider access
       description: Lists resources with the stored credential without changing the inventory. Scope `admin`.
       responses:
@@ -416,6 +456,7 @@ paths:
     post:
       tags: [Connections]
       operationId: discoverConnection
+      security: [{bearerAuth: [admin]}]
       summary: Discover assets
       description: Lists the provider's repositories or images and reconciles the asset inventory. Resources that disappeared lose eligibility but keep their history. Scope `admin`.
       responses:
@@ -432,6 +473,7 @@ paths:
     get:
       tags: [Assets]
       operationId: listAssets
+      security: [{bearerAuth: [read]}]
       summary: List assets
       description: All discovered repositories and images ordered by locator. Check `flags.in_scope` and `flags.accessible` for eligibility. Scope `read`.
       parameters:
@@ -447,6 +489,7 @@ paths:
     get:
       tags: [Assets]
       operationId: getAsset
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get an asset
       description: Asset with owner and attributes. The `ETag` header is the revision for updates. Scope `read` or `write`.
       responses:
@@ -461,6 +504,7 @@ paths:
     patch:
       tags: [Assets]
       operationId: updateAsset
+      security: [{bearerAuth: [write]}]
       summary: Update owner and attributes
       description: Sets owner, environment, criticality, exposure and labels. The label `mirror=true` opts the asset into scheduled git mirrors. Requires `If-Match`. Scope `write`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -483,6 +527,7 @@ paths:
     get:
       tags: [Assets]
       operationId: lastKnownGood
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Last known good revision
       description: Newest `pass` SCRS assessment of a ref with no open integrity finding against it. Imports never count. Use it as the restore target after an incident. Scope `read` or `write`.
       parameters: [{name: ref, in: query, required: true, schema: {type: string}, example: main}]
@@ -506,6 +551,7 @@ paths:
     get:
       tags: [Assets]
       operationId: listOwners
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List owners
       description: Accountable contacts that assets can reference. Scope `read` or `write`.
       responses:
@@ -516,6 +562,7 @@ paths:
     post:
       tags: [Assets]
       operationId: createOwner
+      security: [{bearerAuth: [write]}]
       summary: Create an owner
       description: Names are unique. Contact fields are excluded from outbound events unless a subscription opts in. Scope `write`.
       requestBody:
@@ -536,6 +583,7 @@ paths:
     patch:
       tags: [Assets]
       operationId: updateOwner
+      security: [{bearerAuth: [write]}]
       summary: Replace an owner's fields
       description: Requires `If-Match` with the owner's revision. Scope `write`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -559,6 +607,7 @@ paths:
     get:
       tags: [Mirrors]
       operationId: listMirrors
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List git mirrors of an asset
       description: The 50 newest mirror jobs and bundles, newest first. Bundles beyond `SCRS_MIRROR_KEEP` and older than `SCRS_MIRROR_MIN_AGE_DAYS` show `pruned`; the newest bundle before an open integrity finding is never pruned. Scope `read` or `write`.
       responses:
@@ -569,6 +618,7 @@ paths:
     post:
       tags: [Mirrors]
       operationId: requestMirror
+      security: [{bearerAuth: [write]}]
       summary: Mirror a repository now
       description: Queues a git bundle of every branch and tag of a GitHub or GitLab asset. If a mirror is already queued or running, returns it with `200`. Scope `write`.
       responses:
@@ -585,6 +635,7 @@ paths:
     get:
       tags: [Mirrors]
       operationId: downloadMirror
+      security: [{bearerAuth: [admin]}]
       summary: Download a git bundle
       description: Streams the bundle. Verify it against `X-Content-SHA256`, then restore with `git clone <file>.bundle`. Scope `admin`.
       responses:
@@ -603,6 +654,7 @@ paths:
     post:
       tags: [Assessments]
       operationId: createAssessment
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Trigger an assessment
       description: |
         Queues an assessment of one in-scope asset. This is also the inbound endpoint for automation (n8n, CI, ticketing): use a `trigger` token restricted with `ip_allow_list`, the caller's event id as `Idempotency-Key`, and `trigger.context` for correlation data returned in `assessment.completed`. Git targets resolve `ref` to an immutable commit (or pin `commit`); image targets resolve `ref` (tag) to a manifest digest (or pin `commit` = `sha256:` digest).
@@ -637,6 +689,7 @@ paths:
     get:
       tags: [Assessments]
       operationId: listAssessments
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: List assessments
       description: Newest first, filterable. `trigger`-only tokens see only their own assessments. Scope `read`, `write` or `trigger`.
       parameters:
@@ -659,6 +712,7 @@ paths:
     post:
       tags: [Assessments]
       operationId: createAssessmentBatch
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Trigger up to 100 assessments
       description: Each item has its own idempotency key and result; one failing item never fails the others. Always `207`. Scope `write` or `trigger`.
       requestBody:
@@ -707,6 +761,7 @@ paths:
     get:
       tags: [Assessments]
       operationId: latestAssessment
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Latest assessment for an asset or commit
       description: The newest assessment matching `asset_id`, `repository` and/or `commit`, for example to show a PR or release gate. Scope `read`, `write` or `trigger`.
       parameters:
@@ -724,6 +779,7 @@ paths:
     get:
       tags: [Assessments]
       operationId: getAssessment
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Get an assessment
       description: Status, verdict, stage coverage, counts and component diff. With `wait`, holds the request up to that many seconds until the assessment finishes (long-poll). Scope `read`, `write` or `trigger` (own).
       parameters: [{name: wait, in: query, schema: {type: integer, minimum: 0, maximum: 60}}]
@@ -736,6 +792,7 @@ paths:
     delete:
       tags: [Assessments]
       operationId: cancelAssessment
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Cancel a queued or running assessment
       description: Finished assessments cannot be cancelled. Scope `write`, or `trigger` for own assessments.
       responses:
@@ -751,6 +808,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentFindings
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Findings of an assessment
       description: Findings as detected in this assessment, each marked `new` or `existing` against the baseline. Scope `read`, `write` or `trigger` (own).
       parameters: [{$ref: '#/components/parameters/Cursor'}]
@@ -764,6 +822,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentComponents
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Components (packages) of an assessment
       description: Package inventory with ecosystem, version, PURL and manifest path. Scope `read`, `write` or `trigger` (own).
       parameters: [{$ref: '#/components/parameters/Cursor'}]
@@ -779,6 +838,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentFiles
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: File evidence
       description: Path, size, SHA-256 and malware status per file. Source content is never stored. Image assessments list only flagged layer files. Scope `read`, `write` or `trigger` (own).
       responses:
@@ -792,6 +852,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentSBOM
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: SBOM (CycloneDX or SPDX)
       description: 'The assessment''s SBOM (SBM-011). `cyclonedx-json` (default) is the stored CycloneDX 1.6 document SCRS generated from its component model, integrity-checked against `sbom_sha256` (`ETag`); `cyclonedx-xml` is the same document as XML; `spdx-json` is SPDX 2.3 generated from the same components (SBM-010), with declared and concluded licences, so both formats list the same packages. Documents name the SCRS version and generation time (also in `X-SCRS-Version` and `X-SCRS-Generated-At`). Scope `read`, `write` or `trigger` (own).'
       parameters: [{$ref: '#/components/parameters/SBOMFormat'}]
@@ -807,6 +868,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentReport
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Human-readable report
       description: Markdown summary with `format=md`; otherwise the assessment JSON. Scope `read`, `write` or `trigger` (own).
       parameters: [{name: format, in: query, schema: {type: string, enum: [md, json]}}]
@@ -824,6 +886,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentContext
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Context document for automation and AI agents
       description: Size-capped, redacted JSON with verdict, gate rule, findings and guidance. `agent` marks repository-controlled text as untrusted. Contacts only with `include_contacts=true` and `admin`. Scope `read`, `write` or `trigger` (own).
       parameters:
@@ -839,6 +902,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentMBOM
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: CycloneDX MBOM (manufacturing BOM)
       description: CycloneDX 1.6 Manufacturing Bill of Materials of the assessed revision. Lists the produced artifact (commit or image digest), the build definitions and pinned inputs SCRS observed (CI workflows, Dockerfiles, build scripts, lockfiles) with SHA-256, the verifying tools and a link to the SBOM. It is declared, not observed, build data; use SLSA attestations for provenance. Scope `read`, `write` or `trigger` (own).
       responses:
@@ -852,6 +916,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentVEX
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: OpenVEX document
       description: OpenVEX 0.2.0 statements derived from register triage (affected, not_affected, fixed, under_investigation). Scope `read`, `write` or `trigger` (own).
       responses:
@@ -864,6 +929,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: assessmentSnapshot
+      security: [{bearerAuth: [admin]}]
       summary: Download the scanned source archive
       description: The exact tar.gz SCRS scanned, when `SCRS_SNAPSHOT_ARCHIVES=true`. Scope `admin`.
       responses:
@@ -877,6 +943,7 @@ paths:
     get:
       tags: [Remediation]
       operationId: remediationPlan
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Remediation plan result
       description: The plan produced by a remediation assessment (changed manifest, upgrades, residual risk). Scope `read`, `write` or `trigger` (own).
       responses:
@@ -890,6 +957,7 @@ paths:
     get:
       tags: [Remediation]
       operationId: automaticRemediationPlans
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Automatic plans for an assessment
       description: Fix plans dispatched automatically for this assessment's manifests, with dispatch and job status. Scope `read`, `write` or `trigger` (own).
       responses:
@@ -916,6 +984,7 @@ paths:
     post:
       tags: [Imports]
       operationId: importReport
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Import a Trivy or SARIF report
       description: |
         Records an external scan of one in-scope asset revision as a completed assessment (stage `import`). Findings join the register and the verdict gate.
@@ -961,6 +1030,7 @@ paths:
     get:
       tags: [Risk register]
       operationId: listRegister
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List register entries
       description: Deduplicated findings across all assessments with current lifecycle status. Scope `read` or `write`.
       parameters:
@@ -976,9 +1046,10 @@ paths:
     patch:
       tags: [Risk register]
       operationId: transitionFinding
+      security: [{bearerAuth: [write]}]
       summary: Change a finding's status
       description: |
-        Triage with a reason (8 to 2000 characters). `open`, `triaged` and `in_progress` need `write`. `accepted` (a waiver, requires `expires_at` within 90 days), `suppressed` and `false_positive` need `admin`.
+        Triage with a reason (8 to 2000 characters). Scope `write` for `open`, `triaged` and `in_progress`; `admin` for `accepted` (a waiver, requires `expires_at` within 90 days), `suppressed` and `false_positive`.
         Malicious content never gates below `warn`, even when waived.
       requestBody:
         required: true
@@ -1004,6 +1075,7 @@ paths:
     get:
       tags: [Risk register]
       operationId: findingHistory
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Finding history
       description: The 100 newest lifecycle events (detected, transitions, fixed by scan or import) with actor and details. Scope `read` or `write`.
       responses:
@@ -1030,6 +1102,7 @@ paths:
     get:
       tags: [Remediation]
       operationId: remediationCapabilities
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Supported fix-plan ecosystems
       description: Whether remediation is enabled and which manifests and strategies are supported. Scope `read` or `write`.
       responses:
@@ -1042,6 +1115,7 @@ paths:
     post:
       tags: [Remediation]
       operationId: requestRemediation
+      security: [{bearerAuth: [write]}]
       summary: Request a fix plan
       description: Queues a sandboxed plan for one manifest of a completed assessment (`package-lock.json` with `in-place`, or `pom.xml` with `override`). Fetch the result from `/assessments/{id}/remediation`. Scope `write`.
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
@@ -1088,7 +1162,7 @@ paths:
       description: |
         Shared receiver for deployments that set `SCRS_GITHUB_WEBHOOK_SECRET`; prefer each connection's own receiver, `/ingest/github/{connection}`. Without `Authorization`, GitHub calls directly and `X-Hub-Signature-256` is required. With a bearer token (scope `ingest:relay`, `SCRS_RELAY_ENABLED=true`), automation relays the unchanged body. A forwarded signature is verified when `SCRS_GITHUB_WEBHOOK_SECRET` is configured; otherwise the relay token alone is trusted.
         `push` and `pull_request` (opened, synchronize, reopened) queue assessments. `push`, `delete`, `create`, `repository`, `member` and `organization` raise integrity alerts (force push, deletions, branch churn, mass deletion, visibility and membership changes, campaign patterns). Other events return `200`.
-      security: [{}, {bearerAuth: []}]
+      security: [{}, {bearerAuth: [ingest:relay]}]
       parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
       requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
@@ -1107,7 +1181,7 @@ paths:
       description: |
         Shared receiver for deployments that set `SCRS_GITLAB_WEBHOOK_SECRET`; prefer each connection's own receiver, `/ingest/gitlab/{connection}`. Without `Authorization`, GitLab calls directly with `X-Gitlab-Token` equal to `SCRS_GITLAB_WEBHOOK_SECRET`. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded `X-Gitlab-Token` is verified when the secret is configured, otherwise the relay token alone is trusted.
         GitLab's `Idempotency-Key` header (stable across retries of one delivery) is the idempotency key; `X-Gitlab-Event-UUID`, which recursive hooks share, is the fallback. One of the two is required. Push Hook and Merge Request Hook (open, reopen, update with new commits) queue assessments. Pushes raise ref-deletion, branch-churn, mass-deletion and pattern alerts. Tag pushes raise alerts only. Other hooks return `200`.
-      security: [{}, {bearerAuth: []}]
+      security: [{}, {bearerAuth: [ingest:relay]}]
       parameters:
         - {name: X-Gitlab-Event, in: header, required: true, schema: {type: string, enum: [Push Hook, Tag Push Hook, Merge Request Hook]}}
         - {name: Idempotency-Key, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}, description: Sent by GitLab 17.4 and later; preferred delivery id}
@@ -1130,7 +1204,7 @@ paths:
       description: |
         A GitHub connection's own receiver. Direct deliveries are verified with that connection's webhook secret (`X-Hub-Signature-256`), set with `POST /connections/{id}:webhook`. An unknown, disabled or unconfigured connection answers `401` like a bad signature. With a bearer token (scope `ingest:relay`), a relay forwards the body; a forwarded signature is checked against the connection's secret.
         Events behave as on `/ingest/github`, but only reach that connection's repositories: an event for a repository outside it is acknowledged as out of scope.
-      security: [{}, {bearerAuth: []}]
+      security: [{}, {bearerAuth: [ingest:relay]}]
       parameters: [{$ref: '#/components/parameters/GitHubEvent'}, {$ref: '#/components/parameters/GitHubDelivery'}, {$ref: '#/components/parameters/GitHubSignature'}]
       requestBody: {required: true, content: {application/json: {schema: {type: object}}}}
       responses:
@@ -1148,7 +1222,7 @@ paths:
       summary: GitLab events for one connection
       description: |
         A GitLab connection's own receiver: `X-Gitlab-Token` must equal that connection's webhook secret. Relays use a bearer token (scope `ingest:relay`); a forwarded `X-Gitlab-Token` is checked against the connection's secret. Events behave as on `/ingest/gitlab` but only reach that connection's projects. Unknown, disabled or unconfigured connections answer `401`.
-      security: [{}, {bearerAuth: []}]
+      security: [{}, {bearerAuth: [ingest:relay]}]
       parameters:
         - {name: X-Gitlab-Event, in: header, required: true, schema: {type: string, enum: [Push Hook, Tag Push Hook, Merge Request Hook]}}
         - {name: Idempotency-Key, in: header, schema: {type: string, pattern: '^[A-Za-z0-9._:-]{8,128}$'}}
@@ -1190,6 +1264,7 @@ paths:
     post:
       tags: [Ingest]
       operationId: ingestRegistry
+      security: [{bearerAuth: [ingest:relay]}]
       summary: Registry push events
       description: |
         Queues an image assessment per pushed manifest, pinned to the pushed digest when the registry reports it. Accepted payloads:
@@ -1219,6 +1294,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: listSubscriptions
+      security: [{bearerAuth: [admin]}]
       summary: List subscriptions
       description: Subscriptions without secrets. Scope `admin`.
       responses:
@@ -1229,6 +1305,7 @@ paths:
     post:
       tags: [Webhook subscriptions]
       operationId: createSubscription
+      security: [{bearerAuth: [admin]}]
       summary: Create a subscription
       description: |
         Delivers selected events to an HTTPS URL that resolves to a public address. HTTP and private addresses work only for hosts in `SCRS_WEBHOOK_PRIVATE_HOSTS` (for example an n8n container).
@@ -1264,6 +1341,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: getSubscription
+      security: [{bearerAuth: [admin]}]
       summary: Get a subscription
       description: Subscription settings and revision (`ETag`); the secret is never returned. Scope `admin`.
       responses:
@@ -1278,6 +1356,7 @@ paths:
     patch:
       tags: [Webhook subscriptions]
       operationId: updateSubscription
+      security: [{bearerAuth: [admin]}]
       summary: Update a subscription
       description: Change URL, events, profile, connection scope or enabled state. Requires `If-Match`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -1306,6 +1385,7 @@ paths:
     delete:
       tags: [Webhook subscriptions]
       operationId: disableSubscription
+      security: [{bearerAuth: [admin]}]
       summary: Disable a subscription
       description: Soft delete. Disables delivery and keeps the delivery log as audit evidence. Requires `If-Match`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -1320,6 +1400,7 @@ paths:
     post:
       tags: [Webhook subscriptions]
       operationId: rotateSubscriptionSecret
+      security: [{bearerAuth: [admin]}]
       summary: Rotate the signing secret
       description: Returns the new secret and `X-SCRS-Auth` value once; the old ones stop working immediately. Scope `admin`.
       responses:
@@ -1340,6 +1421,7 @@ paths:
     post:
       tags: [Webhook subscriptions]
       operationId: testSubscription
+      security: [{bearerAuth: [admin]}]
       summary: Send a ping event
       description: Queues a signed `ping` to this subscription; check the delivery log for the result. Scope `admin`.
       responses:
@@ -1352,6 +1434,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: listDeliveries
+      security: [{bearerAuth: [admin]}]
       summary: Delivery log
       description: Newest first, with attempts, last HTTP status and error. Scope `admin`.
       parameters:
@@ -1371,6 +1454,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: getDelivery
+      security: [{bearerAuth: [admin]}]
       summary: Get one delivery
       description: Includes the payload. Scope `admin`.
       responses:
@@ -1386,6 +1470,7 @@ paths:
     post:
       tags: [Webhook subscriptions]
       operationId: redeliver
+      security: [{bearerAuth: [admin]}]
       summary: Redeliver an event
       description: Requeues a delivered or dead delivery with the same event id, so receivers deduplicate it. Scope `admin`.
       responses:
@@ -1400,6 +1485,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: activeIndicators
+      security: [{bearerAuth: [admin]}]
       summary: Active indicator bundle
       description: |
         The bundle last activated with PUT. Its indicators form the `bundle` indicator source (mode `block`), which scans
@@ -1413,6 +1499,7 @@ paths:
     put:
       tags: [Threat intelligence]
       operationId: importIndicators
+      security: [{bearerAuth: [admin]}]
       summary: Import and activate an indicator bundle
       description: |
         Atomically activates a new immutable version, which replaces the indicators of the `bundle` source; previous versions
@@ -1434,6 +1521,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listYaraRulesets
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: YARA rulesets
       description: |
         Team rules written in the Web UI (`custom`) and third-party packs (`external`, for example YARA Forge), without their
@@ -1447,6 +1535,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: createYaraRuleset
+      security: [{bearerAuth: [write]}]
       summary: Create a YARA ruleset
       description: |
         Compiles the rules with YARA-X, then stores them. New rulesets default to mode `hunt`: matches are recorded as
@@ -1468,6 +1557,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: validateYaraRules
+      security: [{bearerAuth: [write]}]
       summary: Compile YARA rules without saving
       description: For the Web UI rule editor. Returns warnings (for example slow patterns) or, with 422, located compile errors. Scope `write`.
       requestBody:
@@ -1486,6 +1576,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: getYaraRuleset
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: YARA ruleset with its rules
       description: One ruleset including its rule text, with an ETag for updates. Scope `read` or `write`.
       responses:
@@ -1497,6 +1588,7 @@ paths:
     patch:
       tags: [Threat intelligence]
       operationId: updateYaraRuleset
+      security: [{bearerAuth: [write]}]
       summary: Change a YARA ruleset
       description: |
         Partial update at the If-Match revision; changed rules are compiled first. `write` may change rulesets that are
@@ -1520,6 +1612,7 @@ paths:
     delete:
       tags: [Threat intelligence]
       operationId: deleteYaraRuleset
+      security: [{bearerAuth: [write]}]
       summary: Delete a YARA ruleset
       description: Removes the ruleset; its findings close on the next complete scan. `write` for `hunt` rulesets, otherwise `admin`.
       responses:
@@ -1534,6 +1627,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: huntYaraRuleset
+      security: [{bearerAuth: [write]}]
       summary: Retro-hunt with a ruleset
       description: Queues a rescan of the default branch of every in-scope repository so enabled rules run against current code. Rescans already queued in the same window are not repeated. Scope `write`.
       responses:
@@ -1547,6 +1641,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listIndicatorSources
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Indicator sources
       description: |
         Each source holds its own indicators and mode. Scans and GitHub event pattern matching use the unexpired indicators of
@@ -1560,6 +1655,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: createIndicatorSource
+      security: [{bearerAuth: [write]}]
       summary: Create an indicator source
       description: |
         Creates an empty source; import indicators next. New sources default to mode `hunt`: matches are recorded as `ioc_hunt`
@@ -1583,6 +1679,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: getIndicatorSource
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Indicator source
       description: One source with its last import, and an ETag for updates. Scope `read` or `write`.
       responses:
@@ -1594,6 +1691,7 @@ paths:
     patch:
       tags: [Threat intelligence]
       operationId: updateIndicatorSource
+      security: [{bearerAuth: [write]}]
       summary: Change an indicator source
       description: |
         Partial update at the If-Match revision (imports also advance the revision). `write` may change sources that are `hunt`
@@ -1617,6 +1715,7 @@ paths:
     delete:
       tags: [Threat intelligence]
       operationId: deleteIndicatorSource
+      security: [{bearerAuth: [write]}]
       summary: Delete an indicator source
       description: Removes the source and its indicators; its findings close on the next complete scan. `write` for `hunt` sources, otherwise `admin`.
       responses:
@@ -1631,6 +1730,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listSourceIndicators
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: A source's indicators
       description: The source's indicators as a bundle, with values normalized and the version of the last import. Scope `read` or `write`.
       responses:
@@ -1642,6 +1742,7 @@ paths:
     put:
       tags: [Threat intelligence]
       operationId: importSourceIndicators
+      security: [{bearerAuth: [write]}]
       summary: Replace a source's indicators
       description: |
         Atomically replaces every indicator of the source with the bundle. Defanged values (`hxxp`, `[.]`) are accepted and
@@ -1665,6 +1766,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: importSTIXBundle
+      security: [{bearerAuth: [write]}]
       summary: Upload a STIX 2.1 bundle
       description: |
         For sources of kind `stix`. Indicator objects whose patterns can be checked against files at rest become indicators:
@@ -1700,6 +1802,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: importIndicatorCSV
+      security: [{bearerAuth: [write]}]
       summary: Import indicators from CSV
       description: |
         Loads a CSV export into a manual source (TIF-005). The header row names columns; map them with `value_column` (default `value`), `type_column`, `first_seen_column`, `confidence_column`, `label_column` and `valid_until_column`. Without a type, `type` sets one for every row, otherwise each value's type is detected (MD5, SHA-1, SHA-256, IPv4, IPv6, URL, purl, domain). Defanged values are accepted. `valid_days` (default 180) sets the expiry from the first-seen date when a row has none. The label becomes part of the indicator ID, and so of the finding's advisory ID.
@@ -1733,6 +1836,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listVulnerabilitySources
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List vulnerability and advisory sources
       description: |
         Every advisory source (VUL-001): OSV.dev dumps, OpenSSF malicious packages, CISA KEV and FIRST EPSS (downloaded by `scrs-feed-sync`), the NVD CVE API 2.0 and the CVE Program's CVE Services API (synced by the worker for CVEs the register references), and imported VEX statements. Each lists its licence and terms, schedule, last sync and success, record count, lag and failures. A source with no success within twice its schedule is `stale` and raises `feed.stale` once (VUL-010). Scope `read` or `write`.
@@ -1746,6 +1850,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: getVulnerabilitySource
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get one advisory source
       description: One source with its health. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
       responses:
@@ -1757,6 +1862,7 @@ paths:
     patch:
       tags: [Threat intelligence]
       operationId: updateVulnerabilitySource
+      security: [{bearerAuth: [admin]}]
       summary: Enable, disable or reschedule a source
       description: Changes `enabled` or `schedule_minutes` (15 to 10080) of a worker-synced source (`nvd`, `cve_program`). Enabling a licence-restricted source needs `acknowledge_terms` set to true (VUL-011). Every change is audited. Sources downloaded by `scrs-feed-sync` answer `409`. Requires `If-Match`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -1775,6 +1881,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: syncVulnerabilitySource
+      security: [{bearerAuth: [admin]}]
       summary: Sync an advisory source now
       description: Makes a worker-synced source (`nvd`, `cve_program`) due now. Set `SCRS_NVD_API_KEY` on the worker for the NVD's higher rate limit. Scope `admin`.
       responses:
@@ -1790,6 +1897,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: getVulnerability
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Everything known about a vulnerability
       description: |
         The vulnerability's records from every synced origin in OSV schema (`nvd`, `cve5`; VUL-002), each with the original kept verbatim server-side; every CVSS vector and score offered with its source (`severity_sources`, VUL-004); CWEs; and vendor statements from imported VEX documents (VUL-009), filtered to a product with `purl` (a statement without a version applies to every version). Statements are attributed inputs and never close a finding. Scope `read` or `write`.
@@ -1815,6 +1923,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listVEXDocuments
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List imported VEX documents
       description: Imported OpenVEX, CycloneDX VEX and CSAF documents, newest first, with publisher, statement count and digest. Scope `read` or `write`.
       responses:
@@ -1825,6 +1934,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: importVEX
+      security: [{bearerAuth: [write]}]
       summary: Import a VEX document
       description: |
         Stores the vendor and maintainer statements of an OpenVEX, CycloneDX VEX or CSAF 2.0 (`csaf_vex` or `csaf_security_advisory`) document (VUL-009), one per vulnerability and product (purl, or product name when the document gives none). CycloneDX analysis states map to `not_affected`, `affected`, `fixed` and `under_investigation`. The same document (by SHA-256) imported twice is `409`. Up to 16 MiB and 20000 statements. Scope `write`.
@@ -1842,6 +1952,7 @@ paths:
     delete:
       tags: [Threat intelligence]
       operationId: deleteVEXDocument
+      security: [{bearerAuth: [admin]}]
       summary: Delete a VEX document
       description: Removes the document and its statements. Audited. Scope `admin`.
       responses:
@@ -1854,6 +1965,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: listVendorStatements
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Find vendor statements
       description: Statements about a `vulnerability` and/or a product `purl` (a versionless statement purl matches every version), newest first, up to 500. Scope `read` or `write`.
       parameters:
@@ -1871,6 +1983,7 @@ paths:
     get:
       tags: [Threat intelligence]
       operationId: getTAXIIFeed
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: TAXII feed settings and poll state
       description: Settings, cursor and the last poll's outcome of a `taxii` source. The credential is never returned. Scope `read` or `write`.
       responses:
@@ -1882,6 +1995,7 @@ paths:
     patch:
       tags: [Threat intelligence]
       operationId: updateTAXIIFeed
+      security: [{bearerAuth: [admin]}]
       summary: Change a TAXII feed
       description: |
         Changes settings; omitted fields are unchanged. Any credential field (`api_key`, `username`, `password`, `cert_pem`,
@@ -1903,6 +2017,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: pollTAXIIFeed
+      security: [{bearerAuth: [admin]}]
       summary: Poll a TAXII feed now
       description: Makes the feed due; the worker polls it within `SCRS_TAXII_POLL_SECONDS`. Scope `admin`.
       responses:
@@ -1917,6 +2032,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: testTAXIIFeed
+      security: [{bearerAuth: [admin]}]
       summary: Check a TAXII feed's settings
       description: Reads the collection resource with the stored URL, credential and certificates, and reports whether the collection can be read. Scope `admin`.
       responses:
@@ -1932,6 +2048,7 @@ paths:
     post:
       tags: [Threat intelligence]
       operationId: huntIndicatorSource
+      security: [{bearerAuth: [write]}]
       summary: Retro-hunt with a source
       description: Queues a rescan of the default branch of every in-scope repository so enabled indicators are checked against current code. Rescans already queued in the same window are not repeated. Scope `write`.
       responses:
@@ -1946,6 +2063,7 @@ paths:
     post:
       tags: [Operations]
       operationId: runMaintenance
+      security: [{bearerAuth: [admin]}]
       summary: Run maintenance now
       description: Applies retention, expires idempotency keys and purges old deliveries. Concurrent runs are skipped. Scope `admin`.
       responses:
@@ -1957,6 +2075,7 @@ paths:
     post:
       tags: [Operations]
       operationId: rescanDefaultBranches
+      security: [{bearerAuth: [admin]}]
       summary: Rescan default branches
       description: Queues a rescan of every in-scope repository's default branch that has no recent assessment. Scope `admin`.
       responses:
@@ -1968,6 +2087,7 @@ paths:
     post:
       tags: [Operations]
       operationId: redeliverDead
+      security: [{bearerAuth: [admin]}]
       summary: Requeue all dead deliveries
       description: Use after a receiver outage. Scope `admin`.
       responses:
@@ -1979,6 +2099,7 @@ paths:
     post:
       tags: [Operations]
       operationId: resetData
+      security: [{bearerAuth: [admin]}]
       summary: Reset one scope of data
       description: |
         Scoped reset (MNT-001), audited. `feed_state` clears TAXII cursors and NVD/CVE sync state so the next runs resync from scratch. `indicators` deletes every indicator of `source_id`. `asset_findings` deletes one asset's register entries and their history (`asset_id`); assets on legal hold are refused. `confirm` must repeat the scope. Scope `admin`.
@@ -2007,6 +2128,7 @@ paths:
     post:
       tags: [Operations]
       operationId: rebuildDerived
+      security: [{bearerAuth: [admin]}]
       summary: Re-assess current revisions
       description: Queues the newest successful assessment of every tracked asset and ref (last 180 days) again (MNT-002), so findings, scores, KEV/EPSS, indicator and rule matches are recomputed against current feeds. Pull requests are left to their own events. Audited. Scope `admin`.
       responses:
@@ -2018,6 +2140,7 @@ paths:
     post:
       tags: [Operations]
       operationId: updateSensors
+      security: [{bearerAuth: [admin]}]
       summary: Refresh feeds now
       description: Makes every enabled TAXII feed and NVD/CVE Program sync due now (MNT-003) and returns the vulnerability sources with their freshness. OSV, KEV, EPSS and ClamAV signatures refresh on their own schedules in `scrs-feed-sync` and `scrs-clamav`. Audited. Scope `admin`.
       responses:
@@ -2029,6 +2152,7 @@ paths:
     get:
       tags: [Operations]
       operationId: maintenanceSchedule
+      security: [{bearerAuth: [admin]}]
       summary: Scheduled jobs and their last runs
       description: Each scheduled job (maintenance and retention, TAXII polling, advisory sync, feed monitor, GitHub delivery check) with interval, last start, finish, status, detail and next run, plus every feed source's schedule and health (MNT-005). Scope `admin`.
       responses:
@@ -2048,6 +2172,7 @@ paths:
     get:
       tags: [Operations]
       operationId: platformVersions
+      security: [{bearerAuth: [admin]}]
       summary: Platform versions and update check
       description: The SCRS build (version, Go, VCS revision), feed freshness, the Karate runner's versions, and the newest published release when `SCRS_RELEASE_FEED_URL` names an https JSON feed with `tag_name` or `version` (MNT-004). Scope `admin`.
       responses:
@@ -2060,6 +2185,7 @@ paths:
     get:
       tags: [SAST]
       operationId: listSASTAnalyzers
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Bundled analyzers
       description: The analyzers in the scrs-sast image (SAST-009) with version, languages, licence, rules licence, whether they may leave CreditChek (`redistributable`), rule count and whether this deployment enables them (`SCRS_SAST_ANALYZERS`), plus the reachability tool. Read live from the service; `service` is `unconfigured` or `unavailable` when it cannot be asked, and then only static metadata is returned. Scope `read` or `write`.
       responses:
@@ -2071,6 +2197,7 @@ paths:
     get:
       tags: [SAST]
       operationId: reachabilityCapabilities
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Reachability capabilities
       description: Ecosystems, methods and tool versions for reachability (REA-007). Go uses the govulncheck call graph; every other ecosystem reports `unsupported`. A failed or skipped analysis is `unknown`, never `not_reachable` (REA-003). Scope `read` or `write`.
       responses:
@@ -2082,6 +2209,7 @@ paths:
     get:
       tags: [SAST]
       operationId: getSASTSettings
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Deployment SAST settings
       description: Rules disabled everywhere (`tool:rule`, globs allowed, for example `bearer:javascript_express_helmet_missing` or `gosec:G104`) and paths excluded everywhere (globs such as `docs/**`). Scope `read` or `write`.
       responses:
@@ -2095,6 +2223,7 @@ paths:
     put:
       tags: [SAST]
       operationId: setSASTSettings
+      security: [{bearerAuth: [admin]}]
       summary: Replace deployment SAST settings
       description: Replaces the disabled rules and excludes; `If-Match` carries the revision (0 before the first change). Audited as `sast_settings.updated`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2115,6 +2244,7 @@ paths:
     get:
       tags: [SAST]
       operationId: getAssetSAST
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Asset SAST settings
       description: The asset's overrides (null fields inherit `SCRS_SAST_ENABLED` and `SCRS_REACHABILITY_ENABLED`) and the effective settings the next assessment uses, including enabled custom rulesets (SAST-002, REA-011). Scope `read` or `write`.
       responses:
@@ -2129,6 +2259,7 @@ paths:
     put:
       tags: [SAST]
       operationId: setAssetSAST
+      security: [{bearerAuth: [write]}]
       summary: Replace asset SAST settings
       description: Turns SAST and reachability on or off for the asset, selects analyzers, and adds disabled rules and excludes. `If-Match` carries the revision (0 before the first change). Audited. Scope `write`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2149,6 +2280,7 @@ paths:
     get:
       tags: [SAST]
       operationId: listSASTRulesets
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Custom OpenGrep rulesets
       description: Uploaded rulesets without their bodies. Enabled rulesets run with the bundled OpenGrep rules on every SAST assessment (SAST-007). Scope `read` or `write`.
       responses:
@@ -2159,6 +2291,7 @@ paths:
     post:
       tags: [SAST]
       operationId: saveSASTRuleset
+      security: [{bearerAuth: [write]}]
       summary: Upload a custom ruleset
       description: Stores or replaces (by name) an OpenGrep/Semgrep rule document after the scrs-sast service compiles it (`opengrep validate`). Audited as `sast_ruleset.saved`. Scope `write`.
       requestBody:
@@ -2188,6 +2321,7 @@ paths:
     get:
       tags: [SAST]
       operationId: getSASTRuleset
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get a ruleset
       description: One ruleset with its rule YAML. Scope `read` or `write`.
       responses:
@@ -2199,6 +2333,7 @@ paths:
     delete:
       tags: [SAST]
       operationId: deleteSASTRuleset
+      security: [{bearerAuth: [admin]}]
       summary: Delete a ruleset
       description: Removes a ruleset. Audited. Scope `admin`.
       responses:
@@ -2212,6 +2347,7 @@ paths:
     get:
       tags: [Licences]
       operationId: getGatePolicy
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Default gate rules
       description: The fixed verdict rules (TRG-006) as text. The gate is not configurable in this release; licence entries follow the licence policy. Scope `read` or `write`.
       responses:
@@ -2223,6 +2359,7 @@ paths:
     get:
       tags: [Licences]
       operationId: getLicensePolicy
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Active licence policy
       description: The licence policy applied to every assessment (LIC-004, LIC-005). Until an admin stores one it is the built-in `corporate-default` at revision 0. Licence data is a policy aid, not legal advice; counsel reviews the default before it is made enforcing. Scope `read` or `write`.
       responses:
@@ -2236,6 +2373,7 @@ paths:
     put:
       tags: [Licences]
       operationId: setLicensePolicy
+      security: [{bearerAuth: [admin]}]
       summary: Replace the licence policy
       description: Stores a policy validated against `GET /schemas/license-policy`. `If-Match` must carry the current revision (0 for corporate-default). Set `enforcing` to true only after counsel review; until then licence entries cap the verdict at `warn`. Audited as `license_policy.updated`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2255,6 +2393,7 @@ paths:
     post:
       tags: [Licences]
       operationId: evaluateLicense
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Try a licence against the policy
       description: Normalises licence text to an SPDX expression (LIC-002) and decides it under the active policy for a distribution model, without recording anything. Useful when counsel reviews rules. Scope `read` or `write`.
       requestBody:
@@ -2284,6 +2423,7 @@ paths:
     get:
       tags: [Licences]
       operationId: getLicenseCategories
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Licence categories
       description: Category of every SPDX License List licence and SCRS LicenseRef (LIC-003), with operator overrides and the override revision. Categories are permissive, public_domain, weak_copyleft, strong_copyleft, network_copyleft, source_available_restricted, non_commercial, proprietary and unknown. Scope `read` or `write`.
       responses:
@@ -2297,6 +2437,7 @@ paths:
     put:
       tags: [Licences]
       operationId: setLicenseCategories
+      security: [{bearerAuth: [admin]}]
       summary: Replace category overrides
       description: Stores a new revision of the overrides (SPDX id or LicenseRef to category); the shipped mapping applies to every id not overridden. Versioned and audited as `license_categories.updated` with each change. Requires `If-Match` with the current revision. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2326,6 +2467,7 @@ paths:
     get:
       tags: [Licences]
       operationId: listLicenseCategoryHistory
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Category override history
       description: Stored override revisions, newest first (up to 100). Scope `read` or `write`.
       responses:
@@ -2338,6 +2480,7 @@ paths:
     get:
       tags: [Licences]
       operationId: assetLicenses
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Asset licence inventory
       description: Components of the asset's newest successful assessment (of `ref`, when given) with licence expression, category, source (`declared`, `detected`, `metadata`, `none` or `unresolved`), confidence, the current policy result and the register status and waiver of each licence entry (LIC-006, LIC-007). Scope `read` or `write`.
       parameters: [{name: ref, in: query, schema: {type: string}}]
@@ -2352,6 +2495,7 @@ paths:
     get:
       tags: [Licences]
       operationId: assetLicenseNotices
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Third-party notices file
       description: A THIRD-PARTY-NOTICES text file (LIC-009) for the asset's newest assessed revision, with each component's licence, the copyright lines SCRS recorded and links to the licence texts. Development-only dependencies are omitted unless `include_dev=true`. A starting point, not legal advice. Scope `read` or `write`.
       parameters:
@@ -2367,6 +2511,7 @@ paths:
     get:
       tags: [Licences]
       operationId: licenseReport
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Licence report
       description: Licence inventory of one asset (`asset_id`) or of every assessed asset, as JSON, CSV (one row per component; cells that start with a formula character are quoted) or Markdown (LIC-007). Scope `read` or `write`.
       parameters:
@@ -2389,6 +2534,7 @@ paths:
     get:
       tags: [Assessment results]
       operationId: downloadSBOM
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Download an SBOM
       description: The same export as `GET /assessments/{id}/sbom` (SBM-011), addressed by SBOM digest so a pipeline can fetch the document it recorded. Scope `read` or `write`.
       parameters: [{$ref: '#/components/parameters/SBOMFormat'}]
@@ -2405,6 +2551,7 @@ paths:
     get:
       tags: [Compliance reports]
       operationId: listFrameworks
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List framework packs
       description: Shipped packs (OWASP Top 10 2021 and 2025, CWE Top 25 2024 and 2025, PCI DSS v4.0.1 requirement 6.3) and uploaded CWE-mapping packs (CMP-001). Each pack names the source of its mapping. Scope `read` or `write`.
       responses:
@@ -2415,6 +2562,7 @@ paths:
     post:
       tags: [Compliance reports]
       operationId: uploadFramework
+      security: [{bearerAuth: [admin]}]
       summary: Upload a framework pack
       description: Stores or replaces a custom `cwe_mapping` pack validated against `GET /schemas/framework-pack` (CMP-005). Shipped pack ids are reserved. Audited. Scope `admin`.
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/FrameworkPack'}}}}
@@ -2428,6 +2576,7 @@ paths:
     post:
       tags: [Compliance reports]
       operationId: importSTIG
+      security: [{bearerAuth: [admin]}]
       summary: Import a DISA STIG benchmark
       description: 'Imports a DISA STIG from its XCCDF benchmark (the `*-xccdf.xml` file, or the zip DISA publishes; at most 40 MiB) as a `stig` pack (CMP-004). Each rule becomes a category keyed by its STIG id, with its CAT severity, vulnerability and rule ids and CCIs. SCRS applies its starter mapping for the Application Security and Development STIG (CWE ids and finding types for the rules its scans can give evidence for); `mapping_unmatched` lists starter entries the benchmark does not contain. Download the pack, adjust the mapping and upload it with `POST /reports/frameworks`. SCRS bundles no DISA content, and reports never mark a rule "Not a Finding". The XML parser resolves no external entities. Audited. Scope `admin`.'
       requestBody:
@@ -2457,6 +2606,7 @@ paths:
     get:
       tags: [Compliance reports]
       operationId: getFramework
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get a framework pack
       description: One shipped or uploaded pack with its categories and CWE ids. Scope `read` or `write`.
       responses:
@@ -2468,6 +2618,7 @@ paths:
     delete:
       tags: [Compliance reports]
       operationId: deleteFramework
+      security: [{bearerAuth: [admin]}]
       summary: Delete an uploaded pack
       description: Removes an uploaded pack; shipped packs cannot be deleted. Audited. Scope `admin`.
       responses:
@@ -2481,6 +2632,7 @@ paths:
     get:
       tags: [Compliance reports]
       operationId: listReports
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List evidence reports
       description: Report jobs newest first, 50 per page. Scope `read` or `write`.
       parameters: [{$ref: '#/components/parameters/Cursor'}]
@@ -2493,6 +2645,7 @@ paths:
     post:
       tags: [Compliance reports]
       operationId: createReport
+      security: [{bearerAuth: [write]}]
       summary: Request an evidence report
       description: Queues a framework evidence report for one asset, one owner's assets or the portfolio over a window of at most 366 days (default the last 90), as JSON, CSV or Markdown (CMP-006). The worker records the data time, SCRS version, scope, advisory feed freshness and the file's SHA-256, and stores the file in S3 under the `reports` retention class. Reports list assets lacking a recent SBOM, count unmapped findings and contain no compliance verdict. Poll `GET /reports/{id}`. Scope `write`.
       requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReportRequest'}}}}
@@ -2511,6 +2664,7 @@ paths:
     get:
       tags: [Compliance reports]
       operationId: getReport
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get a report job
       description: Status, data time, SCRS version, feed freshness, summary counts and SHA-256 of one report. `Retry-After` is set while it is queued or running. Scope `read` or `write`.
       responses:
@@ -2524,6 +2678,7 @@ paths:
     get:
       tags: [Compliance reports]
       operationId: downloadReport
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Download a report
       description: The report file, integrity-checked against its stored SHA-256 (also in `ETag` and `X-SCRS-Report-SHA256`). Scope `read` or `write`.
       responses:
@@ -2544,6 +2699,7 @@ paths:
     get:
       tags: [Integrations]
       operationId: getDependencyTrack
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Dependency-Track export settings
       description: The export settings; the API key is write-only (`api_key_set`). Scope `read` or `write`.
       responses:
@@ -2554,6 +2710,7 @@ paths:
     put:
       tags: [Integrations]
       operationId: setDependencyTrack
+      security: [{bearerAuth: [admin]}]
       summary: Configure the Dependency-Track export
       description: 'While enabled, every completed scan with an SBOM queues an upload in the same transaction; the worker pushes it with `PUT /api/v1/bom` (project = asset locator, version = ref, auto-created), retrying transient failures with backoff for about two days. The key needs BOM_UPLOAD and PROJECT_CREATION_UPLOAD and is sealed with the master key; omit `api_key` to keep the stored one. Requires `If-Match`. Audited without the key. Scope `admin`.'
       parameters: [{name: If-Match, in: header, required: true, schema: {type: string}}]
@@ -2581,6 +2738,7 @@ paths:
     post:
       tags: [Integrations]
       operationId: testDependencyTrack
+      security: [{bearerAuth: [admin]}]
       summary: Test the Dependency-Track connection
       description: Reads the server version, then checks the stored key holds BOM upload permission. Sends no SBOM. Scope `admin`.
       responses:
@@ -2593,6 +2751,7 @@ paths:
     get:
       tags: [Integrations]
       operationId: listDependencyTrackUploads
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List SBOM uploads
       description: Uploads, newest first; finished ones are kept 90 days. Scope `read` or `write`.
       parameters:
@@ -2609,6 +2768,7 @@ paths:
     post:
       tags: [Integrations]
       operationId: retryDependencyTrackUpload
+      security: [{bearerAuth: [admin]}]
       summary: Retry a failed upload
       description: Requeues a failed upload (for example after fixing the key). Audited. Scope `admin`.
       responses:
@@ -2621,8 +2781,9 @@ paths:
     get:
       tags: [Live events]
       operationId: streamEvents
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Stream live events
-      description: 'A `text/event-stream` of notices for committed events (OUT-004): `id` is the event id, `event` its type, `data` a JSON object with id, type, time, connection and asset ids and `refs` (ids to fetch; never evidence or secrets). The stream opens with `ready`, sends a comment heartbeat every 20 s, and ends after 10 minutes with `reconnect` so revoked tokens stop receiving; clients reconnect. Missed events are not replayed: reload state on connect and on `resync`. Use a client that can send the Authorization header (fetch streaming); tokens never go in the URL. At most 5 streams per token and 200 per API instance (SCRS_EVENTS_STREAMS_PER_TOKEN, SCRS_EVENTS_MAX_STREAMS). Scope `read` or `write`.'
+      description: 'A `text/event-stream` of notices for committed events (OUT-004): `id` is the event id, `event` its type, `data` a JSON object with id, type, time, connection and asset ids and `refs` (ids to fetch; never evidence or secrets). The stream opens with `ready`, sends a comment heartbeat every 20 s, and ends after 10 minutes with `reconnect` so revoked tokens stop receiving; clients reconnect. Missed events are not replayed: reload state on connect and on `resync`. Platform health arrives as `system.degraded` and `system.recovered` (not tied to a connection, so every stream receives them): on either, call `GET /system/status` for the component detail. Use a client that can send the Authorization header (fetch streaming); tokens never go in the URL. At most 5 streams per token and 200 per API instance (SCRS_EVENTS_STREAMS_PER_TOKEN, SCRS_EVENTS_MAX_STREAMS). Scope `read` or `write`.'
       parameters:
         - {name: types, in: query, description: Comma-separated event types (default all), schema: {type: string, examples: ['assessment.completed,finding.created']}}
       responses:
@@ -2638,6 +2799,7 @@ paths:
     get:
       tags: [Licences]
       operationId: getDocumentSchema
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Policy and pack JSON Schemas
       description: JSON Schema (draft 2020-12) of the licence policy (`license-policy`, LIC-004) or of an uploaded framework pack (`framework-pack`, CMP-005). Scope `read`, `write` or `trigger`.
       responses:
@@ -2650,6 +2812,7 @@ paths:
     get:
       tags: [Operations]
       operationId: listAudit
+      security: [{bearerAuth: [admin]}]
       summary: Query the audit log
       description: Audit records newest first (OBS-002), 100 per page (`limit` up to 500). Filter by `action` (exact, or a prefix ending in `*` such as `connection.*`), `target_id`, `actor_id`, `since` and `until` (RFC 3339). Page with `cursor` set to the previous `next_cursor`. Scope `admin`.
       parameters:
@@ -2670,6 +2833,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: listEventSchemas
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: List event schemas
       description: Every outbound event type with its schema versions and links (OUT-008). Payload version is also in the `X-SCRS-Event-Version` header. Scope `read`, `write` or `trigger`.
       responses:
@@ -2684,6 +2848,7 @@ paths:
     get:
       tags: [Webhook subscriptions]
       operationId: getEventSchema
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Get one event JSON Schema
       description: The JSON Schema (draft 2020-12) of an event type and version, describing the `event` envelope and `data` (for `assessment.completed`, both the summary and the full/agent context profiles). Data objects allow added properties; a breaking change raises the version. Scope `read`, `write` or `trigger`.
       responses:
@@ -2696,6 +2861,7 @@ paths:
     get:
       tags: [Operations]
       operationId: listInboundEvents
+      security: [{bearerAuth: [admin]}]
       summary: Inbound event log
       description: Raw provider events and triggers SCRS received, newest first. GitLab and registry events are prefixed (`gitlab:push`, `registry:harbor`). Scope `admin`.
       parameters:
@@ -2714,6 +2880,7 @@ paths:
     get:
       tags: [Operations]
       operationId: getInboundEvent
+      security: [{bearerAuth: [admin]}]
       summary: Get an inbound event
       description: Includes the raw body. Scope `admin`.
       responses:
@@ -2727,6 +2894,7 @@ paths:
     post:
       tags: [Operations]
       operationId: replayInboundEvent
+      security: [{bearerAuth: [admin]}]
       summary: Replay an event's assessment
       description: Queues a new assessment with the original request pinned to the originally resolved revision. Scope `admin`.
       responses:
@@ -2739,6 +2907,7 @@ paths:
     get:
       tags: [Operations]
       operationId: getRetention
+      security: [{bearerAuth: [admin]}]
       summary: Get the retention policy
       description: |
         The policy (RET-001). `classes` lists every data class: its policy `days` (null = not set), `effective_days` and its `source` (`policy`, or `default` from `SCRS_RETENTION_DEFAULT_<CLASS>_DAYS`), its guard, and the last purge. Zero keeps forever. Open register entries, the current revision of each tracked ref and assets on legal hold are never purged; the audit log keeps at least 365 days. `inbound_event_days` and `webhook_delivery_days` are the original fields for their classes. Scope `admin`.
@@ -2753,6 +2922,7 @@ paths:
     put:
       tags: [Operations]
       operationId: setRetention
+      security: [{bearerAuth: [admin]}]
       summary: Set the retention policy
       description: Applies the given classes atomically and audits old and new values (RET-002); classes not named keep their setting. Requires `If-Match`. Preview first with `:preview`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2781,6 +2951,7 @@ paths:
     post:
       tags: [Operations]
       operationId: previewRetention
+      security: [{bearerAuth: [admin]}]
       summary: Preview what a retention change deletes
       description: Counts what proposed values would delete now, without deleting (RET-003). Send `classes` for per-class counts, or `inbound_event_days` for the original rows-and-bytes preview. Scope `admin`.
       requestBody:
@@ -2796,6 +2967,7 @@ paths:
     post:
       tags: [Operations]
       operationId: purgeRetention
+      security: [{bearerAuth: [admin]}]
       summary: Apply the retention policy now
       description: Purges every class past its effective retention in bounded batches, deletes the purged objects from S3 and audits the counts (RET-005, RET-007). Hourly maintenance does the same on schedule. Requires `If-Match` with the policy revision you previewed. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -2813,6 +2985,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: getQAProfile
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get a repository's QA profile
       description: The Karate settings of a GitHub or GitLab asset. Variable values are write-only; `variable_names` lists them. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
       responses:
@@ -2824,6 +2997,7 @@ paths:
     put:
       tags: [E2E QA]
       operationId: putQAProfile
+      security: [{bearerAuth: [admin]}]
       summary: Create or replace a repository's QA profile
       description: |
         Sets where QA runs test (`base_url`, a deployed staging or preview environment), which Karate suites run (`test_path` in the repository, `tags`), the secrets the tests receive as `QA_<NAME>` environment variables, an optional load profile and the LLM provider that drafts tests. Omitted fields take defaults; omitting `variables` keeps the stored ones. Replacing an existing profile needs `If-Match`. With `auto_run`, every successful assessment of a matching ref queues a functional run. Scope `admin`, because the runner calls `base_url` with these secrets.
@@ -2843,6 +3017,7 @@ paths:
     delete:
       tags: [E2E QA]
       operationId: deleteQAProfile
+      security: [{bearerAuth: [admin]}]
       summary: Remove a repository's QA profile
       description: Stops automatic QA runs for the asset. Past runs, reports, findings and generated suites are kept. Scope `admin`.
       responses:
@@ -2856,6 +3031,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: listQARuns
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List a repository's QA runs
       description: The 50 newest runs, newest first. Page with `before` set to the previous response's `next_before`. Scope `read` or `write`.
       parameters:
@@ -2870,6 +3046,7 @@ paths:
     post:
       tags: [E2E QA]
       operationId: createQARun
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Run QA tests now
       description: Queues a functional or performance run of the latest successful git assessment of the asset, or of `assessment_id`. A commit whose verdict is `fail` is never sent to the runner. `include_drafts` also runs draft generated features (admin only). Scope `write` or `trigger`.
       requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QARunRequest'}}}}
@@ -2885,6 +3062,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: qaCoverageHistory
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: API coverage history of a repository
       description: Finished functional runs with API coverage, oldest first, for trend charts. Coverage is the share of documented OpenAPI operations that the tests called. Scope `read` or `write`.
       parameters:
@@ -2900,6 +3078,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: listQAGenerations
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List a repository's test generations
       description: The 50 newest generations with their token usage and accepted and rejected file counts. Scope `read` or `write`.
       responses:
@@ -2910,6 +3089,7 @@ paths:
     post:
       tags: [E2E QA]
       operationId: createQAGeneration
+      security: [{bearerAuth: [write]}]
       summary: Draft tests with the profile's LLM
       description: |
         Queues test generation at the latest successful assessment. `api` sends the OpenAPI document's operations (untested ones first) to the profile's LLM provider and stores Karate features as drafts; they run only after approval. `unit` sends source files that have no tests (Go, TypeScript, JavaScript, Python, Java, Kotlin) and stores unit tests for developers to download and commit; it needs `allow_source_upload` on the profile. Every file passes static checks first; failing files are stored `rejected` with their problems. Scope `write`.
@@ -2926,6 +3106,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: listQASuites
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List generated test files
       description: Generated files of the asset without their content, by path. Filter by `kind` (api or unit) and `status` (draft, approved, rejected, superseded). Scope `read` or `write`.
       parameters:
@@ -2941,6 +3122,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: assessmentQARuns
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: QA runs of an assessment
       description: Functional and performance runs of the assessed commit, newest first. A run is `skipped` when the assessment's verdict was `fail`. Scope `read`, `write` or `trigger`.
       responses:
@@ -2952,6 +3134,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: qaRunnerStatus
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Karate runner status
       description: Whether the API process has a runner configured and can reach it, with the runner's Karate version, Gatling support, slots and queue. Scope `read`, `write` or `trigger`.
       responses:
@@ -2965,6 +3148,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: getQARun
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Get a QA run
       description: Status, scenario counts, coverage summary and load statistics of one run. Poll until `status` is passed, failed, error, cancelled or skipped, or subscribe to `qa.completed` and `qa.failed`. Scope `read`, `write` or `trigger`.
       responses:
@@ -2978,6 +3162,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: listQAScenarios
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Scenarios of a QA run
       description: Executed Karate scenarios with outcome, duration, tags and failure reason, 500 per page. Filter with `status=failed`. Scope `read`, `write` or `trigger`.
       parameters:
@@ -2994,6 +3179,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: getQACoverage
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: API coverage of a QA run
       description: Every documented operation with the number of test calls and response statuses seen, plus called paths the document does not describe. Present when the commit had an OpenAPI document. Scope `read`, `write` or `trigger`.
       responses:
@@ -3007,6 +3193,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: downloadQAReport
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Download a QA run's reports
       description: The runner's report archive (gzip tar) with `result.json`, `console.log`, Karate HTML, JUnit XML and JSON Lines reports, or the Gatling report. Secret values and credential headers are redacted by the runner. Verify against `X-Content-SHA256`. Scope `read`, `write` or `trigger`.
       responses:
@@ -3025,6 +3212,7 @@ paths:
     post:
       tags: [E2E QA]
       operationId: cancelQARun
+      security: [{bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Cancel a QA run
       description: Stops a queued or active run; the worker also removes the job from the runner. Finished runs cannot be cancelled. Scope `write` or `trigger`.
       responses:
@@ -3039,6 +3227,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: getQAGeneration
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Get a test generation and its files
       description: The generation's status, provider, model, token usage and every file it produced (without content). Scope `read`, `write` or `trigger`.
       responses:
@@ -3052,6 +3241,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: downloadQAGeneration
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Download a generation's files
       description: A gzip tar with drafts and approved files under `files/` at their repository paths, rejected and superseded ones under their status, and `MANIFEST.json` with each file's status and problems. Use it to commit generated unit tests. Scope `read`, `write` or `trigger`.
       responses:
@@ -3065,6 +3255,7 @@ paths:
     get:
       tags: [E2E QA]
       operationId: getQASuite
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}, {bearerAuth: [trigger]}]
       summary: Get a generated test file
       description: One generated file with its content, the operations or source file it covers, its static-check problems and its review. Scope `read`, `write` or `trigger`.
       responses:
@@ -3078,6 +3269,7 @@ paths:
     post:
       tags: [E2E QA]
       operationId: approveQASuite
+      security: [{bearerAuth: [admin]}]
       summary: Approve a generated test file
       description: Approves a draft without problems. Approved API features run in every later functional run of the asset (suite `generated`); approving replaces the previously approved file at the same path. Scope `admin`, since approved features run against the target.
       requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QAReview'}}}}
@@ -3093,6 +3285,7 @@ paths:
     post:
       tags: [E2E QA]
       operationId: rejectQASuite
+      security: [{bearerAuth: [write]}]
       summary: Reject a generated test file
       description: Marks a draft rejected with an optional note; it never runs. Scope `write`.
       requestBody: {content: {application/json: {schema: {$ref: '#/components/schemas/QAReview'}}}}
@@ -3108,6 +3301,7 @@ paths:
     get:
       tags: [LLM providers]
       operationId: listLLMPresets
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List supported LLM provider kinds
       description: Each provider kind with its wire protocol (OpenAI chat completions, Anthropic Messages or Gemini generateContent), default inference URL, and whether a base URL or API key is required. Scope `read` or `write`.
       responses:
@@ -3119,6 +3313,7 @@ paths:
     get:
       tags: [LLM providers]
       operationId: listLLMProviders
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: List LLM providers
       description: Configured model endpoints by name. Keys are never returned; `has_api_key` tells whether one is stored. Scope `read` or `write`.
       responses:
@@ -3129,6 +3324,7 @@ paths:
     post:
       tags: [LLM providers]
       operationId: createLLMProvider
+      security: [{bearerAuth: [admin]}]
       summary: Add an LLM provider
       description: |
         Stores a model endpoint for test generation. `base_url` defaults to the kind's inference URL and can point at a regional endpoint, Azure resource, gateway or self-hosted server (plain http only for hosts in `SCRS_LLM_PRIVATE_HOSTS`). The API key is sealed with `SCRS_MASTER_KEY`. Scope `admin`.
@@ -3146,6 +3342,7 @@ paths:
     get:
       tags: [LLM providers]
       operationId: getLLMProvider
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Get an LLM provider
       description: One provider's settings and last connectivity check. The `ETag` is the revision for `If-Match`. Scope `read` or `write`.
       responses:
@@ -3157,6 +3354,7 @@ paths:
     patch:
       tags: [LLM providers]
       operationId: updateLLMProvider
+      security: [{bearerAuth: [admin]}]
       summary: Change an LLM provider
       description: Changes the given fields; `api_key` replaces the stored key and an empty string removes it. `clear_temperature` removes a set temperature. The name cannot change. Requires `If-Match`. Scope `admin`.
       parameters: [{$ref: '#/components/parameters/IfMatch'}]
@@ -3173,6 +3371,7 @@ paths:
     delete:
       tags: [LLM providers]
       operationId: deleteLLMProvider
+      security: [{bearerAuth: [admin]}]
       summary: Delete an LLM provider
       description: Removes the provider and its key. QA profiles that used it lose their provider; past generations keep its name. Scope `admin`.
       responses:
@@ -3186,6 +3385,7 @@ paths:
     post:
       tags: [LLM providers]
       operationId: testLLMProvider
+      security: [{bearerAuth: [admin]}]
       summary: Check an LLM provider
       description: Sends a one-line prompt with the stored settings and key and reports the reply, model, latency and token usage, or the provider's error. The outcome is kept as `last_test_at` and `last_test_error`. Scope `admin`.
       responses:
@@ -3245,6 +3445,21 @@ components:
     Status:
       type: object
       properties: {status: {type: string, enum: [ok, unavailable]}}
+    ComponentStatus:
+      type: object
+      required: [status, checked_at]
+      properties:
+        status: {type: string, enum: [ok, degraded, down, not_configured]}
+        detail: {type: string, description: A short fixed phrase when the component is not ok}
+        checked_at: {type: string, format: date-time}
+        info: {type: object, additionalProperties: true, description: 'Non-sensitive facts such as analyzer counts, runner slots and queue, or the last worker heartbeat'}
+    PlatformStatus:
+      type: object
+      required: [status, checked_at, components]
+      properties:
+        status: {type: string, enum: [ok, degraded, down]}
+        checked_at: {type: string, format: date-time}
+        components: {type: object, additionalProperties: {$ref: '#/components/schemas/ComponentStatus'}}
     Scope: {type: string, enum: [read, write, trigger, ingest:relay, admin]}
     YaraRulesetInput:
       type: object
@@ -3991,7 +4206,16 @@ components:
               digest: {type: string}
               status: {type: string, enum: [queued, replayed, ignored_out_of_scope, invalid_reference, ambiguous_connection]}
               assessment_id: {type: string, format: uuid}
-    EventType: {type: string, enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, finding.rescored, malicious_dependency.reported, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, ping]}
+    EventType:
+      type: string
+      enum: [assessment.completed, assessment.failed, finding.created, finding.status_changed, finding.rescored, malicious_dependency.reported, integrity.alert, feed.stale, connection.degraded, maintenance.completed, qa.completed, qa.failed, system.degraded, system.recovered, ping]
+      description: |
+        `assessment.completed` and `assessment.failed`: an assessment finished. `finding.created`, `finding.status_changed`,
+        `finding.rescored`, `malicious_dependency.reported`: risk register changes. `integrity.alert`: a repository integrity rule fired.
+        `feed.stale`: a vulnerability, advisory or threat-intelligence source stopped updating. `connection.degraded`: a provider
+        connection check failed. `maintenance.completed`: scheduled maintenance ran. `qa.completed`, `qa.failed`: an E2E QA run finished.
+        `system.degraded`: the platform status (see `GET /system/status`) left `ok` or changed between `degraded` and `down`; lists the
+        failing components. `system.recovered`: the status returned to `ok`, with how long it was not ok. `ping`: sent by a webhook test.
     AuthHeader:
       type: object
       description: Configure as Header Auth in n8n (name and value).

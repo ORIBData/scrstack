@@ -17,6 +17,9 @@ func object(required []string, properties map[string]any) map[string]any {
 
 func str() map[string]any     { return map[string]any{"type": "string"} }
 func integer() map[string]any { return map[string]any{"type": "integer"} }
+func enum(values ...string) map[string]any {
+	return map[string]any{"type": "string", "enum": values}
+}
 func boolean() map[string]any { return map[string]any{"type": "boolean"} }
 func array(items map[string]any) map[string]any {
 	return map[string]any{"type": "array", "items": items}
@@ -73,9 +76,16 @@ var eventData = map[string]map[string]any{
 		"connection_id": str(), "name": str(), "provider": str(), "check": str(), "state": str(), "problems": array(str()), "link": str(),
 	}),
 	"maintenance.completed": object([]string{"trigger", "report"}, map[string]any{"trigger": str(), "report": map[string]any{"type": "object"}}),
-	"qa.completed":          qaData,
-	"qa.failed":             qaData,
-	"ping":                  object(nil, map[string]any{}),
+	"system.degraded": object([]string{"status", "previous_status", "components", "since"}, map[string]any{
+		"status": enum("degraded", "down"), "previous_status": enum("ok", "degraded", "down"), "since": map[string]any{"type": "string", "format": "date-time"},
+		"components": array(object([]string{"name", "status"}, map[string]any{"name": str(), "status": enum("degraded", "down"), "detail": str()})),
+	}),
+	"system.recovered": object([]string{"status", "previous_status", "since", "duration_seconds"}, map[string]any{
+		"status": enum("ok"), "previous_status": enum("degraded", "down"), "since": map[string]any{"type": "string", "format": "date-time"}, "duration_seconds": integer(),
+	}),
+	"qa.completed": qaData,
+	"qa.failed":    qaData,
+	"ping":         object(nil, map[string]any{}),
 }
 
 // EventSchema returns the JSON Schema of an event type at a version.

@@ -125,6 +125,8 @@ func TestEventPayloadsMatchSchemas(t *testing.T) {
 		"maintenance.completed":         map[string]any{"trigger": "scheduled", "report": MaintenanceReport{}},
 		"qa.completed":                  QASummary(run),
 		"qa.failed":                     QASummary(run),
+		"system.degraded":               map[string]any{"status": "down", "previous_status": "ok", "since": now, "components": []any{map[string]any{"name": "redis", "status": "down", "detail": "unavailable"}}},
+		"system.recovered":              map[string]any{"status": "ok", "previous_status": "down", "since": now, "duration_seconds": 90},
 		"ping":                          map[string]any{},
 	}
 	for event := range notify.Events {

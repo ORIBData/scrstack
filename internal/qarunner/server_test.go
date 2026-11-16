@@ -332,3 +332,41 @@ func TestRunnerImage(t *testing.T) {
 		t.Fatalf("performance %+v %+v", status, report.Perf)
 	}
 }
+
+func TestHealthzChecksPrerequisites(t *testing.T) {
+	t.Setenv("SCRS_QA_RUNNER_TOKEN", token)
+	get := func(server *Server) (int, string) {
+		rec := httptest.NewRecorder()
+		server.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/healthz", nil))
+		return rec.Code, rec.Body.String()
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	script := filepath.Join(t.TempDir(), "karate")
+	if err := os.WriteFile(script, []byte(fakeKarate), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := New(Config{Token: token, WorkDir: t.TempDir(), Karate: []string{script}, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, body := get(healthy); code != 200 || !strings.Contains(body, `"ok"`) {
+		t.Fatal("healthy runner", code, body)
+	}
+	// A missing Karate command and a missing Gatling classpath fail it by
+	// name, without paths in the body.
+	broken, err := New(Config{Token: token, WorkDir: t.TempDir(), Karate: []string{filepath.Join(t.TempDir(), "missing-karate")}, PerfClasspath: "/nonexistent/lib/*", Java: "missing-java", Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, body := get(broken)
+	if code != 503 || !strings.Contains(body, "karate") || !strings.Contains(body, "java") || !strings.Contains(body, "gatling_classpath") || strings.Contains(body, "nonexistent") {
+		t.Fatal("broken runner", code, body)
+	}
+	// Failures are cached briefly, so a polled probe stays cheap.
+	broken.healthMu.Lock()
+	cached := broken.healthUntil.After(time.Now())
+	broken.healthMu.Unlock()
+	if !cached {
+		t.Fatal("health result not cached")
+	}
+}

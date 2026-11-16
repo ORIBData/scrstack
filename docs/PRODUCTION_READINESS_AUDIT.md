@@ -435,7 +435,7 @@ The deployment test asserts the runner's labels, networks and lack of secrets. `
 - **Schema changes** are additive and re-runnable: the report format check is dropped and re-added, and the test bootstraps the schema twice.
 - **Nothing new can fail an assessment.** A Dependency-Track outage or a stream error never touches assessment state.
 - **Outbound entries** are report-only until the licence policy is made enforcing.
-- **The contract** has 184 operations.
+- **The contract** has 185 operations.
 
 **Verified on 2026-11-15:**
 - `make qa`, `make database-test` (race detector, including `TestPostgresP2Features`), and the new unit tests in `internal/compliance`, `internal/license`, `internal/notify` and `internal/dtrack`;

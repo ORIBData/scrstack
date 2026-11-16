@@ -70,6 +70,8 @@ type Security struct {
 	// Live fans committed events out to GET /events streams (OUT-004);
 	// nil answers 503.
 	Live *notify.Hub
+	// Status serves GET /system/status; nil leaves the route unregistered.
+	Status *PlatformStatus
 	// DTrackPrivateHosts may be internal Dependency-Track servers
 	// (SCRS_DTRACK_PRIVATE_HOSTS); DTrackHTTP overrides the guarded client
 	// (tests only).
@@ -104,6 +106,9 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle(BasePath+"/connections", security.protect("admin", handler))
 	mux.Handle(BasePath+"/connections/", security.protect("admin", handler))
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
+	if security.Status != nil {
+		mux.Handle("GET "+BasePath+"/system/status", security.protect("read|write", security.Status.Handler()))
+	}
 	m := newMetrics(security.Assessments, security.Notify)
 	mux.Handle("GET "+BasePath+"/system/metrics", security.protect("read", m.handler()))
 	if checker, ok := store.(hookChecker); ok {

@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -69,6 +70,10 @@ type Server struct {
 	mu    sync.Mutex
 	jobs  map[string]*job
 	queue chan *job
+
+	healthMu     sync.Mutex
+	healthUntil  time.Time
+	healthFailed []string
 }
 
 // New prepares a runner; it clears WorkDir, since jobs do not survive a
@@ -147,6 +152,10 @@ func (s *Server) prune(now time.Time) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		if failed := s.healthFailures(); len(failed) > 0 {
+			writeJSON(w, 503, map[string]any{"status": "unavailable", "failed": failed})
+			return
+		}
 		writeJSON(w, 200, map[string]string{"status": "ok"})
 	})
 	mux.Handle("GET /v1/info", s.auth(http.HandlerFunc(s.info)))
@@ -155,6 +164,42 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /v1/jobs/{id}/report", s.auth(http.HandlerFunc(s.report)))
 	mux.Handle("DELETE /v1/jobs/{id}", s.auth(http.HandlerFunc(s.remove)))
 	return mux
+}
+
+// healthFailures names the runner's own prerequisites that are broken: the
+// Karate command, a writable work directory and, when performance jobs are
+// enabled, Java and the Gatling classpath. A full queue is not a failure, so
+// a busy runner is never restarted. Results are cached for 10 s because the
+// probe is public and polled. Names only; paths stay out of the response.
+func (s *Server) healthFailures() []string {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if time.Now().Before(s.healthUntil) {
+		return s.healthFailed
+	}
+	failed := []string{}
+	if _, err := exec.LookPath(s.cfg.Karate[0]); err != nil {
+		failed = append(failed, "karate")
+	}
+	if f, err := os.CreateTemp(s.cfg.WorkDir, ".health-*"); err != nil {
+		failed = append(failed, "work_dir")
+	} else {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	if s.cfg.PerfClasspath != "" {
+		if _, err := exec.LookPath(s.cfg.Java); err != nil {
+			failed = append(failed, "java")
+		}
+		for _, entry := range filepath.SplitList(s.cfg.PerfClasspath) {
+			if _, err := os.Stat(strings.TrimSuffix(entry, "/*")); err != nil {
+				failed = append(failed, "gatling_classpath")
+				break
+			}
+		}
+	}
+	s.healthFailed, s.healthUntil = failed, time.Now().Add(10*time.Second)
+	return failed
 }
 
 func (s *Server) auth(next http.Handler) http.Handler {

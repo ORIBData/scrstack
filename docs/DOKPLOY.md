@@ -123,6 +123,18 @@ and preserves `/scrs/v1/*`. A published host port is unnecessary for that routin
 If an HTTP node port is needed for local VPS diagnostics, add
 `deploy/compose.nodeport.yaml`; it binds `SCRS_HTTP_NODE_PORT` (default 7000) to **127.0.0.1**
 only and forwards it to the container's port 7000, e.g. `curl http://127.0.0.1:7000/scrs/v1/system/readyz`.
+Probes: `/system/healthz` and `/system/readyz` are public and answer only `ok` or `unavailable` (load balancers).
+A frontend status page should call `GET /system/status` with a `read` token. It reports `api`, `postgres`, `redis`,
+`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast` and `qa_runner` as `ok`, `degraded`, `down` or `not_configured`,
+and always answers `200`, so read its `status` field. The QA runner's own `/healthz` returns 503 with the names of
+failed prerequisites (`karate`, `work_dir`, `java`, `gatling_classpath`), which makes Docker mark it unhealthy.
+
+Each API instance also watches that status every 30 seconds. A status that holds for three checks (about 90 seconds,
+starting two minutes after boot, so a redeploy stays quiet) is announced once across instances as a `system.degraded`
+event (lists the failing components) or, when it returns to `ok`, `system.recovered` (with the duration). Subscribe a
+webhook to them (`events: ["system.degraded","system.recovered"]`) or receive them on `GET /events`. Announcements
+are stored in PostgreSQL, so an outage of PostgreSQL itself cannot be announced: the live stream drops and clients
+should treat a reconnect as a reason to call `GET /system/status`.
 Keep external consumers on the HTTPS domain. Certificate renewal remains owned by
 Dokploy/Traefik and needs operational verification separately.
 

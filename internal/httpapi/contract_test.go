@@ -109,7 +109,7 @@ func TestContractDocumentsEveryOperation(t *testing.T) {
 // the router source is documented.
 func TestContractMatchesRouter(t *testing.T) {
 	ops, _ := loadContract(t)
-	handler := HandlerWithSecurity(nil, &connections.Store{}, Security{Store: adminTokens{}, Assessments: &assessments.Store{}, Notify: &notify.Store{}})
+	handler := HandlerWithSecurity(nil, &connections.Store{}, Security{Store: adminTokens{}, Assessments: &assessments.Store{}, Notify: &notify.Store{}, Status: NewPlatformStatus(nil, &assessments.Store{}, nil, nil)})
 	placeholder := regexp.MustCompile(`\{[a-z_]+\}`)
 	for path, methods := range ops {
 		for method := range methods {
