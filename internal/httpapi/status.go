@@ -275,9 +275,12 @@ func (h *PlatformStatus) dtrackStatus(ctx context.Context) componentStatus {
 	if err != nil {
 		return componentStatus{Status: statusDown, Detail: "export state unreadable"}
 	}
-	info := map[string]any{"queued_uploads": summary.Queued, "failed_uploads_24h": summary.FailedLast24h, "import_failures_24h": summary.ProcessingFailed24h, "unverified_uploads": summary.Unverified}
+	info := map[string]any{"import_findings": settings.ImportFindings, "sync_triage": settings.SyncTriage, "sync_failures": summary.SyncErrors, "findings_only_in_dependency_track": summary.OnlyDTrackOpen, "queued_uploads": summary.Queued, "failed_uploads_24h": summary.FailedLast24h, "import_failures_24h": summary.ProcessingFailed24h, "unverified_uploads": summary.Unverified}
 	if summary.LastUploadedAt != nil {
 		info["last_upload_at"] = summary.LastUploadedAt
+	}
+	if summary.LastSyncedAt != nil {
+		info["last_sync_at"] = summary.LastSyncedAt
 	}
 	if summary.LastProcessedAt != nil {
 		info["last_import_confirmed_at"] = summary.LastProcessedAt
@@ -291,6 +294,8 @@ func (h *PlatformStatus) dtrackStatus(ctx context.Context) componentStatus {
 	switch {
 	case summary.FailedLast24h > 0 || summary.ProcessingFailed24h > 0:
 		c.Status, c.Detail = statusDegraded, "uploads failed in the last 24 hours; see GET /integrations/dependency-track/uploads"
+	case settings.ImportFindings && summary.SyncErrors > 0:
+		c.Status, c.Detail = statusDegraded, "reading findings back failed for some projects; see GET /integrations/dependency-track/findings and the worker log"
 	case summary.OldestQueued != nil && time.Since(*summary.OldestQueued) > 15*time.Minute:
 		c.Status, c.Detail = statusDegraded, "uploads have been waiting for over 15 minutes"
 	}

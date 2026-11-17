@@ -114,6 +114,119 @@ func TestPostgresQAAndLLMProviderAPI(t *testing.T) {
 	if !p.HasKey || bytes.Contains(sealedKey, []byte("sk-live-key")) {
 		t.Fatal("key stored in clear")
 	}
+	// Where a provider runs decides what it may be sent: this one's host is in
+	// SCRS_LLM_PRIVATE_HOSTS, so it is local; a public endpoint is hosted.
+	if p.Locality != "local" {
+		t.Fatalf("locality of a self-hosted provider: %q", p.Locality)
+	}
+	hostedCreated := must(call("POST", "/llm/providers", admin, `{"name":"cloud","kind":"openai_compatible","base_url":"https://api.example.com/v1","model":"m-2","api_key":"sk-cloud-key"}`, nil), 201)
+	var hostedProvider assessments.LLMProvider
+	_ = json.Unmarshal(hostedCreated.Body.Bytes(), &hostedProvider)
+	if hostedProvider.Locality != "hosted" || !strings.Contains(must(call("GET", "/llm/providers", reader, "", nil), 200).Body.String(), `"locality":"hosted"`) {
+		t.Fatalf("locality of a hosted provider: %q", hostedProvider.Locality)
+	}
+
+	// Source code to a hosted provider is opt-in twice: the platform switch
+	// (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED) and an acknowledgement of that provider.
+	must(call("POST", "/llm/providers/"+hostedProvider.ID.String()+":allow-source", admin, `{"note":"Zero-retention agreement signed 2026"}`, nil), 409) // switch off
+	openHandler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: rdb, Assessments: jobs, LLMPrivateHosts: map[string]bool{"127.0.0.1": true}, LLMAllowSource: true})
+	callOpen := func(method, path, token, body string, headers map[string]string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, BasePath+path, strings.NewReader(body))
+		r.RemoteAddr = "192.0.2.1:1234"
+		r.Header.Set("Authorization", "Bearer "+token)
+		for k, v := range headers {
+			r.Header.Set(k, v)
+		}
+		w := httptest.NewRecorder()
+		openHandler.ServeHTTP(w, r)
+		return w
+	}
+	allow := "/llm/providers/" + hostedProvider.ID.String() + ":allow-source"
+	must(callOpen("POST", allow, writer, `{"note":"Zero-retention agreement signed 2026"}`, nil), 403)
+	must(callOpen("POST", allow, admin, `{}`, nil), 400)                                                                   // a note is the audit trail
+	must(callOpen("POST", "/llm/providers/"+p.ID.String()+":allow-source", admin, `{"note":"not needed here"}`, nil), 409) // self-hosted needs none
+	acked := must(callOpen("POST", allow, admin, `{"note":"Zero-retention agreement signed 2026"}`, nil), 200)
+	var ackedProvider assessments.LLMProvider
+	_ = json.Unmarshal(acked.Body.Bytes(), &ackedProvider)
+	if !ackedProvider.SourceAllowed || ackedProvider.Locality != "hosted" || ackedProvider.SourceAckAt == nil || ackedProvider.SourceAckNote == "" {
+		t.Fatalf("acknowledged provider: %+v", ackedProvider)
+	}
+	// The same acknowledgement means nothing while the platform switch is off.
+	if body := must(call("GET", "/llm/providers/"+hostedProvider.ID.String(), reader, "", nil), 200).Body.String(); !strings.Contains(body, `"source_allowed":false`) {
+		t.Fatal("source must not be allowed while the platform switch is off:", body)
+	}
+	// Pointing the provider elsewhere withdraws the acknowledgement.
+	moved := must(callOpen("PATCH", "/llm/providers/"+hostedProvider.ID.String(), admin, `{"base_url":"https://other.example.com/v1"}`, map[string]string{"If-Match": fmt.Sprintf(`"%d"`, ackedProvider.Revision)}), 200)
+	if !strings.Contains(moved.Body.String(), `"source_allowed":false`) || !strings.Contains(moved.Body.String(), `"source_ack_at":null`) {
+		t.Fatal("a changed endpoint must clear the acknowledgement:", moved.Body.String())
+	}
+	must(callOpen("POST", allow, admin, `{"note":"Zero-retention agreement signed 2026"}`, nil), 200)
+	revoked := must(callOpen("POST", "/llm/providers/"+hostedProvider.ID.String()+":revoke-source", admin, ``, nil), 200)
+	if !strings.Contains(revoked.Body.String(), `"source_allowed":false`) {
+		t.Fatal(revoked.Body.String())
+	}
+	var audited int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.audit_log WHERE action IN ('llm_provider.source_allowed','llm_provider.source_revoked')`).Scan(&audited)
+	if audited != 3 {
+		t.Fatalf("acknowledgements must be audited, got %d", audited)
+	}
+
+	// A provider declared in the environment is managed there.
+	managed, action, err := jobs.BootstrapLLMProvider(ctx, assessments.LLMProvider{Name: "from-env", Kind: "openai_compatible", BaseURL: "https://api.example.com/v1", Model: "m-env", MaxTokens: 4096}, false,
+		func(id uuid.UUID) ([]byte, error) { return []byte{}, nil }, func(uuid.UUID, []byte) bool { return true })
+	if err != nil || action != "created" || !managed.Managed {
+		t.Fatal(managed, action, err)
+	}
+	must(call("DELETE", "/llm/providers/"+managed.ID.String(), admin, "", nil), 409)
+	must(call("PATCH", "/llm/providers/"+managed.ID.String(), admin, `{"model":"other"}`, map[string]string{"If-Match": `"1"`}), 409)
+	must(call("PATCH", "/llm/providers/"+managed.ID.String(), admin, `{"enabled":false}`, map[string]string{"If-Match": `"1"`}), 200) // an administrator can still switch it off
+
+	// AI code review: with the platform switch off, source goes only to a self-hosted provider.
+	reviews := "/assets/" + asset.String() + "/ai-reviews"
+	must(call("POST", reviews, reader, `{}`, nil), 403)
+	must(call("POST", reviews, writer, `{}`, nil), 400) // provider_id is required
+	must(call("POST", reviews, writer, `{"provider_id":"`+hostedProvider.ID.String()+`"}`, nil), 409)
+	if body := call("POST", reviews, trigger, `{"provider_id":"`+hostedProvider.ID.String()+`"}`, nil).Body.String(); !strings.Contains(body, "may not receive source code") {
+		t.Fatal("the refusal should say why:", body)
+	}
+	must(call("POST", reviews, writer, `{"provider_id":"`+uuid.NewString()+`"}`, nil), 409)
+	must(call("POST", reviews, writer, `{"provider_id":"`+p.ID.String()+`","max_files":99}`, nil), 400)
+	must(call("POST", reviews, writer, `{"provider_id":"`+p.ID.String()+`"}`, nil), 409) // local, but the asset has no successful assessment yet
+	must(call("POST", reviews, writer, `{"provider_id":"`+p.ID.String()+`","unknown":1}`, nil), 400)
+	if body := must(call("GET", reviews, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"items":[]`) {
+		t.Fatal(body)
+	}
+	must(call("GET", "/ai-reviews/"+uuid.NewString(), reader, "", nil), 404)
+	must(call("GET", "/ai-reviews/not-a-uuid", reader, "", nil), 404)
+	must(call("GET", "/ai-reviews/"+uuid.NewString(), "", "", nil), 401)
+
+	// AI advisories and summaries: any provider, findings and advisory text only.
+	summaries := "/assessments/" + uuid.NewString() + "/summaries"
+	must(call("POST", summaries, reader, `{}`, nil), 403)
+	must(call("POST", summaries, writer, `{}`, nil), 400) // provider_id is required
+	must(call("POST", summaries, trigger, `{"provider_id":"`+uuid.NewString()+`"}`, nil), 409)
+	must(call("POST", summaries, writer, `{"provider_id":"`+p.ID.String()+`","max_advisories":99}`, nil), 400)
+	must(call("POST", summaries, writer, `{"provider_id":"`+p.ID.String()+`"}`, nil), 404) // no such assessment
+	must(call("POST", summaries, writer, `{"provider_id":"`+hostedProvider.ID.String()+`","bogus":1}`, nil), 400)
+	if body := must(call("GET", summaries, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"items":[]`) {
+		t.Fatal(body)
+	}
+	must(call("GET", "/summary-jobs/"+uuid.NewString(), reader, "", nil), 404)
+	must(call("GET", "/summary-jobs/nope", reader, "", nil), 404)
+
+	// The chronicle is empty until something is written, and its filters are checked.
+	chronicle := "/assets/" + asset.String() + "/chronicle"
+	if body := must(call("GET", chronicle, reader, "", nil), 200).Body.String(); !strings.Contains(body, `"items":[]`) {
+		t.Fatal(body)
+	}
+	must(call("GET", chronicle+"?kind=advisory,assessment_summary&include_superseded=true&limit=5", reader, "", nil), 200)
+	must(call("GET", chronicle+"?finding_id=nope", reader, "", nil), 400)
+	must(call("GET", chronicle+"?assessment_id=nope", reader, "", nil), 400)
+	must(call("GET", chronicle+"?since=yesterday", reader, "", nil), 400)
+	must(call("GET", chronicle+"?limit=0", reader, "", nil), 400)
+	must(call("GET", chronicle+"?limit=500", reader, "", nil), 400)
+	must(call("GET", chronicle, "", "", nil), 401)
+
 	must(call("POST", "/llm/providers", admin, provider, nil), 409)
 	must(call("POST", "/llm/providers", admin, `{"name":"nokey","kind":"openai","model":"gpt-5.1"}`, nil), 400)
 	must(call("POST", "/llm/providers", admin, `{"name":"plain","kind":"openai","base_url":"http://api.openai.com/v1","model":"m","api_key":"k"}`, nil), 400)

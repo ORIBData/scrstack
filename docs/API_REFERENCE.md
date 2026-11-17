@@ -114,6 +114,11 @@ Deduplicated findings across assessments and their triage lifecycle.
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
 | GET | `/register` | `read` or `write` | List register entries |
+| GET | `/register/export` | `read` or `write` | Export register entries |
+| GET | `/register/summary` | `read` or `write` | Register totals |
+| GET | `/register/timeseries` | `read` or `write` | Findings detected and fixed per day |
+| GET | `/register/top-assets` | `read` or `write` | Assets with the most open findings |
+| GET | `/register/vex` | `read` or `write` | Register-wide VEX |
 | PATCH | `/register/{id}` | `write` | Change a finding's status |
 | GET | `/register/{id}/events` | `read` or `write` | Finding history |
 
@@ -289,14 +294,16 @@ OWASP Top 10, CWE Top 25, PCI DSS and imported DISA STIG evidence reports from f
 
 ## Integrations
 
-Optional export of SCRS-generated SBOMs to OWASP Dependency-Track. SCRS never depends on it being reachable.
+Optional two-way link to OWASP Dependency-Track. SCRS uploads each SBOM, then (when enabled) reads back what Dependency-Track found, joins it with its own register entries, and shares triage decisions. SCRS never depends on it being reachable.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
 | GET | `/integrations/dependency-track` | `read` or `write` | Dependency-Track export settings |
 | PUT | `/integrations/dependency-track` | `admin` | Configure the Dependency-Track export |
+| GET | `/integrations/dependency-track/findings` | `read` or `write` | Dependency-Track findings and their register entries |
 | GET | `/integrations/dependency-track/uploads` | `read` or `write` | List SBOM uploads |
 | POST | `/integrations/dependency-track/uploads/{id}/retry` | `admin` | Retry a failed upload |
+| POST | `/integrations/dependency-track:sync` | `admin` | Read Dependency-Track findings now |
 | POST | `/integrations/dependency-track:test` | `admin` | Test the Dependency-Track connection |
 
 ## Live events
@@ -326,7 +333,11 @@ Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, 
 
 ## LLM providers
 
-Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests (admin).
+Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests and review code (admin).
+
+Each provider has a read-only `locality`: `local` is a model server you run, whose host is listed in `SCRS_LLM_PRIVATE_HOSTS`; `hosted` is any other provider. Both can exist side by side, and either can be declared in the deployment's environment (`managed_by_environment`).
+
+`source_allowed` says whether the provider may be sent **source code** (AI review, unit-test generation). A `local` provider always may. A `hosted` provider may only after the platform switch `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` is on and an administrator has called `POST /llm/providers/{id}:allow-source`; `POST /llm/providers/{id}:revoke-source` withdraws it. Findings and advisory text, the input of advisories and summaries, need neither.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -336,5 +347,36 @@ Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSee
 | DELETE | `/llm/providers/{id}` | `admin` | Delete an LLM provider |
 | GET | `/llm/providers/{id}` | `read` or `write` | Get an LLM provider |
 | PATCH | `/llm/providers/{id}` | `admin` | Change an LLM provider |
+| POST | `/llm/providers/{id}:allow-source` | `admin` | Allow source code to go to a hosted provider |
+| POST | `/llm/providers/{id}:revoke-source` | `admin` | Withdraw the source-code acknowledgement |
 | POST | `/llm/providers/{id}:test` | `admin` | Check an LLM provider |
+
+## Advisories and summaries
+
+A language model writes an **assessment summary** (headline, risk level, priorities, progress since the last summary) and an **advisory** (explanation, recommended action, urgency) for the most important findings of an assessment. Use any provider; the model sees only findings and advisory text, never code (see the data policy in the API overview).
+
+Flow: `POST /assessments/{id}/summaries` with a `provider_id`, poll `GET /summary-jobs/{id}` until `status` is `succeeded` or `failed`, then read the results in the asset's chronicle: `GET /assets/{id}/chronicle`.
+
+**The chronicle** is the history of an asset's written advisories, summaries and reviews, oldest first. A new summary or advisory *supersedes* the one before it: the old one is kept, marked with `superseded_at`, and the new one names it in `supersedes`, so you can follow a risk from first advisory to fix. Every document has `origin: llm` when a model wrote it, and `provenance` (model, provider, prompt version, what the guard removed). Texts are written by a model from the findings and are not verified.
+
+Which findings are described: vulnerabilities (SCRS's own and Dependency-Track's), malicious dependencies, licence, integrity and configuration findings. Not described, only counted: code analysis (SAST), secret detection, AI code review entries, malware, YARA and IOC matches, QA entries.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/assessments/{id}/summaries` | `read` or `write` | List an assessment's summary jobs |
+| POST | `/assessments/{id}/summaries` | `write` or `trigger` | Write advisories and a summary for an assessment |
+| GET | `/assets/{id}/chronicle` | `read` or `write` | The asset's chronicle of advisories, summaries and reviews |
+| GET | `/summary-jobs/{id}` | `read` or `write` | Get a summary job |
+
+## AI review
+
+A language model reads the source of an assessed commit and reports production risks, logic bugs, lint-class problems, security weaknesses and performance problems as report-only register entries of type `ai_review`.
+
+**Source code goes to a provider whose `source_allowed` is true**: a self-hosted model (`locality` `local`), or a hosted provider the platform and an administrator have both opted in (see the data policy in the API overview). Each review records where its source went in `locality`. The review is advisory: entries are marked `unverified`, never change a verdict, and carry the file, lines, category, confidence, a plain explanation and a suggested fix, never code. Each review also writes a summary to the asset's chronicle (`GET /assets/{id}/chronicle`). Flow: `POST /assets/{id}/ai-reviews`, poll `GET /ai-reviews/{id}` until `status` is `succeeded` or `failed`, then list the entries with `GET /register?asset_id=` and look for `type: ai_review`. The real linters of the QA runner are separate and are not merged into this result yet.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/ai-reviews/{id}` | `read` or `write` | Get an AI code review |
+| GET | `/assets/{id}/ai-reviews` | `read` or `write` | List an asset's AI code reviews |
+| POST | `/assets/{id}/ai-reviews` | `write` or `trigger` | Review the code with a self-hosted model |
 

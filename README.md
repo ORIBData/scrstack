@@ -300,35 +300,163 @@ rules.
 
 ### OWASP Dependency-Track
 
-Keep Dependency-Track for portfolio-level component tracking. Every SCRS
-assessment produces a CycloneDX SBOM with licences (`GET /assessments/{id}/sbom`,
-also as XML or SPDX 2.3) and an MBOM (`GET /assessments/{id}/mbom`).
+SCRS and Dependency-Track (DT) work as a pair. SCRS uploads each assessment's
+CycloneDX SBOM (`GET /assessments/{id}/sbom`, with licences) and can read back
+what DT found with every analyzer and vulnerability source it has enabled (NVD,
+GitHub advisories, OSV, OSS Index, Snyk, Trivy). SCRS's MBOM is not sent: DT has
+no MBOM. SAST and DAST results do not go to DT, which analyses components only.
 
-SCRS can push every scan's SBOM to Dependency-Track itself:
+**Set up.**
 
-1. In Dependency-Track, create an API key for a team with `BOM_UPLOAD` and
-   `PROJECT_CREATION_UPLOAD`.
-2. Store it with `PUT /integrations/dependency-track` (admin, `If-Match`), with
-   `{"enabled":true,"url":"https://dtrack.example.com","api_key":"..."}`. The key
-   is sealed with the master key and never returned. An internal server on
-   http must be listed in `SCRS_DTRACK_PRIVATE_HOSTS`.
-3. Check it with `POST /integrations/dependency-track:test`. It reads the key's team permissions and reports `missing_permissions`; add `VIEW_PORTFOLIO` too, so SCRS can confirm each import.
+1. In DT, create a team for SCRS with `BOM_UPLOAD` and `PROJECT_CREATION_UPLOAD`,
+   and an API key for it. Add `VIEW_PORTFOLIO` and `VIEW_VULNERABILITY` to read
+   findings back, `VULNERABILITY_ANALYSIS` to share triage, and
+   `PORTFOLIO_MANAGEMENT` only if you set `tags`. Do not grant
+   `SYSTEM_CONFIGURATION` or `ACCESS_MANAGEMENT`.
+2. Store it with `PUT /integrations/dependency-track` (admin, `If-Match`):
+   `{"enabled":true,"url":"https://dtrack.example.com","api_key":"...","import_findings":true,"sync_triage":true}`.
+   The body replaces all settings. The key is sealed with the master key and never
+   returned. An internal server on http must be listed in `SCRS_DTRACK_PRIVATE_HOSTS`.
+3. Check it with `POST /integrations/dependency-track:test`. It reads the key's
+   team permissions and lists `missing_permissions` for the features you enabled.
 
-How pushes work:
-- Each completed scan with an SBOM is queued in the same database transaction.
-- The worker uploads it with `PUT /api/v1/bom`. The project is the asset locator
-  and the version is the ref; projects are created automatically, optionally
-  under `parent_uuid`.
-- Transient failures retry with backoff for about two days. Rejected keys or
-  permissions fail at once and can be retried after a fix
+**Uploads.**
+- Each completed scan with an SBOM is queued in the same database transaction and
+  uploaded with `PUT /api/v1/bom`, creating the project if needed (optionally under
+  `parent_uuid`).
+- The DT project is `<provider>/<locator>` (`github/org/app`, `gitlab/group/app`,
+  `image/ghcr.io/org/app`) and the version is the ref, so equal paths on two
+  providers never collide. The default branch's version is sent as `isLatest`.
+  Pull request scans and git scans with only a commit are not uploaded unless
+  `upload_pull_requests` or `upload_commit_only` is set, because each would add a
+  project version to DT. `tags` replace the tags of the projects SCRS uploads to.
+  Projects named by the bare locator before this change stay in DT; delete them there.
+- Transient failures retry with backoff for about two days. A rejected key or
+  permission fails at once and can be retried after a fix
   (`POST /integrations/dependency-track/uploads/{id}/retry`).
-- `GET /integrations/dependency-track/uploads` lists uploads. `uploaded` means
-  Dependency-Track accepted the BOM. The worker then checks its processing about every
-  30 seconds for up to ten minutes: `processing` becomes `processed`, `unconfirmed`
-  (the key cannot read projects, or time ran out) or `failed` (finished without importing).
-- A rejected upload, or an import that failed, emits `dependency_track.upload_failed`
-  and shows as `dependency_track` in `GET /system/status`.
-- An unreachable Dependency-Track never affects an assessment.
+- `uploaded` means DT accepted the BOM. The worker then checks its processing about
+  every 30 seconds for up to ten minutes: `processing` becomes `processed`,
+  `unconfirmed` (the key cannot read projects, or time ran out) or `failed`
+  (finished without importing).
+
+**Reading findings back** (`import_findings`). About every 30 minutes the worker reads
+each uploaded project's findings from DT.
+- A finding SCRS also reports (same package URL and the same vulnerability ID or any
+  alias, so a CVE from NVD and its GHSA from GitHub are one) joins the existing
+  register entry. Nothing is duplicated.
+- A finding only DT reports becomes a report-only register entry of type
+  `dt_vulnerability`, with its analyzers and sources in the evidence. It never changes
+  an assessment's verdict, emits `finding.created`, and closes when DT stops reporting it.
+- `GET /integrations/dependency-track/findings` lists the DT findings with
+  `matched`, `analyzer`, `ids` and the register entry (`finding_id`); filter with
+  `asset_id` and `matched`. `POST /integrations/dependency-track:sync` makes every
+  project due now.
+
+**Triage** (`sync_triage`).
+- SCRS to DT: a register decision is written as a DT analysis at the next sync,
+  which the decision makes due: `triaged` and `in_progress` become `IN_TRIAGE`,
+  `accepted` becomes `EXPLOITABLE` with response `WILL_NOT_FIX`, `false_positive`
+  becomes `FALSE_POSITIVE` (suppressed), `suppressed` becomes `NOT_AFFECTED`
+  (suppressed), and `open` resets it to `NOT_SET`. `fixed` is decided by scans and
+  is not written. The reason text stays in SCRS.
+- DT to SCRS: DT's analysis is imported only while the register entry is `open` and
+  SCRS has written nothing for it. Hiding a finding (`false_positive`, `suppressed`)
+  needs every DT finding of that vulnerability to agree; any other analysed mix only
+  marks it `triaged`. Once the register has a decision it wins, and later DT edits
+  are not imported.
+
+An unreachable DT never affects an assessment. `GET /system/status` reports a
+`dependency_track` component (down when unreachable; degraded after failed uploads,
+imports or syncs), and `dependency_track.upload_failed` announces rejected uploads and
+failed imports. See [docs/DEPENDENCY_TRACK_AUDIT.md](docs/DEPENDENCY_TRACK_AUDIT.md).
+
+### AI code review (self-hosted model)
+
+A language model can read the source of an assessed commit and report what could
+break in production, logic bugs, lint-class problems, security weaknesses and
+performance problems. It is an advisory second opinion next to SAST and the QA
+runner, not a verdict.
+
+**What may leave your network.** Where a model runs decides what it is sent.
+`GET /llm/providers` shows each provider's `locality` and whether it may be sent
+source (`source_allowed`):
+- `local`: a model server you run (Ollama, llama.cpp, vLLM). Its host is in
+  `SCRS_LLM_PRIVATE_HOSTS`. It may always be sent source code.
+- `hosted`: any other provider (pay per token). It receives findings and advisory
+  text. It receives source code only if you opt in twice: the platform switch
+  `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` and an administrator's acknowledgement of
+  that provider (`POST /llm/providers/{id}:allow-source` with a note). Both are
+  off by default.
+
+Code review and unit-test generation accept a provider only when `source_allowed`
+is true and answer `409` otherwise. The worker checks again when it runs, so a
+withdrawn acknowledgement or an edited endpoint is refused. Every prompt and
+answer also passes a guard that redacts credentials, keys, tokens and the
+platform's own secrets (a safety net, not a guarantee). A hosted provider has a
+monthly token cap (`SCRS_LLM_MONTHLY_INPUT_TOKENS`, `SCRS_LLM_MONTHLY_OUTPUT_TOKENS`).
+Providers can be declared in the environment (`SCRS_LLM_PROVIDERS`), so a hosted
+and a self-hosted provider exist when the API starts.
+
+**Use it.**
+1. Add your server: `POST /llm/providers` with kind `ollama` or
+   `openai_compatible`, its `base_url`, a code-capable `model`, and a
+   `max_tokens` large enough for a JSON answer (4096 or more). Check `locality`
+   is `local`.
+2. `POST /assets/{id}/ai-reviews` with `{"provider_id":"...","max_files":10}`
+   (scope `write` or `trigger`). It reviews the asset's latest successful git
+   assessment and answers `202` with a `Location`.
+3. Poll `GET /ai-reviews/{id}` until `status` is `succeeded` or `failed`.
+4. Read the results in the register: `GET /register?asset_id=...`, entries of
+   type `ai_review` (file, lines, category, confidence, explanation and suggested
+   fix; no code).
+
+**How it behaves.**
+- The model reads one file at a time, most risk-prone files first (auth, payment,
+  handler, query, client, queue, config). Tests, vendored, generated and minified
+  files, and files over 48 KiB, are skipped and counted.
+- Its answer must match a JSON schema; findings with an unknown category or a line
+  outside the file are dropped.
+- Entries are marked `unverified`, never change a verdict, and are closed when a
+  later review of the same files no longer reports them. Their history is kept in
+  the finding events, and each review writes a summary to the asset's history.
+- A review stops and says why in `incomplete` when the assessment's token budget
+  (`SCRS_LLM_ASSESSMENT_INPUT_TOKENS`, `SCRS_LLM_ASSESSMENT_OUTPUT_TOKENS`) is
+  reached or when answers are cut off at the provider's `max_tokens`.
+- The QA runner's real linters are separate and are not merged into this result yet.
+
+See [docs/LLM_KNOWLEDGE.md](docs/LLM_KNOWLEDGE.md).
+
+### AI advisories and summaries
+
+A language model can turn an assessment's findings into something a manager can
+read: an **assessment summary** (headline, risk level, priorities, progress since
+the last summary) and an **advisory** for each of the most important findings
+(what it is, what to do, how urgent).
+
+**What the model sees.** Only findings and advisory text: identifiers, titles,
+severities, package names and versions, fixed versions and the upstream advisory
+text. It never sees code, evidence, file paths or secrets, and findings from code
+analysis (SAST), secret detection, AI code review, malware and YARA matches and
+QA are counted but never described. Because of that, any provider may be used,
+hosted or self-hosted. Everything is also screened by the guard.
+
+**Use it.**
+1. `POST /assessments/{id}/summaries` with `{"provider_id":"...","max_advisories":10}`
+   (scope `write` or `trigger`). It answers `202` with a `Location`.
+2. Poll `GET /summary-jobs/{id}` until `status` is `succeeded` or `failed`.
+3. Read the texts in the asset's chronicle: `GET /assets/{id}/chronicle`.
+
+**The chronicle.** It is the asset's history, oldest first: summaries, advisories and
+AI code review summaries. A new summary or advisory supersedes the one before it;
+the old one is kept (`superseded_at`) and the new one names it (`supersedes`), so a
+risk can be followed from its first advisory to its fix. Each text records its model,
+provider, prompt version and what the guard removed, and says it was written by a
+model and is not verified. It is stored in your PostgreSQL and is not touched by the
+retention jobs. When the self-hosted embedding service (`scrs-embed`) is configured,
+texts are also indexed for search; no text goes to a provider for embedding.
+
+Setup of the embedding service and of the self-hosted model machine:
+[docs/MODEL_HOST.md](docs/MODEL_HOST.md).
 
 ### Live events for a frontend
 

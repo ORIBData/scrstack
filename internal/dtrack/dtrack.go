@@ -36,8 +36,13 @@ var (
 	ErrNotFound  = errors.New("not found")
 )
 
-// RequiredPermissions are what the key needs to push SBOMs.
-var RequiredPermissions = []string{"BOM_UPLOAD", "PROJECT_CREATION_UPLOAD"}
+// Permissions SCRS may need, by feature. Uploading always needs BasePermissions.
+var (
+	BasePermissions    = []string{"BOM_UPLOAD", "PROJECT_CREATION_UPLOAD"}
+	ImportPermissions  = []string{"VIEW_PORTFOLIO", "VIEW_VULNERABILITY"}
+	TriagePermissions  = []string{"VULNERABILITY_ANALYSIS"}
+	TaggingPermissions = []string{"PORTFOLIO_MANAGEMENT"}
+)
 
 // Client talks to one Dependency-Track API server.
 type Client struct {
@@ -77,7 +82,17 @@ func ValidURL(raw string, private map[string]bool) bool {
 	return false
 }
 
+// maxResponse bounds ordinary answers; a project's findings may be larger.
+const (
+	maxResponse = 1 << 20
+	maxFindings = 32 << 20
+)
+
 func (c Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
+	return c.doLimit(ctx, method, path, body, maxResponse)
+}
+
+func (c Client) doLimit(ctx context.Context, method, path string, body any, limit int64) ([]byte, error) {
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -104,7 +119,10 @@ func (c Client) do(ctx context.Context, method, path string, body any) ([]byte, 
 		return nil, fmt.Errorf("%w: %s", ErrUnavailable, describe(err))
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%w: response larger than %d bytes", ErrRejected, limit)
+	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return data, nil
@@ -138,6 +156,10 @@ type Upload struct {
 	ProjectVersion string
 	Parent         *uuid.UUID
 	BOM            []byte
+	// IsLatest marks this version as the project's latest (the default
+	// branch). Tags replace the project's tags and need PORTFOLIO_MANAGEMENT.
+	IsLatest bool
+	Tags     []string
 }
 
 // Upload sends a CycloneDX BOM with PUT /api/v1/bom, creating the project
@@ -149,6 +171,16 @@ func (c Client) Upload(ctx context.Context, u Upload) (string, error) {
 	body := map[string]any{"projectName": u.ProjectName, "projectVersion": u.ProjectVersion, "autoCreate": true, "bom": base64.StdEncoding.EncodeToString(u.BOM)}
 	if u.Parent != nil {
 		body["parentUUID"] = u.Parent.String()
+	}
+	if u.IsLatest {
+		body["isLatest"] = true
+	}
+	if len(u.Tags) > 0 {
+		tags := make([]map[string]string, len(u.Tags))
+		for i, name := range u.Tags {
+			tags[i] = map[string]string{"name": name}
+		}
+		body["projectTags"] = tags
 	}
 	data, err := c.do(ctx, http.MethodPut, "/api/v1/bom", body)
 	if err != nil {
@@ -191,9 +223,9 @@ type CheckResult struct {
 
 // Check reads the server version without the key, then reads the key's
 // permissions with GET /api/v1/team/self (the key must belong to a team) and
-// requires RequiredPermissions. Missing permissions are an ErrRejected error
+// requires every permission in required. Missing permissions are an ErrRejected error
 // that names them; the result is returned either way.
-func (c Client) Check(ctx context.Context) (CheckResult, error) {
+func (c Client) Check(ctx context.Context, required []string) (CheckResult, error) {
 	var out CheckResult
 	version, err := c.Version(ctx)
 	out.Version = version
@@ -220,7 +252,7 @@ func (c Client) Check(ctx context.Context) (CheckResult, error) {
 		have[p.Name] = true
 		out.Permissions = append(out.Permissions, p.Name)
 	}
-	for _, need := range RequiredPermissions {
+	for _, need := range required {
 		if !have[need] {
 			out.Missing = append(out.Missing, need)
 		}
@@ -280,4 +312,141 @@ func (c Client) Project(ctx context.Context, name, version string) (Project, err
 		p.LastBOMImport = time.UnixMilli(*raw.LastBomImport).UTC()
 	}
 	return p, nil
+}
+
+// Finding is one vulnerability Dependency-Track reports for a project,
+// reduced to what SCRS stores. IDs holds the vulnerability's own ID and
+// every alias.
+type Finding struct {
+	ComponentUUID     string
+	ComponentName     string
+	ComponentGroup    string
+	ComponentVersion  string
+	PURL              string
+	VulnerabilityUUID string
+	VulnID            string
+	Source            string
+	Title             string
+	Severity          string
+	CVSS              float64
+	CWEs              []int
+	IDs               []string
+	Analyzer          string
+	ReferenceURL      string
+	AnalysisState     string
+	Suppressed        bool
+}
+
+// Findings reads a project's findings, suppressed ones included
+// (GET /api/v1/finding/project/{uuid}, needs VIEW_VULNERABILITY). The answer
+// is bounded, and a malformed entry is skipped rather than failing the sync.
+func (c Client) Findings(ctx context.Context, project string) ([]Finding, error) {
+	if _, err := uuid.Parse(project); err != nil {
+		return nil, fmt.Errorf("%w: project is not a UUID", ErrRejected)
+	}
+	data, err := c.doLimit(ctx, http.MethodGet, "/api/v1/finding/project/"+project+"?suppressed=true", nil, maxFindings)
+	if err != nil {
+		return nil, err
+	}
+	var raw []struct {
+		Component struct {
+			UUID    string `json:"uuid"`
+			Name    string `json:"name"`
+			Group   string `json:"group"`
+			Version string `json:"version"`
+			PURL    string `json:"purl"`
+		} `json:"component"`
+		Vulnerability struct {
+			UUID     string   `json:"uuid"`
+			Source   string   `json:"source"`
+			VulnID   string   `json:"vulnId"`
+			Title    string   `json:"title"`
+			Severity string   `json:"severity"`
+			CVSSV3   *float64 `json:"cvssV3BaseScore"`
+			CVSSV2   *float64 `json:"cvssV2BaseScore"`
+			CWEs     []struct {
+				ID int `json:"cweId"`
+			} `json:"cwes"`
+			Aliases []map[string]any `json:"aliases"`
+		} `json:"vulnerability"`
+		Analysis struct {
+			State      string `json:"state"`
+			Suppressed bool   `json:"isSuppressed"`
+		} `json:"analysis"`
+		Attribution struct {
+			Analyzer     string `json:"analyzerIdentity"`
+			ReferenceURL string `json:"referenceUrl"`
+		} `json:"attribution"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("%w: unexpected findings response", ErrRejected)
+	}
+	out := make([]Finding, 0, len(raw))
+	for _, r := range raw {
+		if _, err := uuid.Parse(r.Component.UUID); err != nil {
+			continue
+		}
+		if _, err := uuid.Parse(r.Vulnerability.UUID); err != nil || r.Vulnerability.VulnID == "" {
+			continue
+		}
+		f := Finding{
+			ComponentUUID: r.Component.UUID, ComponentName: r.Component.Name, ComponentGroup: r.Component.Group, ComponentVersion: r.Component.Version, PURL: r.Component.PURL,
+			VulnerabilityUUID: r.Vulnerability.UUID, VulnID: r.Vulnerability.VulnID, Source: r.Vulnerability.Source, Title: r.Vulnerability.Title,
+			Severity: strings.ToLower(r.Vulnerability.Severity), Analyzer: r.Attribution.Analyzer, ReferenceURL: r.Attribution.ReferenceURL,
+			AnalysisState: r.Analysis.State, Suppressed: r.Analysis.Suppressed,
+		}
+		switch {
+		case r.Vulnerability.CVSSV3 != nil:
+			f.CVSS = *r.Vulnerability.CVSSV3
+		case r.Vulnerability.CVSSV2 != nil:
+			f.CVSS = *r.Vulnerability.CVSSV2
+		}
+		for _, cwe := range r.Vulnerability.CWEs {
+			f.CWEs = append(f.CWEs, cwe.ID)
+		}
+		f.IDs = append(f.IDs, r.Vulnerability.VulnID)
+		for _, alias := range r.Vulnerability.Aliases {
+			for _, v := range alias {
+				if id, ok := v.(string); ok && id != "" && len(id) <= 128 {
+					f.IDs = append(f.IDs, id)
+				}
+			}
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// Analysis is a triage decision written to Dependency-Track.
+type Analysis struct {
+	Project, Component, Vulnerability string
+	State, Justification, Response    string
+	Details, Comment                  string
+	Suppressed                        bool
+}
+
+// SetAnalysis records an analysis decision (PUT /api/v1/analysis, needs
+// VULNERABILITY_ANALYSIS). Each call also adds a comment to the audit trail.
+func (c Client) SetAnalysis(ctx context.Context, a Analysis) error {
+	for _, id := range []string{a.Project, a.Component, a.Vulnerability} {
+		if _, err := uuid.Parse(id); err != nil {
+			return fmt.Errorf("%w: analysis target is not a UUID", ErrRejected)
+		}
+	}
+	body := map[string]any{"project": a.Project, "component": a.Component, "vulnerability": a.Vulnerability, "analysisState": a.State, "analysisJustification": orNotSet(a.Justification), "analysisResponse": orNotSet(a.Response), "isSuppressed": a.Suppressed}
+	if a.Details != "" {
+		body["analysisDetails"] = a.Details
+	}
+	if a.Comment != "" {
+		body["comment"] = a.Comment
+	}
+	_, err := c.do(ctx, http.MethodPut, "/api/v1/analysis", body)
+	return err
+}
+
+func orNotSet(s string) string {
+	if s == "" {
+		return "NOT_SET"
+	}
+	return s
 }

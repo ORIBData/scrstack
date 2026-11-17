@@ -471,6 +471,14 @@ func (s *Store) Transition(ctx context.Context, id, actor uuid.UUID, status, rea
 	if _, err = tx.Exec(ctx, `UPDATE `+s.schema+`.findings SET status=$2,waiver_until=$3,revision=revision+1 WHERE id=$1`, id, status, until); err != nil {
 		return err
 	}
+	// A person's decision is written to Dependency-Track at the next sync,
+	// which this makes due now. Imports from Dependency-Track (no actor)
+	// need no write-back.
+	if actor != uuid.Nil {
+		if _, err = tx.Exec(ctx, `UPDATE `+s.schema+`.dtrack_projects SET next_sync_at=LEAST(next_sync_at,clock_timestamp()) WHERE id IN (SELECT project_id FROM `+s.schema+`.dtrack_findings WHERE finding_id=$1)`, id); err != nil {
+			return err
+		}
+	}
 	if _, err := notify.EmitScoped(ctx, tx, s.schema, "finding.status_changed", map[string]any{"finding_id": id, "asset_id": asset, "previous_status": previous, "status": status, "waiver_until": until, "actor_id": actor, "link": notify.Link("/register/" + id.String() + "/events")}, nil, notify.Scope{Asset: asset}); err != nil {
 		return err
 	}

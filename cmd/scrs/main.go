@@ -18,6 +18,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/httpapi"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/storage"
@@ -119,6 +120,7 @@ func main() {
 		os.Exit(1)
 	}
 	assessmentStore.UseObjects(artifacts)
+	bootstrapLLMProviders(context.Background(), assessmentStore, store, netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	events, err := notify.Open(context.Background(), cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "notification store unavailable")
@@ -198,7 +200,7 @@ func main() {
 	platformStatus := httpapi.NewPlatformStatus(dependencyProbe, assessmentStore, sastClient, qaRunner).WithDependencyTrack(netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS")))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, Status: platformStatus, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), LLMAllowSource: llm.AllowSourceToHosted(), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, Status: platformStatus, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

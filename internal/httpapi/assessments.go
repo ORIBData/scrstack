@@ -438,7 +438,13 @@ func (h assessmentHandler) register(ctx context.Context, w http.ResponseWriter, 
 			writeError(w, 400, "invalid asset")
 			return
 		}
-		items, err := h.store.Findings(ctx, uuid.Nil, asset, after)
+		filter, ok := registerFilter(r)
+		if !ok {
+			writeError(w, 400, "invalid asset_id, status, severity or type")
+			return
+		}
+		filter.Asset = asset
+		items, err := h.store.FindingsFiltered(ctx, filter, after)
 		if err != nil {
 			assessmentError(w, err)
 			return
@@ -452,6 +458,9 @@ func (h assessmentHandler) register(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, BasePath+"/register/"), "/")
+	if len(parts) == 1 && h.registerAggregate(w, r, parts[0]) {
+		return
+	}
 	id, err := uuid.Parse(parts[0])
 	if err != nil || len(parts) > 2 {
 		writeError(w, 404, "not found")

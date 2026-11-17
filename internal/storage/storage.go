@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/knowledge"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -154,6 +155,11 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 	for _, ddl := range notify.Schema(schema) {
 		if _, err := tx.Exec(ctx, ddl); err != nil {
 			return errors.New("notification schema migration failed")
+		}
+	}
+	for _, ddl := range knowledge.Schema(schema) {
+		if _, err := tx.Exec(ctx, ddl); err != nil {
+			return errors.New("knowledge schema migration failed")
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111301),(2026111401),(2026111402) ON CONFLICT DO NOTHING`); err != nil {

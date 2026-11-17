@@ -38,6 +38,15 @@ func (w Worker) RunDependencyTrack(ctx context.Context, every time.Duration) {
 				break
 			}
 		}
+		for ctx.Err() == nil {
+			done, err := w.SyncDependencyTrackOnce(ctx)
+			if err != nil {
+				w.Logger.Warn("Dependency-Track sync bookkeeping failed", "error", err)
+			}
+			if !done || err != nil {
+				break
+			}
+		}
 		if time.Since(pruned) > time.Hour {
 			if _, err := w.Store.PruneDTrack(ctx, 90*24*time.Hour); err == nil {
 				pruned = time.Now()
@@ -113,7 +122,7 @@ func (w Worker) pushDTrack(ctx context.Context, u assessments.DTrackUpload) (str
 		// Transient unless the object is gone; the attempt bound ends it.
 		return "", errors.New("SBOM unavailable from artifact storage")
 	}
-	return client.Upload(ctx, dtrack.Upload{ProjectName: u.ProjectName, ProjectVersion: u.ProjectVersion, Parent: settings.Parent, BOM: bom})
+	return client.Upload(ctx, dtrack.Upload{ProjectName: u.ProjectName, ProjectVersion: u.ProjectVersion, Parent: settings.Parent, BOM: bom, IsLatest: u.IsLatest, Tags: u.Tags})
 }
 
 // VerifyDependencyTrackOnce checks one accepted upload's processing, if one
@@ -178,4 +187,77 @@ func (w Worker) verifyDTrack(ctx context.Context, u assessments.DTrackUpload) (o
 		return "failed", "Dependency-Track finished processing without importing the BOM (its last import is older than this upload); check its notifications for BOM_PROCESSING_FAILED"
 	}
 	return "processed", ""
+}
+
+// SyncDependencyTrackOnce reads one project's findings back, if one is due.
+// Errors are recorded on the project, not returned.
+func (w Worker) SyncDependencyTrackOnce(ctx context.Context) (bool, error) {
+	p, err := w.Store.ClaimDTrackSync(ctx)
+	if errors.Is(err, assessments.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	res, syncErr := w.syncDTrack(syncCtx, p)
+	cancel()
+	text := ""
+	if syncErr != nil {
+		text = syncErr.Error()
+		w.Logger.Warn("Dependency-Track sync failed", "project", p.Name, "version", p.Version, "error", syncErr)
+	} else if res.Created+res.Closed+res.Imported+len(res.Pushes) > 0 {
+		w.Logger.Info("Dependency-Track synced", "project", p.Name, "version", p.Version, "findings", res.Total, "matched", res.Matched, "only_in_dependency_track", res.Created, "closed", res.Closed, "triage_imported", res.Imported, "triage_written", len(res.Pushes))
+	}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	return true, w.Store.FinishDTrackSync(finishCtx, p, text, res.Total, res.MorePushes)
+}
+
+// syncDTrack reads a project's findings into the register and writes the
+// register's triage decisions back.
+func (w Worker) syncDTrack(ctx context.Context, p assessments.DTrackProject) (assessments.DTrackSyncResult, error) {
+	var res assessments.DTrackSyncResult
+	client, cleanup, err := w.dtrackClient(ctx)
+	if err != nil {
+		return res, err
+	}
+	defer cleanup()
+	settings, err := w.Store.DTrackSettings(ctx)
+	if err != nil {
+		return res, err
+	}
+	project, err := client.Project(ctx, p.Name, p.Version)
+	switch {
+	case errors.Is(err, dtrack.ErrForbidden):
+		return res, errors.New("the API key cannot read projects (needs VIEW_PORTFOLIO)")
+	case errors.Is(err, dtrack.ErrNotFound):
+		return res, errors.New("the project is not in Dependency-Track (deleted there?); the next upload recreates it")
+	case err != nil:
+		return res, err
+	}
+	findings, err := client.Findings(ctx, project.UUID)
+	switch {
+	case errors.Is(err, dtrack.ErrForbidden):
+		return res, errors.New("the API key cannot read findings (needs VIEW_VULNERABILITY)")
+	case err != nil:
+		return res, err
+	}
+	res, err = w.Store.ApplyDTrackFindings(ctx, p, project.UUID, findings, settings)
+	if err != nil {
+		return res, err
+	}
+	for _, push := range res.Pushes {
+		err := client.SetAnalysis(ctx, push.Analysis)
+		if errors.Is(err, dtrack.ErrForbidden) {
+			return res, errors.New("the API key cannot write triage (needs VULNERABILITY_ANALYSIS)")
+		}
+		if err != nil {
+			return res, err
+		}
+		if err := w.Store.MarkDTrackPushed(ctx, push.MemberID, push.Status); err != nil {
+			return res, err
+		}
+	}
+	return res, nil
 }

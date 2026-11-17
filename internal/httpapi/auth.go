@@ -63,6 +63,9 @@ type Security struct {
 	QAReports       QAReportReader
 	QARunner        *qa.Runner
 	LLMPrivateHosts map[string]bool
+	// LLMAllowSource is the platform switch that lets an acknowledged hosted
+	// provider receive source code (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED).
+	LLMAllowSource bool
 	// SAST is the scrs-sast service client (M9); SASTDefaults are the
 	// deployment defaults for SAST and reachability.
 	SAST         *sast.Client
@@ -178,6 +181,8 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("POST "+BasePath+"/integrations/dependency-track:test", dtrackAPI)
 		mux.Handle("GET "+BasePath+"/integrations/dependency-track/uploads", dtrackAPI)
 		mux.Handle("POST "+BasePath+"/integrations/dependency-track/uploads/{id}/retry", dtrackAPI)
+		mux.Handle("GET "+BasePath+"/integrations/dependency-track/findings", dtrackAPI)
+		mux.Handle("POST "+BasePath+"/integrations/dependency-track:sync", dtrackAPI)
 		sources := security.protect("read|write", sourceHandler{store: security.Assessments, validate: validate, compiles: compiles, secrets: secrets, taxiiHosts: security.TAXIIPrivateHosts})
 		mux.Handle(BasePath+"/intel/indicator-sources", sources)
 		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
@@ -282,7 +287,7 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle(BasePath+"/register", security.protect("read|write", h))
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
 		// E2E QA (Karate) and the LLM providers that draft tests.
-		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner}
+		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner, llmHosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/profile", security.protect("read|write", qaH))
 		mux.Handle("PUT "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
 		mux.Handle("DELETE "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
@@ -291,10 +296,19 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/coverage", security.protect("read|write", qaH))
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/generations", security.protect("read|write", qaH))
 		mux.Handle("POST "+BasePath+"/assets/{id}/qa/generations", security.protect("write", qaH))
+		aiReviews := aiReviewHandler{store: security.Assessments, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
+		mux.Handle("POST "+BasePath+"/assets/{id}/ai-reviews", security.protect("write|trigger", aiReviews))
+		mux.Handle("GET "+BasePath+"/assets/{id}/ai-reviews", security.protect("read|write", aiReviews))
+		mux.Handle("GET "+BasePath+"/ai-reviews/{id}", security.protect("read|write", aiReviews))
+		aiSummaries := aiSummaryHandler{store: security.Assessments}
+		mux.Handle("POST "+BasePath+"/assessments/{id}/summaries", security.protect("write|trigger", aiSummaries))
+		mux.Handle("GET "+BasePath+"/assessments/{id}/summaries", security.protect("read|write", aiSummaries))
+		mux.Handle("GET "+BasePath+"/summary-jobs/{id}", security.protect("read|write", aiSummaries))
+		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle", security.protect("read|write", aiSummaries))
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write", qaH))
 		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger", qaH))
 		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger", qaH))
-		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts})
+		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource})
 		mux.Handle(BasePath+"/llm/", models)
 	}
 	return security.observe(m, security.cors(mux))

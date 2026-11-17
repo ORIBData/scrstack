@@ -51,6 +51,8 @@ Networks (all `internal: true` except `proxy`): `scanning` (worker, scanner, Cla
 | `scrs-feed-sync` | Downloads OSV and enrichment feeds into the shared volume | none | none | none | Stale sources show in `/system/status` |
 | `scrs-sast` | Bundled analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, run without network | 8083 | Worker, and Core for `/sast/analyzers` | `SCRS_SAST_API_TOKEN` | `/healthz` (503 if an enabled analyzer is missing) |
 | `scrs-qa-runner` | Runs Karate API, UI and load jobs against your deployed environment | 8090 | Worker, and Core for `/qa/runner` | `SCRS_QA_RUNNER_TOKEN` | `/healthz` (503 names a broken prerequisite) |
+| `scrs-embed` | Self-hosted text embeddings (CPU) for the chronicle's search | 80 | Worker only (`embed` network) | `SCRS_EMBED_API_KEY` | `/health` |
+| `scrs-model` (second machine, optional) | Self-hosted code model (llama.cpp) for AI code review and unit tests, for data that must stay on your hardware; a hosted provider is the alternative | 8080 behind Traefik | Worker, over HTTPS | `SCRS_MODEL_API_KEY`, IP allowlist | `/health` (see [MODEL_HOST.md](MODEL_HOST.md)) |
 | `scrs-storage-init` | One-shot migrations and storage checks | none | Compose at start | Admin DB URL, first start only | exits 0 |
 
 Core and the worker are the same image (`scrs`); the worker is the `worker` command. Traefik also publishes the runner at `SCRS_QA_DOMAIN`, behind an IP allowlist (`SCRS_QA_RUNNER_ALLOWED_CIDRS`, default nobody) and its token. That route is for operators: it lets them trigger standalone QA, performance and load jobs (`POST /v1/jobs`) that have nothing to do with supply-chain risk. Core and the worker reach the runner over the internal `qa` network and do not use the public route.
@@ -110,16 +112,18 @@ The exact scope of every operation is in [API_REFERENCE.md](API_REFERENCE.md) an
 | Assets, owners, history | Assets, Mirrors | `/assets`, `/owners`, `/assets/{id}/mirrors` | [PROVIDERS.md](PROVIDERS.md) |
 | Assessments and results (SCA, malware, SBOM, MBOM, VEX) | Assessments, Assessment results | `/assessments`, `/assessments/{id}/...` | [ASSESSMENT_PIPELINE.md](ASSESSMENT_PIPELINE.md) |
 | External findings import | Imports | `/assessments:import` | [ASSESSMENT_PIPELINE.md](ASSESSMENT_PIPELINE.md) |
-| Risk register and remediation | Risk register, Remediation | `/register`, `/register/{id}`, `/assets/{id}/remediations` | [ASSESSMENT_PIPELINE.md](ASSESSMENT_PIPELINE.md) |
+| Risk register and remediation | Risk register, Remediation | `/register`, `/register/{id}`, `/register/summary`, `/register/export`, `/assets/{id}/remediations` | [ASSESSMENT_PIPELINE.md](ASSESSMENT_PIPELINE.md) |
 | Inbound webhooks and registries | Ingest | `/ingest/...`, `/webhooks/github` | [PROVIDERS.md](PROVIDERS.md) |
 | Outbound webhooks | Webhook subscriptions | `/webhooks`, deliveries, `:test` | [integrations/N8N.md](integrations/N8N.md) |
 | Threat intelligence and vulnerability sources | Threat intelligence | `/intel/...` | [THREAT_INTELLIGENCE.md](THREAT_INTELLIGENCE.md) |
 | Retention and maintenance | Operations | `/settings/retention`, `/maintenance/...`, `/audit` | [DOKPLOY.md](DOKPLOY.md) |
 | SAST and reachability | SAST | `/sast/...`, `/assets/{id}/sast`, `/reachability/capabilities` | [SAST.md](SAST.md) |
 | E2E QA (Karate) | E2E QA, LLM providers | `/assets/{id}/qa/...`, `/qa/...`, `/llm/...` | [QA_TESTING.md](QA_TESTING.md) |
+| AI code review (self-hosted model) | AI review, LLM providers | `/assets/{id}/ai-reviews`, `/ai-reviews/{id}` | [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md), [MODEL_HOST.md](MODEL_HOST.md) |
+| AI advisories, summaries and the chronicle | Advisories and summaries | `/assessments/{id}/summaries`, `/summary-jobs/{id}`, `/assets/{id}/chronicle` | [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md) |
 | Licences | Licences | `/policies/license`, `/licenses/...`, `/assets/{id}/licenses` | [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md) |
 | Compliance reports, STIG, PDF | Compliance reports | `/reports/...`, `/frameworks/{id}` | [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md) |
-| Dependency-Track export | Integrations | `/integrations/dependency-track/...` | [ADR.md](ADR.md) (ADR-033) |
+| Dependency-Track link (SBOM upload, findings read-back, shared triage) | Integrations | `/integrations/dependency-track/...` | [README.md](../README.md#owasp-dependency-track), [ADR.md](ADR.md) (ADR-033) |
 | Live events | Live events | `GET /events`, `/schemas/events` | contract, `/events` |
 
 ## Failure behaviour: what a client sees when a part is down
@@ -132,7 +136,7 @@ The exact scope of every operation is in [API_REFERENCE.md](API_REFERENCE.md) an
 | ClamAV or stale signatures | Malware coverage is partial, so the verdict is `incomplete` | Posture finding in the register |
 | SAST | A failed analyzer makes the assessment `incomplete`, never `pass` (SAST-011); the SAST gate itself is report-only | `sast` is `down` or `degraded` |
 | QA runner | A run fails after repeated submission attempts; assessments are unaffected | `qa_runner` is `down`; `qa.failed` event |
-| Dependency-Track (optional export) | Assessments are unaffected; uploads queue and retry for about two days | `dependency_track` is `down` (unreachable) or `degraded` (failed uploads, old backlog); `dependency_track.upload_failed` event |
+| Dependency-Track (optional export) | Assessments are unaffected; uploads queue and retry for about two days | `dependency_track` is `down` (unreachable) or `degraded` (failed uploads, imports or syncs; old backlog); `dependency_track.upload_failed` event. DT-only findings stop updating |
 | Traefik or DNS | Clients cannot reach Core; the runner's callbacks fail | Outside the stack: probe `/system/healthz` from where the client runs |
 
 An `incomplete` verdict is not a clean result: gate on `fail` and never treat `incomplete` as `pass`.

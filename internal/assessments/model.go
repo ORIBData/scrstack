@@ -372,8 +372,9 @@ func maliciousType(t string) bool {
 func huntOnly(t string) bool { return t == "yara_hunt" || t == "ioc_hunt" }
 
 // reportOnly reports E2E QA findings (qa_failure, qa_untested,
-// qa_performance, qa_config, qa_unconfigured): they inform, never gate.
-func reportOnly(t string) bool { return strings.HasPrefix(t, "qa_") }
+// qa_performance, qa_config, qa_unconfigured) and AI code review entries
+// (ai_review): they inform, never gate.
+func reportOnly(t string) bool { return strings.HasPrefix(t, "qa_") || t == "ai_review" }
 
 // closableTypes lists finding types whose producing stages all completed, so
 // their absence from this scan is evidence of a fix rather than lost coverage.

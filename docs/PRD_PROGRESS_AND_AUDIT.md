@@ -106,6 +106,9 @@ Earlier versions of this table lagged the code. It now follows the delivery reco
 | M9 SAST/reachability | Delivered 2026-11-15 ([SAST.md](SAST.md)). Reachability beyond Go remains P2. |
 | E2E QA (Karate) and LLM test generation | Delivered ([QA_TESTING.md](QA_TESTING.md)). Scope decision 2026-11-16: the runner is a QA, performance and load service with an operator route for standalone jobs, separate from supply-chain risk. A lint job kind is not implemented. |
 | P2 | Delivered 2026-11-15: Dependency-Track export (ADR-033), live events (ADR-030), ASD STIG import (ADR-031), PDF reports (ADR-032), outbound licence compatibility. CPE matching (VUL-007) deferred to spike S14. |
+| AI advisories, summaries and chronicle | Delivered 2026-11-16: allowlisted findings-and-advisory-text prompts, summary and per-finding advisories with provenance and supersession, self-hosted embeddings, compose services for `scrs-embed` and the model host ([MODEL_HOST.md](MODEL_HOST.md)). Rendering into PDF reports, search through the API and linters are not built. |
+| AI code review | Delivered 2026-11-16 on a self-hosted model: guarded model calls, `ai_review` entries, per-assessment token budget and ledger ([LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md)). Real linters in the QA runner are not built. |
+| Dependency-Track link | Delivered 2026-11-16: processing checks, permission-aware `:test`, `dependency_track` status and `dependency_track.upload_failed`, findings read-back as one entry per vulnerability, shared triage, provider-qualified project names ([DEPENDENCY_TRACK_AUDIT.md](DEPENDENCY_TRACK_AUDIT.md)). |
 | Platform status | Delivered 2026-11-16: `GET /system/status`, `system.degraded` and `system.recovered` events, a deeper QA runner `/healthz`, scopes on every operation checked against the router, and [STACK.md](STACK.md) with the generated [API_REFERENCE.md](API_REFERENCE.md). |
 
 ## Open PRD requirements (audited 2026-11-16)
@@ -117,7 +120,7 @@ None blocks the delivered modules above, and the PRD marks most as P1 or P2.
 | Area | Requirement | Gap |
 | --- | --- | --- |
 | Assets | AST-001, ING-006 | No `uploaded` asset type or `POST /uploads`; assets come from connection discovery. No `POST /assets`, `DELETE /assets/{id}`, `POST /assets:import` or `GET /assets/{id}/revisions`. |
-| Register | RR-008, RR-010, RR-012, RR-014 | No finding comments or assignment endpoints; no register export (CSV or VEX download), summary, timeseries or top-assets aggregates. Triage and waivers go through `PATCH /register/{id}`; VEX is per assessment. |
+| Register | RR-008, RR-010, RR-012, RR-014 | No finding comments or assignment endpoints. Delivered: `GET /register` filters (asset, status, severity, type), `/register/summary`, `/register/timeseries`, `/register/top-assets`, `/register/export` (CSV or JSON, 50000 rows at most) and `/register/vex` (one OpenVEX document for the filtered register). Triage and waivers go through `PATCH /register/{id}`. |
 | SBOM | SBM-005 | Component changes are recorded per assessment (`change` on findings and components); there is no `sbom-diff` endpoint between two revisions. |
 | Advisories | OSV-008 | No API to create local `x_SCRS-*` advisories, and no advisory search; `GET /intel/vulnerabilities/{id}` reads one. |
 | Malicious dependencies | MAL-004, MAL-005, MAL-006 | No `introduced_by` tagging, minimum-release-age policy (P2) or typosquat heuristic (P2). |

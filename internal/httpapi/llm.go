@@ -24,6 +24,9 @@ type llmHandler struct {
 	secrets Sealer
 	// hosts may resolve to private addresses (SCRS_LLM_PRIVATE_HOSTS).
 	hosts map[string]bool
+	// allowSource is the platform switch for sending source code to a hosted
+	// provider (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED).
+	allowSource bool
 }
 
 type providerInput struct {
@@ -56,6 +59,8 @@ func llmError(w http.ResponseWriter, err error) {
 		writeError(w, 400, "invalid LLM provider: name is 2-63 lower-case letters, digits, hyphens or underscores")
 	case errors.Is(err, assessments.ErrNotFound):
 		writeError(w, 404, "LLM provider not found")
+	case errors.Is(err, assessments.ErrManaged):
+		writeError(w, 409, err.Error())
 	case errors.Is(err, assessments.ErrConflict):
 		writeError(w, 409, "provider name exists or revision is stale; reload and retry")
 	default:
@@ -128,6 +133,9 @@ func (h llmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			llmError(w, err)
 			return
 		}
+		for i := range items {
+			items[i] = h.view(items[i])
+		}
 		writeJSON(w, 200, map[string]any{"items": items})
 		return
 	case rest == "providers" && r.Method == http.MethodPost:
@@ -153,7 +161,7 @@ func (h llmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(p.Revision, 10)))
-		writeJSON(w, 200, p)
+		writeJSON(w, 200, h.view(p))
 	case " PATCH":
 		revision, ok := ifMatch(w, r)
 		if !ok {
@@ -170,6 +178,10 @@ func (h llmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		before, secret, err := h.withKey(ctx, id)
 		if err != nil {
 			llmError(w, err)
+			return
+		}
+		if before.Managed && (input.Kind != nil || input.BaseURL != nil || input.Model != nil || input.MaxTokens != nil || input.Temperature != nil || input.ClearTemperature || input.APIKey != nil) {
+			llmError(w, assessments.ErrManaged)
 			return
 		}
 		after, secret, err := input.apply(before, secret, h.hosts)
@@ -190,8 +202,12 @@ func (h llmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(updated.Revision, 10)))
-		writeJSON(w, 200, updated)
+		writeJSON(w, 200, h.view(updated))
 	case " DELETE":
+		if p, err := h.store.LLMProviderByID(ctx, id); err == nil && p.Managed {
+			llmError(w, assessments.ErrManaged)
+			return
+		}
 		if err := h.store.DeleteLLMProvider(ctx, id, principal.ID); err != nil {
 			llmError(w, err)
 			return
@@ -199,6 +215,15 @@ func (h llmHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 	case "test POST":
 		h.test(ctx, w, id)
+	case "allow-source POST":
+		h.allowSourceTo(ctx, w, r, id, principal)
+	case "revoke-source POST":
+		updated, err := h.store.SetLLMSourceAck(ctx, id, false, "", principal.Name, principal.ID)
+		if err != nil {
+			llmError(w, err)
+			return
+		}
+		writeJSON(w, 200, h.view(updated))
 	default:
 		writeError(w, 405, "method not allowed")
 	}
@@ -260,7 +285,7 @@ func (h llmHandler) create(ctx context.Context, w http.ResponseWriter, r *http.R
 	}
 	w.Header().Set("Location", BasePath+"/llm/providers/"+created.ID.String())
 	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(created.Revision, 10)))
-	writeJSON(w, 201, created)
+	writeJSON(w, 201, h.view(created))
 }
 
 // test sends a one-line prompt with the stored settings and key, so an
@@ -295,4 +320,51 @@ func (h llmHandler) test(ctx context.Context, w http.ResponseWriter, id uuid.UUI
 		reply = reply[:200]
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "model": resp.Model, "reply": reply, "latency_ms": latency, "input_tokens": resp.InputTokens, "output_tokens": resp.OutputTokens})
+}
+
+// view adds the computed locality: where the provider runs, which decides
+// whether source code may be sent to it.
+func (h llmHandler) view(p assessments.LLMProvider) assessments.LLMProvider {
+	policy := llm.SourcePolicy{Private: h.hosts, AllowHosted: h.allowSource}
+	p.Locality, p.SourceAllowed = policy.Check(llmSettings(p), p.SourceAckAt != nil)
+	return p
+}
+
+// allowSourceTo records an administrator's acknowledgement that a hosted
+// provider may receive source code. It is refused while the platform switch
+// is off, so the response never suggests source can go where it cannot, and
+// for a self-hosted provider, which needs none.
+func (h llmHandler) allowSourceTo(ctx context.Context, w http.ResponseWriter, r *http.Request, id uuid.UUID, principal connections.Token) {
+	var input struct {
+		Note string `json:"note"`
+	}
+	if !readBody(w, r, &input) {
+		return
+	}
+	p, err := h.store.LLMProviderByID(ctx, id)
+	if err != nil {
+		llmError(w, err)
+		return
+	}
+	switch {
+	case llmSettings(p).Local(h.hosts):
+		writeError(w, 409, "this provider is self-hosted (its host is in SCRS_LLM_PRIVATE_HOSTS) and needs no acknowledgement")
+		return
+	case !h.allowSource:
+		writeError(w, 409, "sending source code to hosted providers is off for this platform; set SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true and redeploy first")
+		return
+	case len(strings.TrimSpace(input.Note)) < 10:
+		writeError(w, 400, "note is required (10 to 500 characters): record why this provider may receive source code, for example the agreement that covers it")
+		return
+	}
+	updated, err := h.store.SetLLMSourceAck(ctx, id, true, input.Note, principal.Name, principal.ID)
+	if errors.Is(err, assessments.ErrInput) {
+		writeError(w, 400, "note is required (10 to 500 characters): record why this provider may receive source code, for example the agreement that covers it")
+		return
+	}
+	if err != nil {
+		llmError(w, err)
+		return
+	}
+	writeJSON(w, 200, h.view(updated))
 }

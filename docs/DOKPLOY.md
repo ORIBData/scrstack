@@ -125,7 +125,7 @@ If an HTTP node port is needed for local VPS diagnostics, add
 only and forwards it to the container's port 7000, e.g. `curl http://127.0.0.1:7000/scrs/v1/system/readyz`.
 Probes: `/system/healthz` and `/system/readyz` are public and answer only `ok` or `unavailable` (load balancers).
 A frontend status page should call `GET /system/status` with a `read` token. It reports `api`, `postgres`, `redis`,
-`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast`, `qa_runner` and `dependency_track` (only while the export is on) as `ok`, `degraded`, `down` or `not_configured`,
+`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast`, `qa_runner` and `dependency_track` (only while the Dependency-Track link is on) as `ok`, `degraded`, `down` or `not_configured`,
 and always answers `200`, so read its `status` field. The QA runner's own `/healthz` returns 503 with the names of
 failed prerequisites (`karate`, `work_dir`, `java`, `gatling_classpath`), which makes Docker mark it unhealthy.
 
@@ -292,7 +292,17 @@ How the two services connect:
 | `SCRS_QA_RUNNER_URL`, `SCRS_QA_RUNNER_ALLOW_HTTP` | API, worker | Default to the private runner; set an https URL and `false` for a runner on another host |
 | `SCRS_QA_RUNNER_CA_FILE` | API, worker | PEM file trusted for a privately issued runner certificate |
 | `SCRS_QA_MAX_ACTIVE` | worker | Runs on the runner at once (default 4) |
-| `SCRS_QA_GENERATION_ENABLED` | worker | `false` disables LLM test generation |
+| `SCRS_QA_GENERATION_ENABLED` | worker | `false` disables LLM test generation and AI code review |
+| `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Your own model servers (Ollama, vLLM). Besides allowing private addresses and http, this list marks a provider `local`, which may always be sent source code. A hosted provider needs the two opt-ins instead. |
+| `SCRS_LLM_PROVIDERS`, `SCRS_LLM_PROVIDER_HOSTED_*`, `SCRS_LLM_PROVIDER_LOCAL_*` | API | Providers declared in the environment (names `hosted` and `local`; settings are `KIND`, `MODEL`, `BASE_URL`, `API_KEY`, `MAX_TOKENS`, `TEMPERATURE`, `ALLOW_SOURCE`). They exist when the API starts; the environment owns them. See [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md#providers-from-the-environment) |
+| `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED` | API, worker | `true` lets an acknowledged hosted provider receive source code (default `false`). Set it on both |
+| `SCRS_LLM_MONTHLY_INPUT_TOKENS`, `SCRS_LLM_MONTHLY_OUTPUT_TOKENS` | worker | Monthly token cap per hosted provider (defaults 20000000 and 4000000; `0` removes a cap) |
+| `SCRS_LLM_ASSESSMENT_INPUT_TOKENS`, `SCRS_LLM_ASSESSMENT_OUTPUT_TOKENS` | worker | Token ceiling for the model work of one assessment (defaults 300000 and 60000) |
+| `SCRS_LLM_TIMEOUT_SECONDS` | API, worker | One model call's time limit (default 360; 900 for a CPU model) |
+| `SCRS_AI_REVIEW_MAX_FILE_BYTES` | worker | Largest source file sent for AI code review (default 49152) |
+| `SCRS_EMBED_API_KEY` | `scrs-embed`, worker | Required. Key for the embedding service |
+| `SCRS_EMBED_URL`, `SCRS_EMBED_MODEL`, `SCRS_EMBED_DIM`, `SCRS_EMBED_MAX_CHARS`, `SCRS_EMBED_PRIVATE_HOSTS` | worker | The self-hosted embedding service (defaults: `scrs-embed`, bge-small, 384, 1500). Empty URL turns embedding off. See [MODEL_HOST.md](MODEL_HOST.md) |
+| `SCRS_EMBED_MEMORY`, `SCRS_EMBED_CPUS` | `scrs-embed` | Resource limits (defaults 2g, 2) |
 | `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Self-hosted model hosts (Ollama, vLLM) allowed to resolve privately and use http |
 
 **Runner isolation in the shared stack.** The runner executes repository test code on

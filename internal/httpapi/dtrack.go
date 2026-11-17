@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +30,15 @@ type dtrackInput struct {
 	URL     string     `json:"url"`
 	APIKey  *string    `json:"api_key,omitempty"`
 	Parent  *uuid.UUID `json:"parent_uuid,omitempty"`
+
+	ImportFindings     bool     `json:"import_findings"`
+	SyncTriage         bool     `json:"sync_triage"`
+	UploadPullRequests bool     `json:"upload_pull_requests"`
+	UploadCommitOnly   bool     `json:"upload_commit_only"`
+	Tags               []string `json:"tags"`
 }
+
+var dtrackTag = regexp.MustCompile(`^[a-z0-9][a-z0-9._:-]{0,63}$`)
 
 func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	principal := r.Context().Value(principalKey{}).(connections.Token)
@@ -69,7 +78,21 @@ func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "url must be https, or http for a host in SCRS_DTRACK_PRIVATE_HOSTS, without credentials, query or fragment")
 			return
 		}
-		change := assessments.DTrackChange{Enabled: in.Enabled, URL: in.URL, Parent: in.Parent}
+		if len(in.Tags) > 10 {
+			writeError(w, 400, "at most 10 tags")
+			return
+		}
+		for _, tag := range in.Tags {
+			if !dtrackTag.MatchString(tag) {
+				writeError(w, 400, "tags are lower case letters, digits and . _ : - (up to 64 characters)")
+				return
+			}
+		}
+		if in.SyncTriage && !in.ImportFindings {
+			writeError(w, 400, "sync_triage needs import_findings")
+			return
+		}
+		change := assessments.DTrackChange{Enabled: in.Enabled, URL: in.URL, Parent: in.Parent, ImportFindings: in.ImportFindings, SyncTriage: in.SyncTriage, UploadPullRequests: in.UploadPullRequests, UploadCommitOnly: in.UploadCommitOnly, Tags: in.Tags}
 		if in.APIKey != nil {
 			key := strings.TrimSpace(*in.APIKey)
 			if len(key) < 16 || len(key) > 256 || strings.ContainsAny(key, " \r\n") {
@@ -117,8 +140,8 @@ func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			client = dtrack.NewHTTPClient(h.hosts)
 			defer client.CloseIdleConnections()
 		}
-		check, err := dtrack.Client{BaseURL: settings.URL, APIKey: string(key), HTTP: client}.Check(ctx)
-		result := map[string]any{"ok": err == nil, "version": check.Version, "permissions": nonNil(check.Permissions), "missing_permissions": nonNil(check.Missing), "required_permissions": dtrack.RequiredPermissions}
+		check, err := dtrack.Client{BaseURL: settings.URL, APIKey: string(key), HTTP: client}.Check(ctx, settings.RequiredPermissions())
+		result := map[string]any{"ok": err == nil, "version": check.Version, "permissions": nonNil(check.Permissions), "missing_permissions": nonNil(check.Missing), "required_permissions": settings.RequiredPermissions()}
 		if err != nil {
 			result["error"] = err.Error()
 		}
@@ -145,6 +168,49 @@ func (h dtrackHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			next = items[49].ID.String()
 		}
 		writeJSON(w, 200, map[string]any{"items": items, "next_cursor": next})
+	case path == "/findings" && r.Method == http.MethodGet:
+		q := r.URL.Query()
+		asset, err := pageUUID(r, "asset_id")
+		if err != nil {
+			writeError(w, 400, "invalid asset_id")
+			return
+		}
+		after, err := pageUUID(r, "cursor")
+		if err != nil {
+			writeError(w, 400, "invalid cursor")
+			return
+		}
+		var matched *bool
+		switch q.Get("matched") {
+		case "":
+		case "true", "false":
+			v := q.Get("matched") == "true"
+			matched = &v
+		default:
+			writeError(w, 400, "matched must be true or false")
+			return
+		}
+		items, err := h.store.DTrackFindings(ctx, asset, matched, after, 50)
+		if err != nil {
+			licenseError(w, err)
+			return
+		}
+		next := ""
+		if len(items) > 50 {
+			items = items[:50]
+			next = items[49].ID.String()
+		}
+		writeJSON(w, 200, map[string]any{"items": items, "next_cursor": next})
+	case path == ":sync" && r.Method == http.MethodPost:
+		if !admin() {
+			return
+		}
+		n, err := h.store.RequestDTrackSync(ctx)
+		if err != nil {
+			licenseError(w, err)
+			return
+		}
+		writeJSON(w, 202, map[string]any{"projects_queued": n})
 	case strings.HasPrefix(path, "/uploads/") && strings.HasSuffix(path, "/retry") && r.Method == http.MethodPost:
 		if !admin() {
 			return

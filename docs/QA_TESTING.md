@@ -266,7 +266,7 @@ The full contract, with schemas and examples, is in `api/openapi.yaml` (tags *E2
 | `SCRS_QA_RUNNER_ALLOW_HTTP` | API, worker | Allow `http://` for a runner on a private network |
 | `SCRS_QA_RUNNER_CA_FILE` | API, worker | PEM trusted for a privately issued runner certificate |
 | `SCRS_QA_MAX_ACTIVE` | worker | Runs on the runner at once (default 4) |
-| `SCRS_QA_GENERATION_ENABLED` | worker | `false` stops test generation |
+| `SCRS_QA_GENERATION_ENABLED` | worker | `false` stops test generation and AI code review |
 | `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Self-hosted model hosts allowed private addresses and http |
 
 ## Verification

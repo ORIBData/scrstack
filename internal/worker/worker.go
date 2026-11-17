@@ -80,6 +80,9 @@ type Worker struct {
 	QAReports   QAReports
 	// LLMPrivateHosts may resolve to internal addresses (SCRS_LLM_PRIVATE_HOSTS).
 	LLMPrivateHosts map[string]bool
+	// LLMAllowSource is the platform switch that lets an acknowledged hosted
+	// provider receive source code (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED).
+	LLMAllowSource bool
 	// NVDAPIKey raises the NVD rate limit; NVDURL and CVEURL override the
 	// sources' API URLs (tests, mirrors); AdvisoryPace overrides pacing.
 	NVDAPIKey, NVDURL, CVEURL string

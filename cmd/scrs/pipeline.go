@@ -15,6 +15,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/depsdev"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
@@ -279,6 +280,7 @@ func pipelineCommand() error {
 			return err
 		}
 		w.LLMPrivateHosts = netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS"))
+		w.LLMAllowSource = llm.AllowSourceToHosted()
 		if runner != nil {
 			w.QARunner, w.QAReports = runner, artifacts
 			w.QAMaxActive = 4
@@ -289,6 +291,8 @@ func pipelineCommand() error {
 		}
 		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
 			go w.RunGenerations(ctx)
+			go w.RunAIReviews(ctx)
+			go w.RunAISummaries(ctx)
 		}
 		// Dependency-Track export (P2): configured through the API; this loop
 		// only pushes uploads while it is enabled there.
