@@ -376,6 +376,16 @@ package. Statements are attributed inputs, shown with
 never close or waive a finding; triage stays a person's decision in the
 register. The same document imported twice is refused.
 
+## Package checks beyond advisories
+
+Three checks sit next to the malicious-package feed (`MAL-` records), which matches known-bad packages.
+
+- **Who brought it in (MAL-004).** An entry about a dependency that is new since the previous successful scan of the same ref (a vulnerability, malicious package, suspicious package or licence entry) carries `evidence.introduced_by`: the commit, ref and assessment, plus the trigger's `actor` and `origin`. For a push webhook the actor is the pusher the provider named; it is claimed, never verified, and a git archive has no commit author to read. The first scan of a ref, and a scan whose baseline had no inventory, tag nothing. The tag stays on the entry when later scans repeat it, and appears in `malicious_dependency.reported` events.
+- **Fresh releases (MAL-005).** `PUT /policies/dependencies` with `min_release_age_days` above 0 flags versions published more recently than that (`SCRS-NEW-RELEASE`). Dates come from deps.dev and are cached for good once known; a version without a date is not judged. At most `SCRS_DEPSDEV_MAX_LOOKUPS` (default 2000) unknown versions are looked up per scan; the rest make the stage partial. `SCRS_DEPSDEV_ENABLED=false` turns the lookup off, which also makes the release-age stage partial.
+- **Look-alike names (MAL-006).** `typosquat: true` flags an npm or PyPI name one edit away from a listed popular package, or equal to one once `-`, `_` and `.` are ignored (`SCRS-TYPOSQUAT`). The list is a seed of about 260 names in `internal/supplychain`, so it misses most squats and flags some legitimate neighbours; accept or mark those false positives, the choice sticks.
+
+Both policy checks are off until an admin enables them. Their `suspicious_dependency` entries are medium, report-only and never change a verdict. Each scan reports a `dependency_policy` stage; when it is `partial` (deps.dev unreachable or the lookup limit reached), entries are not closed by absence.
+
 ## Roadmap
 
 The threat-intelligence module is complete:

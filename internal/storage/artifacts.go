@@ -124,6 +124,44 @@ func (a *Artifacts) GetSnapshot(ctx context.Context, key string) ([]byte, error)
 	return data, nil
 }
 
+// MaxUploadBytes bounds an uploaded source archive; it equals the snapshot
+// limit the scanner accepts.
+const MaxUploadBytes = 64 << 20
+
+var uploadKey = regexp.MustCompile(`^uploads/[a-f0-9]{64}\.tar\.gz$`)
+
+// PutUpload stores an uploaded source archive content-addressed, apart from
+// snapshots so that retention of snapshots never removes an upload.
+func (a *Artifacts) PutUpload(ctx context.Context, data []byte) (string, error) {
+	if len(data) == 0 || len(data) > MaxUploadBytes {
+		return "", errors.New("upload size not allowed")
+	}
+	hash := sha256.Sum256(data)
+	key := "uploads/" + hex.EncodeToString(hash[:]) + ".tar.gz"
+	_, err := a.client.PutObject(ctx, a.bucket, key, bytes.NewReader(data), int64(len(data)), minio.PutObjectOptions{ContentType: "application/gzip"})
+	return key, err
+}
+
+func (a *Artifacts) GetUpload(ctx context.Context, key string) ([]byte, error) {
+	if !uploadKey.MatchString(key) {
+		return nil, errors.New("invalid upload key")
+	}
+	object, err := a.client.GetObject(ctx, a.bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer object.Close()
+	data, err := io.ReadAll(io.LimitReader(object, MaxUploadBytes+1))
+	if err != nil || len(data) > MaxUploadBytes {
+		return nil, errors.New("upload unavailable")
+	}
+	hash := sha256.Sum256(data)
+	if "uploads/"+hex.EncodeToString(hash[:])+".tar.gz" != key {
+		return nil, errors.New("upload integrity check failed")
+	}
+	return data, nil
+}
+
 var mirrorKey = regexp.MustCompile(`^mirrors/[0-9a-f-]{36}\.bundle$`)
 
 // PutMirror streams a git bundle into S3 without buffering it whole; minio
@@ -243,7 +281,7 @@ func (a *Artifacts) GetReport(ctx context.Context, key string) ([]byte, error) {
 // SBOM, snapshot, remediation, QA report and compliance report keys may be
 // deleted.
 func (a *Artifacts) DeleteObject(ctx context.Context, key string) error {
-	if !sbomKey.MatchString(key) && !snapshotKey.MatchString(key) && !planKey.MatchString(key) && !qaReportKey.MatchString(key) && !reportKey.MatchString(key) {
+	if !sbomKey.MatchString(key) && !snapshotKey.MatchString(key) && !planKey.MatchString(key) && !qaReportKey.MatchString(key) && !reportKey.MatchString(key) && !uploadKey.MatchString(key) {
 		return errors.New("object key is not a purgeable artifact")
 	}
 	return a.client.RemoveObject(ctx, a.bucket, key, minio.RemoveObjectOptions{})

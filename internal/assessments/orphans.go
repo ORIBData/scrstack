@@ -26,6 +26,7 @@ var orphanPrefixes = map[string]string{
 	"remediation/": `SELECT 1 FROM %s.remediation_results WHERE artifact_key=$1`,
 	"qa/":          `SELECT 1 FROM %s.qa_runs WHERE report_key=$1`,
 	"reports/":     `SELECT 1 FROM %s.reports WHERE s3_key=$1`,
+	"uploads/":     `SELECT 1 FROM %s.uploads WHERE object_key=$1`,
 }
 
 // OrphanGrace is how old an unreferenced object must be before deletion.

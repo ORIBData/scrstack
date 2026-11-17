@@ -2,6 +2,10 @@ package assessments
 
 // Schema is applied under the storage migration lock. No destructive DDL.
 func Schema(s string) []string {
+	return append(append(append(append(append(append(append(allSchema(s), uploadSchema(s)...), commentSchema(s)...), dependencyPolicySchema(s)...), integritySchema(s)...), incidentSchema(s)...), actionsSchema(s)...), assetLinkSchema(s)...)
+}
+
+func allSchema(s string) []string {
 	return append(append(append(append(append(append(append(append(append(append(append(append(append(append(baseSchema(s), mirrorSchema(s)...), ruleSchema(s)...), indicatorSchema(s)...), taxiiSchema(s)...), qaSchema(s)...), vulnSourceSchema(s)...), retentionClassSchema(s)...), licenseSchema(s)...), reportSchema(s)...), sastSchema(s)...), dtrackSchema(s)...), dtrackSyncSchema(s)...), aiReviewSchema(s)...), aiSummarySchema(s)...)
 }
 
@@ -74,5 +78,28 @@ func baseSchema(s string) []string {
 		// OBS-002: audit queries by action and by target, newest first.
 		`CREATE INDEX IF NOT EXISTS audit_log_action_idx ON ` + s + `.audit_log(action,id DESC)`,
 		`CREATE INDEX IF NOT EXISTS audit_log_target_idx ON ` + s + `.audit_log(target_id,id DESC) WHERE target_id IS NOT NULL`,
+	}
+}
+
+// uploadSchema holds source archives uploaded through POST /uploads. One
+// asset (type `uploaded`) has one row per distinct archive; the archive's
+// SHA-256 names the revision.
+func uploadSchema(s string) []string {
+	return []string{
+		`CREATE TABLE IF NOT EXISTS ` + s + `.uploads(id uuid PRIMARY KEY,asset_id uuid NOT NULL REFERENCES ` + s + `.assets(id),sha256 text NOT NULL CHECK(sha256 ~ '^[a-f0-9]{64}$'),size bigint NOT NULL CHECK(size>0),filename text NOT NULL DEFAULT '',label text NOT NULL DEFAULT '',object_key text NOT NULL,uploaded_by text NOT NULL,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),UNIQUE(asset_id,sha256))`,
+		`CREATE INDEX IF NOT EXISTS uploads_asset_idx ON ` + s + `.uploads(asset_id,created_at DESC)`,
+	}
+}
+
+// commentSchema holds the assignment and discussion of register entries
+// (RR-008). There is no user model, so an assignee is a free-text identifier
+// and a comment records the token that wrote it.
+func commentSchema(s string) []string {
+	return []string{
+		`ALTER TABLE ` + s + `.findings ADD COLUMN IF NOT EXISTS assignee text NOT NULL DEFAULT ''`,
+		`ALTER TABLE ` + s + `.findings ADD COLUMN IF NOT EXISTS assigned_at timestamptz`,
+		`CREATE INDEX IF NOT EXISTS findings_assignee_idx ON ` + s + `.findings(lower(assignee)) WHERE assignee<>''`,
+		`CREATE TABLE IF NOT EXISTS ` + s + `.finding_comments(id uuid PRIMARY KEY,finding_id uuid NOT NULL REFERENCES ` + s + `.findings(id),author text NOT NULL,actor_id uuid,on_behalf_of text NOT NULL DEFAULT '',body text NOT NULL CHECK(length(body) BETWEEN 1 AND 4000),created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
+		`CREATE INDEX IF NOT EXISTS finding_comments_idx ON ` + s + `.finding_comments(finding_id,created_at,id)`,
 	}
 }

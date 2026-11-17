@@ -45,6 +45,24 @@ func TestS3ArtifactsRoundTripAndTamper(t *testing.T) {
 	if err != nil || !bytes.Equal(plan, data) {
 		t.Fatal("plan roundtrip failed", err)
 	}
+	// Uploaded source archives live under their own prefix, apart from snapshots.
+	source := []byte("synthetic gzip archive")
+	uploadKey, err := a.PutUpload(ctx, source)
+	if err != nil || !strings.HasPrefix(uploadKey, "uploads/") {
+		t.Fatalf("upload key %q %v", uploadKey, err)
+	}
+	if data, err := a.GetUpload(ctx, uploadKey); err != nil || !bytes.Equal(data, source) {
+		t.Fatal("upload roundtrip failed", err)
+	}
+	if _, err := a.PutUpload(ctx, nil); err == nil {
+		t.Fatal("an empty upload was stored")
+	}
+	if _, err := a.PutUpload(ctx, make([]byte, MaxUploadBytes+1)); err == nil {
+		t.Fatal("an oversized upload was stored")
+	}
+	if _, err := a.GetUpload(ctx, "snapshots/"+strings.Repeat("a", 64)+".tar.gz"); err == nil {
+		t.Fatal("a snapshot key was read as an upload")
+	}
 	// The orphan sweep lists objects older than a cutoff, by prefix.
 	if old, err := a.ListObjects(ctx, "sbom/", time.Now().Add(time.Minute), 10); err != nil || len(old) != 1 || old[0] != key {
 		t.Fatalf("listing %v %v", old, err)
@@ -104,7 +122,13 @@ func TestS3ArtifactsRoundTripAndTamper(t *testing.T) {
 	if _, err := a.GetSnapshot(ctx, snapKey); err == nil {
 		t.Fatal("snapshot corruption not detected")
 	}
-	for _, object := range []string{key, planKey, snapKey} {
+	if _, err := a.client.PutObject(ctx, a.bucket, uploadKey, strings.NewReader("tampered"), 8, minio.PutObjectOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.GetUpload(ctx, uploadKey); err == nil {
+		t.Fatal("upload corruption not detected")
+	}
+	for _, object := range []string{key, planKey, snapKey, uploadKey} {
 		if err := a.client.RemoveObject(ctx, a.bucket, object, minio.RemoveObjectOptions{}); err != nil {
 			t.Fatal(err)
 		}

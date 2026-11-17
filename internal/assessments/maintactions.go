@@ -70,7 +70,7 @@ func (s *Store) Reset(ctx context.Context, scope string, target uuid.UUID, actor
 		if hold {
 			return nil, ErrLegalHold
 		}
-		if err := count("findings", `WITH doomed AS (SELECT id FROM `+s.schema+`.findings WHERE asset_id=$1), i AS (UPDATE `+s.schema+`.integrity_events SET finding_id=NULL WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), e AS (DELETE FROM `+s.schema+`.finding_events WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), af AS (DELETE FROM `+s.schema+`.assessment_findings WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1) DELETE FROM `+s.schema+`.findings WHERE id IN (SELECT id FROM doomed)`, target); err != nil {
+		if err := count("findings", `WITH doomed AS (SELECT id FROM `+s.schema+`.findings WHERE asset_id=$1), i AS (UPDATE `+s.schema+`.integrity_events SET finding_id=NULL WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), e AS (DELETE FROM `+s.schema+`.finding_events WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), fc AS (DELETE FROM `+s.schema+`.finding_comments WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), af AS (DELETE FROM `+s.schema+`.assessment_findings WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1) DELETE FROM `+s.schema+`.findings WHERE id IN (SELECT id FROM doomed)`, target); err != nil {
 			return nil, err
 		}
 	}
@@ -121,6 +121,9 @@ func (s *Store) Rebuild(ctx context.Context, actor uuid.UUID, limit int) (int, e
 		request := Request{Target: Target{Type: t.Type, Repository: t.Repository, Ref: t.Ref, Platform: t.Platform, Provider: t.Provider}, Connection: it.connection}
 		if t.PullRequest != nil {
 			continue // a pull request's head is assessed by its own events
+		}
+		if t.Type == "upload" {
+			request.Target.Commit = t.Commit // an archive never moves: rebuild the same one
 		}
 		request.Trigger.Origin = "rebuild"
 		_, replayed, err := s.Enqueue(ctx, request, SchedulerActor, "rebuild", "rebuild-"+window+"-"+Hash([]byte(it.connection + t.Repository + t.Ref))[:16])

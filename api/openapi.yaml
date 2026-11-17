@@ -548,6 +548,50 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Assets]
+      operationId: createAsset
+      security: [{bearerAuth: [write]}]
+      summary: Register an asset by hand
+      description: |
+        Registers one repository or image under an existing connection when discovery has not listed it, optionally with its owner and attributes. `type` defaults to the connection's own (`github_repo`, `gitlab_repo` or `container_image`). The asset is created with `flags.manual` true and is `in_scope` only when the connection's scope matches its locator. Discovery never marks a manual asset inaccessible; it only follows the current scope. Registering a locator that exists returns `200` with the existing asset (git hosts compare case-insensitively). `distribution` and `legal_hold` need `admin`. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AssetCreate'}}}
+      responses:
+        '201':
+          description: Created
+          headers: {ETag: {$ref: '#/components/headers/ETag'}, Location: {schema: {type: string}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Asset'}}}
+        '200':
+          description: The asset already exists
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Asset'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets:import:
+    post:
+      tags: [Assets]
+      operationId: importAssets
+      security: [{bearerAuth: [write]}]
+      summary: Register many assets
+      description: |
+        Registers 1 to 500 assets under one connection, each with its own result (`created`, `exists` or `invalid`); one invalid item never fails the rest. Items follow `POST /assets`. Answers `207`. Scope `write`; `distribution` and `legal_hold` need `admin`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/AssetImport'}}}
+      responses:
+        '207':
+          description: One result per item
+          content: {application/json: {schema: {$ref: '#/components/schemas/AssetImportResult'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /assets/{id}:
     parameters: [{$ref: '#/components/parameters/Id'}]
     get:
@@ -562,6 +606,20 @@ paths:
           headers: {ETag: {$ref: '#/components/headers/ETag'}}
           content: {application/json: {schema: {$ref: '#/components/schemas/Asset'}}}
         '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    delete:
+      tags: [Assets]
+      operationId: deleteAsset
+      security: [{bearerAuth: [admin]}]
+      summary: Delete a manually registered asset
+      description: |
+        Removes an asset registered with `POST /assets` or `POST /assets:import` that nothing refers to. An asset discovered by its connection answers `409`: narrow the connection's scope instead, or it would reappear at the next discovery. An asset with assessments, findings, settings or a legal hold also answers `409`; its history is kept. An `uploaded` asset follows the same rule and is deleted together with its archives; one that has been assessed answers `409` (delete its uploads, or set the `uploaded_archives` retention class). Audited. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -583,6 +641,199 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '409': {$ref: '#/components/responses/Conflict'}
         '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /uploads:
+    post:
+      tags: [Assets]
+      operationId: uploadSource
+      security: [{bearerAuth: [write]}]
+      summary: Upload a source archive
+      description: |
+        Assesses source code that is not in a connected repository, such as a vendor drop or a build output. Send `multipart/form-data` with `name` (the asset becomes `upload/<name>`, lowercase letters, digits, `.`, `_`, `-`, at most 100 characters), `file` (a gzip-compressed tar archive of at most 64 MiB) and optionally `ref` (a label for this version, default `upload`) and `assess` (`false` stores the archive without scanning it).
+        The first upload for a name creates an asset of type `uploaded`, in scope, on a built-in connection that `GET /connections` does not list and that cannot be edited. Each distinct archive is a revision whose `commit` is the first 40 hex digits of its SHA-256; uploading the same archive again returns the existing upload (`200`) and queues another assessment. The scan, register, SBOM, licences and SAST work as for a repository; QA runs and remediation plans do not apply. Archives are kept until deleted with `DELETE /assets/{id}/uploads/{upload}` or removed by the `uploaded_archives` retention class (those replaced by a newer upload with the same `ref`). If the asset already has a running assessment the archive is kept and `assessment_error` says so; queue it later with `POST /assessments` and `target.type` `upload`. Send `Idempotency-Key` to make a retry queue one assessment. Audited. Scope `write`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, file]
+              properties:
+                name: {type: string, maxLength: 100, example: vendor-portal}
+                ref: {type: string, maxLength: 128, example: v2.3.0}
+                assess: {type: string, enum: ['true', 'false'], default: 'true'}
+                file: {type: string, format: binary}
+      responses:
+        '201':
+          description: New archive stored; the assessment is queued unless `assess` was false
+          headers: {Location: {schema: {type: string}, description: The queued assessment}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/UploadResult'}}}
+        '200':
+          description: This archive was already uploaded for the asset
+          content: {application/json: {schema: {$ref: '#/components/schemas/UploadResult'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '413': {description: The archive is larger than 64 MiB, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '415': {description: The body is not multipart/form-data, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '422': {description: The file is not a gzip-compressed tar archive, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '502': {description: Object storage refused the archive, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Object storage is not configured, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /assets/{id}/uploads:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: listAssetUploads
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Archives uploaded for an asset
+      description: The archives of an `uploaded` asset, newest first (at most 200), each with its SHA-256, size, original file name, label and uploader. The archive itself is not returned. `404` for an asset that is not an uploaded one. Scope `read` or `write`.
+      responses:
+        '200': {description: Uploads, content: {application/json: {schema: {$ref: '#/components/schemas/UploadPage'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/uploads/{upload}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - {name: upload, in: path, required: true, schema: {type: string, format: uuid}, description: 'The upload id from `GET /assets/{id}/uploads`'}
+    delete:
+      tags: [Assets]
+      operationId: deleteUpload
+      security: [{bearerAuth: [admin]}]
+      summary: Delete an uploaded archive
+      description: |
+        Removes the stored archive and its record. Assessments that scanned it keep their results, SBOMs and findings; the archive can no longer be scanned again, so a rebuild of that revision fails. The object is deleted unless another upload of the same bytes uses it. Answers `409` when the asset is under legal hold or an assessment of the archive is queued or running (`Retry-After` is set). Audited. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/actions:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: getAssetActions
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: GitHub Actions inventory of a repository
+      description: |
+        What the last check found (INT-014, INT-015): whether Actions is enabled, the workflow list, and per workflow the run numbers seen and any missing between the lowest and highest (a deleted run leaves a hole). `available` is false, with a `reason`, when the credential lacks the read-only Actions permission; `error` is set when the last attempt failed outright, and the other fields then show the last good reading. `404` until a check has run. Checks run on a schedule when `SCRS_ACTIONS_SWEEP_INTERVAL_HOURS` is set, or on demand with `POST /assets/{id}/actions:check`. Scope `read` or `write`.
+      responses:
+        '200': {description: The inventory, content: {application/json: {schema: {$ref: '#/components/schemas/ActionsState'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/actions:check:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Assets]
+      operationId: checkAssetActions
+      security: [{bearerAuth: [write]}]
+      summary: Read a repository's Actions inventory now
+      description: |
+        Reads GitHub's Actions API with the connection's credential (read-only: the repository's Actions permissions, its workflows and up to 500 recent runs of each of up to 30 workflows) and stores the result. It sets the asset's `flags.actions_unused` when Actions is off or there are no workflows, and raises `integrity` entries: `actions_workflows_changed` (low) when the workflow list differs from the previous reading, and `run_number_gap` (medium, high when another integrity entry of medium severity or more is open for the asset and was seen in the last week) for holes in run numbers. Legitimate run deletions cause false positives. A hole already reported does not raise again. Only GitHub repositories of an enabled connection qualify (`409` otherwise); a GitHub outage answers `502`. Scope `write`.
+      responses:
+        '200': {description: The stored inventory, content: {application/json: {schema: {$ref: '#/components/schemas/ActionsState'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '502': {description: GitHub could not be read, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /assets/{id}/links:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: listAssetLinks
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Image-to-source links of an asset
+      description: |
+        A container image lists the repository it was built from (`direction: out`); a repository, or an uploaded source, lists the images built from it (`direction: in`) (CON-012). A link comes from `source: manual` (set with `POST`) or `oci_label`: the worker reads the image's `org.opencontainers.image.source` label at each assessment and links the image to the GitHub or GitLab repository asset it names when exactly one is known. A label is the publisher's claim, not proof, and a label link that no longer matches the image's current label is removed at its next assessment; a manual link never is. Entries of an image carry `source_repository`. Scope `read` or `write`.
+      responses:
+        '200': {description: Links, content: {application/json: {schema: {$ref: '#/components/schemas/AssetLinkList'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Assets]
+      operationId: addAssetLink
+      security: [{bearerAuth: [write]}]
+      summary: Link an image to its source
+      description: |
+        Records that this container image was built from a repository. Name the repository by `to_asset_id`, or by `repository` (`owner/name`, or the GitLab group path; `provider` narrows it when both hosts have that path). The image must be a `container_image` and the target a `github_repo`, `gitlab_repo` or `uploaded` asset. Linking again returns the existing link (`200`). A repository path that matches several assets answers `409`. Audited. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [kind], properties: {kind: {type: string, enum: [built_from]}, to_asset_id: {type: string, format: uuid}, repository: {type: string, maxLength: 300, example: acme/api}, provider: {type: string, enum: [github, gitlab]}}}}}
+      responses:
+        '201': {description: Linked, content: {application/json: {schema: {$ref: '#/components/schemas/AssetLink'}}}}
+        '200': {description: Already linked, content: {application/json: {schema: {$ref: '#/components/schemas/AssetLink'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/links/{to}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - {name: to, in: path, required: true, schema: {type: string, format: uuid}, description: The repository asset the image is linked to}
+    delete:
+      tags: [Assets]
+      operationId: removeAssetLink
+      security: [{bearerAuth: [write]}]
+      summary: Remove an image-to-source link
+      description: Removes the link from this image to that repository, whether it was set by hand or from a label (a label link returns at the next assessment if the label still names it). Audited. Scope `write`.
+      parameters: [{name: kind, in: query, schema: {type: string, enum: [built_from], default: built_from}}]
+      responses:
+        '204': {description: Removed}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/revisions:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: listAssetRevisions
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Assessed revisions of an asset
+      description: |
+        Each revision (ref and commit) with a successful assessment, newest first, described by its newest successful assessment: its verdict, how many assessments covered it, whether it was imported and whether an SBOM exists. Page with `next_before` as `before`. Compare two revisions' components with the assessment ids. Scope `read` or `write`.
+      parameters:
+        - {name: ref, in: query, schema: {type: string, maxLength: 255}}
+        - {name: before, in: query, schema: {type: string, format: date-time}, description: Only revisions assessed before this time}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+      responses:
+        '200': {description: Revisions, content: {application/json: {schema: {$ref: '#/components/schemas/AssetRevisionPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/sbom-diff:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Assets]
+      operationId: diffAssetSBOM
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Compare the packages of two revisions
+      description: |
+        Compares the components of two successful assessments of the same asset. `from` and `to` each name a revision: a commit or image digest (the newest successful assessment of it is used) or an assessment id of this asset. `GET /assets/{id}/revisions` lists the candidates. Packages are matched by ecosystem and name. `added` and `removed` are packages present on one side only; `changed` have a different set of versions; `license_changed` keep their versions but declare a different licence expression. `unchanged` counts the rest. Each list is cut at `limit` entries (default 500, at most 5000), with `totals` and `truncated` showing what was cut. Scope `read` or `write`.
+      parameters:
+        - {name: from, in: query, required: true, schema: {type: string}, description: 'Commit, image digest (`sha256:...`) or assessment id'}
+        - {name: to, in: query, required: true, schema: {type: string}, description: 'Commit, image digest (`sha256:...`) or assessment id'}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 5000, default: 500}}
+      responses:
+        '200': {description: The differences, content: {application/json: {schema: {$ref: '#/components/schemas/SBOMDiff'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {description: 'No successful assessment of this asset matches `from` or `to`', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -1103,6 +1354,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
       responses:
         '200': {description: Page of register entries, content: {application/json: {schema: {$ref: '#/components/schemas/FindingPage'}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -1121,6 +1374,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
       responses:
         '200': {description: Counts, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterSummary'}}}}
         '400': {$ref: '#/components/responses/BadRequest'}
@@ -1140,6 +1395,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
         - {name: days, in: query, schema: {type: integer, minimum: 1, maximum: 366, default: 30}}
       responses:
         '200': {description: Daily points, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterTimeseries'}}}}
@@ -1160,6 +1417,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
         - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 10}}
       responses:
         '200': {description: Ranked assets, content: {application/json: {schema: {$ref: '#/components/schemas/RegisterTopAssets'}}}}
@@ -1180,6 +1439,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
         - {name: format, in: query, schema: {type: string, enum: [csv, json], default: csv}}
       responses:
         '200': {description: The file, content: {text/csv: {schema: {type: string}}, application/json: {schema: {$ref: '#/components/schemas/RegisterExport'}}}}
@@ -1200,6 +1461,8 @@ paths:
         - {name: status, in: query, schema: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}, description: 'An accepted entry whose waiver has expired counts as `open`'}
         - {name: severity, in: query, schema: {type: string, enum: [critical, high, medium, low, info, unknown]}}
         - {name: type, in: query, schema: {type: string, maxLength: 40}, description: 'Finding type, for example `vulnerability` or `ai_review`'}
+        - {name: assignee, in: query, schema: {type: string, maxLength: 100}, description: Entries assigned to this identifier (case-insensitive)}
+        - {name: unassigned, in: query, schema: {type: boolean}, description: 'true selects entries nobody holds'}
       responses:
         '200': {description: OpenVEX document, content: {application/json: {schema: {type: object}}}}
         '422': {description: 'More than 50000 statements; narrow with `asset_id`', content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
@@ -1235,6 +1498,77 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '401': {$ref: '#/components/responses/Unauthorized'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /register/{id}/assignee:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    put:
+      tags: [Risk register]
+      operationId: assignFinding
+      security: [{bearerAuth: [write]}]
+      summary: Assign a register entry
+      description: |
+        Sets who holds the entry, or clears it with an empty `assignee`. SCRS has no user model, so the assignee is a free-text identifier you choose (an email, a username or a team name, at most 100 characters); filter by it with `assignee` on `GET /register`. `on_behalf_of` optionally names the person the caller acts for; it is recorded as claimed, next to the verified token name, in the entry's history (`GET /register/{id}/events`, action `assigned`). Setting the same assignee again records nothing. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [assignee], properties: {assignee: {type: string, maxLength: 100, example: alex@example.com}, on_behalf_of: {type: string, maxLength: 100}}}}}
+      responses:
+        '204': {description: Assigned}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /register/{id}/comments:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Risk register]
+      operationId: listFindingComments
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Comments on a register entry
+      description: Oldest first, 200 per page; pass `next_cursor` as `cursor` for the next page. Scope `read` or `write`.
+      parameters: [{name: cursor, in: query, schema: {type: string, format: uuid}}]
+      responses:
+        '200': {description: Page of comments, content: {application/json: {schema: {$ref: '#/components/schemas/CommentPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Risk register]
+      operationId: addFindingComment
+      security: [{bearerAuth: [write]}]
+      summary: Comment on a register entry
+      description: |
+        Adds a note of 1 to 4000 characters to the entry's discussion and records `comment.added` in its history. `author` is the name of the token that wrote it (verified); `on_behalf_of` is a person's name the caller claims to act for and is stored as claimed. Comments cannot be edited. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [body], properties: {body: {type: string, minLength: 1, maxLength: 4000, example: Waiting on the vendor patch; revisit Friday}, on_behalf_of: {type: string, maxLength: 100}}}}}
+      responses:
+        '201':
+          description: The comment
+          headers: {Location: {schema: {type: string}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Comment'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /register/{id}/comments/{comment}:
+    parameters:
+      - {$ref: '#/components/parameters/Id'}
+      - {name: comment, in: path, required: true, schema: {type: string, format: uuid}}
+    delete:
+      tags: [Risk register]
+      operationId: deleteFindingComment
+      security: [{bearerAuth: [admin]}]
+      summary: Delete a comment
+      description: Removes the comment. The entry's history keeps that it was deleted, by whom and whose it was, without the text. Scope `admin`.
+      responses:
+        '204': {description: Deleted}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
   /register/{id}/events:
     parameters: [{$ref: '#/components/parameters/Id'}]
@@ -2085,6 +2419,102 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /advisories:
+    get:
+      tags: [Threat intelligence]
+      operationId: searchAdvisories
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Search advisories
+      description: |
+        Searches every synced advisory (`nvd`, `cve5`, `local`) by id, alias, summary or details (`q`, a case-insensitive substring; `%` and `_` match themselves), and filters by origin, affected ecosystem and package (exact, case-insensitive), alias, withdrawn state and modification time. Ordered by id then origin; pass `next_cursor` as `cursor`. Results are summaries: read one in full with `GET /advisories/{id}`. Scope `read` or `write`.
+      parameters:
+        - {name: q, in: query, schema: {type: string, maxLength: 100}}
+        - {name: origin, in: query, schema: {type: string, enum: [nvd, cve5, local]}}
+        - {name: ecosystem, in: query, schema: {type: string}, example: npm}
+        - {name: package, in: query, schema: {type: string}}
+        - {name: alias, in: query, schema: {type: string}, description: 'An id the advisory is also known by, for example a CVE'}
+        - {name: withdrawn, in: query, schema: {type: boolean}}
+        - {name: since, in: query, schema: {type: string, format: date-time}, description: Modified at or after}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Page of advisories, content: {application/json: {schema: {$ref: '#/components/schemas/AdvisoryPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    post:
+      tags: [Threat intelligence]
+      operationId: createLocalAdvisory
+      security: [{bearerAuth: [write]}]
+      summary: Create a local advisory
+      description: |
+        Writes an OSV 1.9.2 record for something no public database knows, such as an internal package found compromised (OSV-008). SCRS assigns the id `x_SCRS-<year>-<number>` (the `x_` prefix marks a local database). Name each affected package with its explicit `versions`, or `all_versions` true for a package bad in every release: SCRS has no version comparators, so ranges are not accepted. A reference needs an OSV type and an http or https URL. The advisory is searchable, appears in `GET /intel/vulnerabilities/{id}`, and `GET /advisories/{id}/affected` lists the components in the latest assessments that match it. It does not create register entries or change a verdict by itself. Audited. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/LocalAdvisoryInput'}}}
+      responses:
+        '201':
+          description: The stored OSV record
+          headers: {Location: {schema: {type: string}}}
+          content: {application/json: {schema: {type: object}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /advisories/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}, description: 'CVE, GHSA or local `x_SCRS-` id'}
+    get:
+      tags: [Threat intelligence]
+      operationId: getAdvisory
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Read one advisory
+      description: |
+        The same view as `GET /intel/vulnerabilities/{id}`: the records of every origin, severity sources, CWEs and vendor statements. Scope `read` or `write`.
+      parameters: [{name: purl, in: query, schema: {type: string}}]
+      responses:
+        '200': {description: Advisory, content: {application/json: {schema: {type: object}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /advisories/{id}:withdraw:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}, description: 'A local `x_SCRS-` id'}
+    post:
+      tags: [Threat intelligence]
+      operationId: withdrawLocalAdvisory
+      security: [{bearerAuth: [write]}]
+      summary: Withdraw a local advisory
+      description: Marks a local advisory withdrawn with a reason (8 to 1000 characters). The record is kept and audited. Only local advisories can be withdrawn; public records are managed by their source. Scope `write`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [reason], properties: {reason: {type: string, minLength: 8, maxLength: 1000}}}}}
+      responses:
+        '200': {description: The withdrawn record, content: {application/json: {schema: {type: object}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /advisories/{id}/affected:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: string}, description: 'A local `x_SCRS-` id'}
+    get:
+      tags: [Threat intelligence]
+      operationId: listAdvisoryAffected
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Components a local advisory names
+      description: |
+        For a local advisory that is not withdrawn, the components in the newest successful assessment of each asset and ref whose ecosystem, name and version match an affected package (at most 1000 rows; `truncated` says when more exist). It reads stored inventories: nothing is rescanned and no register entry is created. Scope `read` or `write`.
+      responses:
+        '200': {description: Matching components, content: {application/json: {schema: {$ref: '#/components/schemas/AdvisoryAffected'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /intel/vex-documents:
     get:
       tags: [Threat intelligence]
@@ -2225,6 +2655,105 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
   # ---------------------------------------------------------------- Operations
+  /incidents:
+    post:
+      tags: [Operations]
+      operationId: createIncident
+      security: [{bearerAuth: [admin]}]
+      summary: Sweep what an account touched
+      description: |
+        Evidence for a suspected account compromise (INT-018). Give one to twenty actor logins and a time window (`since`, and `until`, default now; at most 366 days). SCRS collects, read-only: the revisions those actors triggered scans of (`touched`), integrity signals raised for them, the branches and pull requests in the stored webhook deliveries (only as far back as inbound events are retained), workflow, install-hook, remote-execution and large-file entries found in the touched revisions, and per touched asset and ref the last known good revision and the newest mirror snapshots to restore from. Unless `reassess` is false it also queues a fresh scan of each touched revision, pinned to its commit, at most `max_reassess` (default 50, at most 200). Each list is cut at 500 entries and `report.truncated` names the lists that were. Actors are the identities events and triggers claim, never verified; matching ignores case. The sweep contains nothing: suspending the account, rotating secrets and restoring code stay manual or an automation's runbook. Audited. Scope `admin`.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/IncidentRequest'}}}
+      responses:
+        '201':
+          description: The incident with its report
+          headers: {Location: {schema: {type: string}}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/Incident'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    get:
+      tags: [Operations]
+      operationId: listIncidents
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: List incidents
+      description: Newest first, without reports; read one with `GET /incidents/{id}`. Scope `read` or `write`.
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Page of incidents, content: {application/json: {schema: {$ref: '#/components/schemas/IncidentPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /incidents/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Operations]
+      operationId: getIncident
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Read an incident
+      description: The report written when the incident was created, with the current status and verdict of the re-assessments it queued (`reassessments`, counted by status in `reassessment_counts`). Scope `read` or `write`.
+      responses:
+        '200': {description: The incident, content: {application/json: {schema: {$ref: '#/components/schemas/Incident'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /jobs:
+    get:
+      tags: [Operations]
+      operationId: listJobs
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: List background jobs
+      description: |
+        One newest-first list of the platform's queued and finished work, for a status page or to find what is stuck: assessments, QA runs, QA test generation, AI summaries and reviews, compliance reports, git mirrors and Dependency-Track uploads. Each job has a normalised `status` (`queued`, `running`, `succeeded`, `failed`, `cancelled`), its own `state`, and `resource`, the path of the endpoint that returns the full record. Filter by `kind`, `status`, `asset_id` and `since` (created at or after). A QA run whose tests fail is a succeeded job (its `state` is `failed`). Scheduled maintenance jobs are not listed; see `GET /maintenance/schedule`. Scope `read` or `write`.
+      parameters:
+        - {name: kind, in: query, schema: {type: string, enum: [assessment, qa_run, qa_generation, ai_summary, ai_review, report, mirror, dependency_track_upload]}}
+        - {name: status, in: query, schema: {type: string, enum: [queued, running, succeeded, failed, cancelled]}}
+        - {name: asset_id, in: query, schema: {type: string, format: uuid}, description: Jobs of one asset (reports have none)}
+        - {name: since, in: query, schema: {type: string, format: date-time}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+        - {name: cursor, in: query, schema: {type: string}}
+      responses:
+        '200': {description: Page of jobs, content: {application/json: {schema: {$ref: '#/components/schemas/JobPage'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /jobs/{id}:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Operations]
+      operationId: getJob
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Read one job
+      description: Finds the job whatever its kind and returns the normalised view; follow `resource` for the full record. Scope `read` or `write`.
+      responses:
+        '200': {description: The job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /jobs/{id}:cancel:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    post:
+      tags: [Operations]
+      operationId: cancelJob
+      security: [{bearerAuth: [admin]}]
+      summary: Cancel a job
+      description: Stops a queued or running assessment (same effect as `DELETE /assessments/{id}`) or QA run (same as `POST /qa/runs/{id}:cancel`). Other kinds cannot be stopped and answer `409`, as does a job that already finished. Audited. Scope `admin`.
+      responses:
+        '200': {description: The job after cancelling, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
   /maintenance/run:
     post:
       tags: [Operations]
@@ -2518,6 +3047,80 @@ paths:
       description: The fixed verdict rules (TRG-006) as text. The gate is not configurable in this release; licence entries follow the licence policy. Scope `read` or `write`.
       responses:
         '200': {description: Gate rules, content: {application/json: {schema: {type: object, properties: {kind: {const: gate}, builtin: {type: boolean}, policy: {type: object}}}}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /policies/dependencies:
+    get:
+      tags: [Threat intelligence]
+      operationId: getDependencyPolicy
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Dependency checks policy
+      description: |
+        The two optional package checks. Both start off. `min_release_age_days` flags a package version published fewer than that many days ago (MAL-005; needs deps.dev, and covers npm, PyPI, Go, Maven, crates.io, NuGet and RubyGems). `typosquat` flags an npm or PyPI package name that is one edit away from a popular package, or equal to it once `-`, `_` and `.` are ignored (MAL-006; a curated list, so it misses much and can flag a legitimate neighbour). Both produce `suspicious_dependency` entries (`SCRS-NEW-RELEASE`, `SCRS-TYPOSQUAT`) of severity `medium`, which inform and never change a verdict. Each assessment reports them in its `dependency_policy` stage. Scope `read` or `write`.
+      responses:
+        '200':
+          description: Settings and revision
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/DependencyPolicy'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Threat intelligence]
+      operationId: setDependencyPolicy
+      security: [{bearerAuth: [admin]}]
+      summary: Change the dependency checks
+      description: Replaces both settings. `If-Match` must carry the current revision (`428` when missing, `409` when stale). The change applies from the next assessment; existing entries close when a scan with the check on no longer reports them, and stay open if the check could not cover every package. Audited. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, required: [min_release_age_days, typosquat], properties: {min_release_age_days: {type: integer, minimum: 0, maximum: 365, description: 0 turns the release-age check off}, typosquat: {type: boolean}}}}}
+      responses:
+        '200':
+          description: Stored settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/DependencyPolicy'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+  /policies/integrity:
+    get:
+      tags: [Threat intelligence]
+      operationId: getIntegrityPolicy
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Behavioural and size signals policy
+      description: |
+        The optional integrity signals (INT-003, INT-012), all off until an admin sets them. From push webhooks (GitHub and GitLab): `author_new_days` flags a commit author not seen in the repository for that many days or never (`author_new`, high on the default branch, else medium); `off_hours` flags a push at an hour the author rarely pushes at, after at least 20 recorded pushes (`author_off_hours`, low); `pusher_differs` flags a pusher who is not the commit author, ignoring merges and web merges (`pusher_differs_from_author`, low). From scans: `large_file_bytes` flags a file above that size that is new since the previous scan of the ref (`SCRS-LARGE-NEW-FILE`, high when the pusher's first push to the repository left that commit, else medium) and `ci_growth_bytes` flags a CI or build file (workflows, Dockerfile, Makefile, package manifests) that grew by more than that many bytes (`SCRS-CI-FILE-GROWTH`, medium). Who pushed what is recorded for every push even while a signal is off, so enabling one later has history. A repository with no recorded authors only builds a baseline. Authors are the claimed identities in the event, never verified. Scope `read` or `write`.
+      responses:
+        '200':
+          description: Settings and revision
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/IntegrityPolicy'}}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+    put:
+      tags: [Threat intelligence]
+      operationId: setIntegrityPolicy
+      security: [{bearerAuth: [admin]}]
+      summary: Change the integrity signals
+      description: Replaces every setting; a field left out becomes off. `If-Match` must carry the current revision (`428` when missing, `409` when stale). Applies from the next push or scan. Audited. Scope `admin`.
+      parameters: [{$ref: '#/components/parameters/IfMatch'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object, additionalProperties: false, properties: {author_new_days: {type: integer, minimum: 0, maximum: 3650}, off_hours: {type: boolean}, pusher_differs: {type: boolean}, large_file_bytes: {type: integer, minimum: 0, maximum: 1073741824}, ci_growth_bytes: {type: integer, minimum: 0, maximum: 1073741824}}}}}
+      responses:
+        '200':
+          description: Stored settings
+          headers: {ETag: {$ref: '#/components/headers/ETag'}}
+          content: {application/json: {schema: {$ref: '#/components/schemas/IntegrityPolicy'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '428': {$ref: '#/components/responses/PreconditionRequired'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
@@ -3815,6 +4418,7 @@ components:
   schemas:
     Error:
       type: object
+      example: {"error": "asset not found"}
       required: [error]
       properties: {error: {type: string}}
     Status:
@@ -3830,6 +4434,7 @@ components:
         info: {type: object, additionalProperties: true, description: 'Non-sensitive facts such as analyzer counts, runner slots and queue, or the last worker heartbeat'}
     PlatformStatus:
       type: object
+      example: {"status": "degraded", "checked_at": "2026-11-16T09:30:00Z", "components": {"database": {"status": "ok", "checked_at": "2026-11-16T09:30:00Z"}, "redis": {"status": "ok", "checked_at": "2026-11-16T09:30:00Z"}, "worker": {"status": "ok", "checked_at": "2026-11-16T09:30:00Z", "info": {"last_heartbeat": "2026-11-16T09:30:00Z"}}, "clamav": {"status": "degraded", "detail": "signatures older than 48 hours", "checked_at": "2026-11-16T09:30:00Z"}, "qa_runner": {"status": "not_configured", "checked_at": "2026-11-16T09:30:00Z"}}}
       required: [status, checked_at, components]
       properties:
         status: {type: string, enum: [ok, degraded, down]}
@@ -4039,6 +4644,7 @@ components:
         problems: {type: array, items: {type: string}}
     Token:
       type: object
+      example: {"id": "7e1c0b52-4a9d-4f36-8b07-d3a5c9e2f148", "name": "frontend-dashboard", "prefix": "scrs_9fK2", "scopes": ["read"], "ip_allow_list": ["203.0.113.0/24"], "expires_at": "2027-02-01T00:00:00Z", "created_at": "2026-11-16T09:30:00Z", "last_used_at": "2026-11-16T09:30:00Z", "revoked_at": null}
       properties:
         id: {type: string, format: uuid}
         name: {type: string}
@@ -4073,6 +4679,7 @@ components:
         credential: {type: object, description: Encrypted at rest and never returned}
     Connection:
       type: object
+      example: {"id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "provider": "github", "name": "acme-github", "config": {"org": "acme"}, "scope": {"include": ["acme/*"], "exclude": ["acme/archive-*"]}, "status": {"state": "ok", "checked_at": "2026-11-16T09:30:00Z", "counts": {"discovered": 42, "in_scope": 31}}, "enabled": true, "webhook": {"configured": true, "path": "/scrs/v1/ingest/github/acme-github", "rotated_at": "2026-11-16T09:30:00Z"}}
       properties:
         id: {type: string, format: uuid}
         provider: {$ref: '#/components/schemas/Provider'}
@@ -4090,15 +4697,16 @@ components:
         path: {type: string, examples: ['/scrs/v1/ingest/github/acme-github']}
         hook_url: {type: string, description: GitHub only; the public hook URL when GitHub calls a relay rather than path}
         rotated_at: {type: string, format: date-time}
-    AssetType: {type: string, enum: [github_repo, gitlab_repo, container_image]}
+    AssetType: {type: string, enum: [github_repo, gitlab_repo, container_image, uploaded], description: '`uploaded` is a source archive sent with `POST /uploads`; it belongs to the built-in upload connection and has no repository behind it'}
     Asset:
       type: object
+      example: {"id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "type": "github_repo", "locator": "acme/api", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "flags": {"discovered": true, "manual": false, "accessible": true, "in_scope": true}, "owner_id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "environment": "prod", "criticality": 4, "exposure": "internet", "labels": {"team": "payments"}, "legal_hold": false, "revision": 3}
       properties:
         id: {type: string, format: uuid}
         type: {$ref: '#/components/schemas/AssetType'}
         locator: {type: string, description: 'owner/repo, group/subgroup/project, or registry/repository', example: acme/api}
         connection_id: {type: string, format: uuid}
-        flags: {type: object, description: 'discovered, accessible, in_scope'}
+        flags: {type: object, description: 'discovered, accessible, in_scope; manual for assets registered by hand; actions_unused for a GitHub repository whose last Actions check found Actions off or no workflows'}
         owner_id: {type: [string, 'null'], format: uuid}
         environment: {type: string, enum: ['', dev, stg, prod]}
         criticality: {type: integer, minimum: 0, maximum: 5}
@@ -4109,9 +4717,340 @@ components:
         revision: {type: integer}
     AssetPage:
       type: object
+      example: {"items": [{"id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "type": "github_repo", "locator": "acme/api", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "flags": {"discovered": true, "manual": false, "accessible": true, "in_scope": true}, "owner_id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "environment": "prod", "criticality": 4, "exposure": "internet", "labels": {"team": "payments"}, "legal_hold": false, "revision": 3}], "next_cursor": "eyJsIjoiYWNtZS9hcGkifQ"}
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Asset'}}
         next_cursor: {type: string}
+    AssetCreate:
+      type: object
+      example: {"connection": "acme-github", "locator": "acme/legacy-billing", "owner_id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "environment": "prod", "criticality": 5, "labels": {"team": "billing"}}
+      additionalProperties: false
+      required: [connection, locator]
+      properties:
+        connection: {type: string, description: Name of an existing connection}
+        locator: {type: string, maxLength: 300, example: org/repo}
+        type: {type: string, enum: [github_repo, gitlab_repo, container_image], description: Defaults to the connection's own type}
+        owner_id: {type: [string, 'null'], format: uuid}
+        environment: {type: string, enum: ['', dev, stg, prod]}
+        criticality: {type: integer, minimum: 0, maximum: 5}
+        exposure: {type: string, enum: ['', internet, internal, offline]}
+        labels: {type: object, maxProperties: 50, additionalProperties: {type: string, maxLength: 256}}
+        legal_hold: {type: boolean, description: Needs admin scope}
+        distribution: {$ref: '#/components/schemas/Distribution', description: Needs admin scope}
+    AssetImport:
+      type: object
+      example: {"connection": "acme-github", "items": [{"locator": "acme/api", "environment": "prod"}, {"locator": "acme/web", "environment": "stg"}, {"locator": ""}]}
+      additionalProperties: false
+      required: [connection, items]
+      properties:
+        connection: {type: string}
+        items:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items:
+            type: object
+            additionalProperties: false
+            required: [locator]
+            properties:
+              locator: {type: string, maxLength: 300}
+              type: {type: string, enum: [github_repo, gitlab_repo, container_image]}
+              owner_id: {type: [string, 'null'], format: uuid}
+              environment: {type: string, enum: ['', dev, stg, prod]}
+              criticality: {type: integer, minimum: 0, maximum: 5}
+              exposure: {type: string, enum: ['', internet, internal, offline]}
+              labels: {type: object, maxProperties: 50, additionalProperties: {type: string, maxLength: 256}}
+              legal_hold: {type: boolean}
+              distribution: {$ref: '#/components/schemas/Distribution'}
+    AssetImportResult:
+      type: object
+      example: {"items": [{"index": 0, "status": "created", "in_scope": true, "asset": {"id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "type": "github_repo", "locator": "acme/api", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "flags": {"discovered": true, "manual": false, "accessible": true, "in_scope": true}, "owner_id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "environment": "prod", "criticality": 4, "exposure": "internet", "labels": {"team": "payments"}, "legal_hold": false, "revision": 3}}, {"index": 1, "status": "exists", "in_scope": true, "asset": {"id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "type": "github_repo", "locator": "acme/web", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "flags": {"discovered": true, "manual": false, "accessible": true, "in_scope": true}, "owner_id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "environment": "stg", "criticality": 4, "exposure": "internet", "labels": {"team": "payments"}, "legal_hold": false, "revision": 3}}, {"index": 2, "status": "invalid", "error": "locator is required"}]}
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              index: {type: integer}
+              status: {type: string, enum: [created, exists, invalid]}
+              error: {type: string}
+              in_scope: {type: boolean, description: Whether the connection's scope matches the locator}
+              asset: {$ref: '#/components/schemas/Asset'}
+    AssetLink:
+      type: object
+      example: {"kind": "built_from", "direction": "out", "asset": {"id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "type": "github_repo", "locator": "acme/api"}, "source": "oci_label", "created_at": "2026-11-17T12:00:00Z"}
+      properties:
+        kind: {type: string, enum: [built_from]}
+        direction: {type: string, enum: [out, in], description: '`out`: this asset is the image and the other end is its source. `in`: this asset is the source and the other end is an image built from it'}
+        asset:
+          type: object
+          properties:
+            id: {type: string, format: uuid}
+            type: {$ref: '#/components/schemas/AssetType'}
+            locator: {type: string}
+        source: {type: string, enum: [manual, oci_label]}
+        created_at: {type: string, format: date-time}
+    AssetLinkList:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/AssetLink'}}
+    ActionsState:
+      type: object
+      example: {"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "available": true, "enabled": true, "workflows": [{"id": 1001, "name": "CI", "path": ".github/workflows/ci.yml", "state": "active", "runs": 97, "min_run": 4, "max_run": 104, "missing": [31, 32], "missing_count": 2}], "runs_truncated": false, "checked_at": "2026-11-17T12:00:00Z"}
+      properties:
+        asset_id: {type: string, format: uuid}
+        available: {type: boolean, description: False when the credential cannot read Actions}
+        reason: {type: string}
+        enabled: {type: boolean}
+        workflows:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              name: {type: string}
+              path: {type: string}
+              state: {type: string}
+              runs: {type: integer}
+              min_run: {type: integer}
+              max_run: {type: integer}
+              missing: {type: array, items: {type: integer}, description: At most 50 numbers}
+              missing_count: {type: integer}
+        runs_truncated: {type: boolean, description: A workflow has more runs than were read; only the newest are checked}
+        error: {type: string}
+        checked_at: {type: string, format: date-time}
+    IncidentRequest:
+      type: object
+      additionalProperties: false
+      required: [actors, since]
+      example: {"title": "Suspected token theft, mallory", "actors": ["mallory"], "since": "2026-11-10T00:00:00Z"}
+      properties:
+        title: {type: string, maxLength: 200}
+        actors: {type: array, minItems: 1, maxItems: 20, items: {type: string, maxLength: 100}}
+        since: {type: string, format: date-time}
+        until: {type: string, format: date-time, description: Default now}
+        reassess: {type: boolean, default: true}
+        max_reassess: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Incident:
+      type: object
+      example: {"id": "e5a1c0de-7b42-4d3f-9a6e-0c8f1d2b3a47", "title": "Suspected token theft, mallory", "actors": ["mallory"], "since": "2026-11-10T00:00:00Z", "until": "2026-11-17T12:00:00Z", "created_by": "ir-lead", "created_at": "2026-11-17T12:00:00Z", "report": {"touched": [{"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "locator": "acme/api", "ref": "main", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "verdict": "warn", "actor": "mallory", "at": "2026-11-16T09:30:00Z"}], "signals": [{"kind": "force_push", "severity": "high", "repository": "acme/api", "ref": "refs/heads/main", "actor": "mallory", "at": "2026-11-16T09:29:50Z"}], "branches": [], "pull_requests": [], "changes": [{"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "locator": "acme/api", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "advisory_id": "SCRS-WORKFLOW-CHANGE", "title": "Workflow file changed since prior assessed revision", "severity": "high", "path": ".github/workflows/ci.yml"}], "recovery": [{"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "locator": "acme/api", "ref": "main", "last_known_good": {"commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "assessment_id": "d4f6b8a0-2c1e-4a73-9b5d-8e0f1a2c3b66", "at": "2026-11-02T14:02:40Z"}, "mirrors": []}], "truncated": []}, "reassessments": [], "actors_note": "Actors are the identities named in provider events and in trigger.actor: claims, not verified identities."}
+      properties:
+        id: {type: string, format: uuid}
+        title: {type: string}
+        actors: {type: array, items: {type: string}}
+        since: {type: string, format: date-time}
+        until: {type: string, format: date-time}
+        created_by: {type: string, description: Name of the admin token}
+        created_at: {type: string, format: date-time}
+        report:
+          type: object
+          description: Absent from the list. Each list holds at most 500 entries.
+          properties:
+            touched: {type: array, items: {type: object, properties: {asset_id: {type: string, format: uuid}, locator: {type: string}, ref: {type: string}, commit: {type: string}, assessment_id: {type: string, format: uuid}, verdict: {type: string}, actor: {type: string}, at: {type: string, format: date-time}}}}
+            signals: {type: array, items: {type: object, properties: {kind: {type: string}, severity: {type: string}, repository: {type: string}, ref: {type: string}, commit: {type: string}, actor: {type: string}, at: {type: string, format: date-time}}}}
+            branches: {type: array, items: {type: object, properties: {repository: {type: string}, ref: {type: string}, event: {type: string}, actor: {type: string}, at: {type: string, format: date-time}}}}
+            pull_requests: {type: array, items: {type: object, properties: {repository: {type: string}, ref: {type: string}, number: {type: integer}, title: {type: string}, event: {type: string}, actor: {type: string}, at: {type: string, format: date-time}}}}
+            changes: {type: array, items: {type: object, properties: {asset_id: {type: string, format: uuid}, locator: {type: string}, commit: {type: string}, assessment_id: {type: string, format: uuid}, advisory_id: {type: string}, title: {type: string}, severity: {type: string}, path: {type: string}}}}
+            recovery: {type: array, items: {type: object, properties: {asset_id: {type: string, format: uuid}, locator: {type: string}, ref: {type: string}, last_known_good: {type: [object, 'null'], properties: {commit: {type: string}, assessment_id: {type: string, format: uuid}, at: {type: string, format: date-time}}}, mirrors: {type: array, items: {type: object, properties: {id: {type: string, format: uuid}, created_at: {type: string, format: date-time}, head: {type: string}, size_bytes: {type: integer}}}}}}}
+            truncated: {type: array, items: {type: string}, description: Names of the lists that were cut at 500}
+        reassessments: {type: array, items: {type: object, properties: {assessment_id: {type: string, format: uuid}, asset_id: {type: string, format: uuid}, commit: {type: string}, ref: {type: string}, status: {type: string}, verdict: {type: string}}}}
+        reassessment_counts: {type: object, additionalProperties: {type: integer}}
+        actors_note: {type: string}
+    IncidentPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Incident'}}
+        next_cursor: {type: string}
+    IntegrityPolicy:
+      type: object
+      example: {"revision": 2, "author_new_days": 60, "off_hours": true, "pusher_differs": false, "large_file_bytes": 5242880, "ci_growth_bytes": 20480, "updated_at": "2026-11-16T09:30:00Z"}
+      properties:
+        revision: {type: integer}
+        author_new_days: {type: integer, minimum: 0, maximum: 3650, description: 0 turns the check off}
+        off_hours: {type: boolean}
+        pusher_differs: {type: boolean}
+        large_file_bytes: {type: integer, minimum: 0, maximum: 1073741824, description: 0 turns the check off}
+        ci_growth_bytes: {type: integer, minimum: 0, maximum: 1073741824, description: 0 turns the check off}
+        updated_at: {type: [string, 'null'], format: date-time}
+    DependencyPolicy:
+      type: object
+      example: {"revision": 3, "min_release_age_days": 7, "typosquat": true, "updated_at": "2026-11-16T09:30:00Z"}
+      properties:
+        revision: {type: integer}
+        min_release_age_days: {type: integer, minimum: 0, maximum: 365}
+        typosquat: {type: boolean}
+        updated_at: {type: [string, 'null'], format: date-time}
+    Comment:
+      type: object
+      example: {"id": "7d1e5c2a-9b34-4f68-8a0d-3c5b7e9f1a24", "finding_id": "9a4d2e71-5c08-4f3b-a6d9-0e8b1c7f2a35", "author": "frontend-dashboard", "on_behalf_of": "alex@example.com", "body": "Waiting on the vendor patch; revisit Friday", "created_at": "2026-11-16T09:30:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        finding_id: {type: string, format: uuid}
+        author: {type: string, description: Name of the token that wrote it (verified)}
+        on_behalf_of: {type: string, description: A person the caller says it acts for (claimed, not verified)}
+        body: {type: string}
+        created_at: {type: string, format: date-time}
+    CommentPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Comment'}}
+        next_cursor: {type: string}
+    Job:
+      type: object
+      example: {"id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "kind": "assessment", "status": "running", "state": "running", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "requested_by": "ci-pipeline", "attempts": 1, "created_at": "2026-11-16T09:30:00Z", "completed_at": null, "resource": "/assessments/c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44"}
+      properties:
+        id: {type: string, format: uuid}
+        kind: {type: string, enum: [assessment, qa_run, qa_generation, ai_summary, ai_review, report, mirror, dependency_track_upload]}
+        status: {type: string, enum: [queued, running, succeeded, failed, cancelled], description: Normalised across kinds}
+        state: {type: string, description: 'The kind''s own status, for example `passed` for a QA run or `uploaded` for a Dependency-Track upload'}
+        asset_id: {type: [string, 'null'], format: uuid}
+        assessment_id: {type: [string, 'null'], format: uuid, description: The assessment this job belongs to or was started by}
+        requested_by: {type: string}
+        attempts: {type: integer}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        completed_at: {type: [string, 'null'], format: date-time}
+        resource: {type: string, description: Path of the endpoint that returns the full record, relative to the API base}
+    JobPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Job'}}
+        next_cursor: {type: string}
+    Upload:
+      type: object
+      example: {"id": "4d9c1a7e-2b83-4f60-9e15-7a0c3d8b6f21", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", "commit": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b", "size": 1482211, "filename": "vendor-portal-2.3.0.tar.gz", "label": "v2.3.0", "uploaded_by": "ci-pipeline", "created_at": "2026-11-16T09:30:00Z"}
+      properties:
+        id: {type: string, format: uuid}
+        asset_id: {type: string, format: uuid}
+        sha256: {type: string}
+        commit: {type: string, description: 'The first 40 hex digits of `sha256`; the revision to pass as `target.commit`'}
+        size: {type: integer}
+        filename: {type: string}
+        label: {type: string}
+        uploaded_by: {type: string}
+        created_at: {type: string, format: date-time}
+    UploadPage:
+      type: object
+      properties:
+        items: {type: array, items: {$ref: '#/components/schemas/Upload'}}
+    UploadResult:
+      type: object
+      properties:
+        asset: {$ref: '#/components/schemas/Asset'}
+        upload: {$ref: '#/components/schemas/Upload'}
+        assessment: {$ref: '#/components/schemas/Assessment'}
+        assessment_error: {type: string, description: Present when the archive was kept but no assessment was queued}
+    AssetRevisionPage:
+      type: object
+      example: {"items": [{"ref": "main", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "assessments": 2, "verdict": "fail", "imported": false, "has_sbom": true, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:33:12Z"}, {"ref": "v1.4.0", "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "assessment_id": "d4f6b8a0-2c1e-4a73-9b5d-8e0f1a2c3b66", "assessments": 1, "verdict": "pass", "imported": false, "has_sbom": true, "created_at": "2026-11-02T14:00:00Z", "completed_at": "2026-11-02T14:02:40Z"}], "next_before": ""}
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              ref: {type: string}
+              commit: {type: string}
+              assessment_id: {type: string, format: uuid, description: The newest successful assessment of this revision}
+              assessments: {type: integer, description: Successful assessments of this revision}
+              verdict: {type: string, enum: [pass, warn, fail, incomplete]}
+              imported: {type: boolean}
+              has_sbom: {type: boolean}
+              created_at: {type: string, format: date-time}
+              completed_at: {type: string, format: date-time}
+        next_before: {type: string, description: Pass as `before` for the next page; empty on the last page}
+    SBOMDiff:
+      type: object
+      example: {"from": {"assessment_id": "d4f6b8a0-2c1e-4a73-9b5d-8e0f1a2c3b66", "ref": "v1.4.0", "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678", "components": 212}, "to": {"assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "ref": "main", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "components": 215}, "added": [{"name": "left-pad-ng", "ecosystem": "npm", "versions": ["1.0.2"]}], "removed": [{"name": "request", "ecosystem": "npm", "versions": ["2.88.2"]}], "changed": [{"name": "lodash", "ecosystem": "npm", "from_versions": ["4.17.20"], "to_versions": ["4.17.21"]}], "license_changed": [{"name": "sharp", "ecosystem": "npm", "from_license": "Apache-2.0", "to_license": "LGPL-3.0-only"}], "unchanged": 209, "totals": {"added": 1, "removed": 1, "changed": 1, "license_changed": 1}, "truncated": false}
+      properties:
+        from: {type: object, properties: {assessment_id: {type: string, format: uuid}, ref: {type: string}, commit: {type: string}, components: {type: integer}}}
+        to: {type: object, properties: {assessment_id: {type: string, format: uuid}, ref: {type: string}, commit: {type: string}, components: {type: integer}}}
+        added: {type: array, items: {type: object, properties: {name: {type: string}, ecosystem: {type: string}, versions: {type: array, items: {type: string}}, from_versions: {type: array, items: {type: string}}, to_versions: {type: array, items: {type: string}}, from_license: {type: string}, to_license: {type: string}, dev: {type: boolean, description: Only development dependencies}}}}
+        removed: {type: array, items: {type: object, properties: {name: {type: string}, ecosystem: {type: string}, versions: {type: array, items: {type: string}}, from_versions: {type: array, items: {type: string}}, to_versions: {type: array, items: {type: string}}, from_license: {type: string}, to_license: {type: string}, dev: {type: boolean, description: Only development dependencies}}}}
+        changed: {type: array, items: {type: object, properties: {name: {type: string}, ecosystem: {type: string}, versions: {type: array, items: {type: string}}, from_versions: {type: array, items: {type: string}}, to_versions: {type: array, items: {type: string}}, from_license: {type: string}, to_license: {type: string}, dev: {type: boolean, description: Only development dependencies}}}}
+        license_changed: {type: array, items: {type: object, properties: {name: {type: string}, ecosystem: {type: string}, versions: {type: array, items: {type: string}}, from_versions: {type: array, items: {type: string}}, to_versions: {type: array, items: {type: string}}, from_license: {type: string}, to_license: {type: string}, dev: {type: boolean, description: Only development dependencies}}}}
+        unchanged: {type: integer}
+        totals: {type: object, additionalProperties: {type: integer}}
+        truncated: {type: boolean}
+    AdvisoryPage:
+      type: object
+      example: {"items": [{"id": "x_SCRS-2026-0001", "origin": "local", "summary": "Internal package acme-utils 2.3.1 published with a backdoor", "aliases": ["INC-2291"], "modified": "2026-11-16T09:30:00Z", "withdrawn": false}, {"id": "CVE-2021-23337", "origin": "nvd", "summary": "Command injection in lodash", "aliases": ["GHSA-35jh-r3h4-6jhm"], "modified": "2026-10-01T08:00:00Z", "withdrawn": false}], "next_cursor": ""}
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: string}
+              origin: {type: string, enum: [nvd, cve5, local]}
+              summary: {type: string}
+              aliases: {type: array, items: {type: string}}
+              modified: {type: string, format: date-time}
+              withdrawn: {type: boolean}
+        next_cursor: {type: string}
+    LocalAdvisoryInput:
+      type: object
+      example: {"summary": "Internal package acme-utils 2.3.1 published with a backdoor", "details": "Version 2.3.1 was published from a compromised CI token and exfiltrates environment variables on install.", "aliases": ["INC-2291"], "cwe": ["CWE-506"], "affected": [{"package": {"ecosystem": "npm", "name": "acme-utils"}, "versions": ["2.3.1"]}], "references": [{"type": "REPORT", "url": "https://wiki.example.com/incidents/INC-2291"}]}
+      additionalProperties: false
+      required: [summary, affected]
+      properties:
+        summary: {type: string, minLength: 3, maxLength: 200}
+        details: {type: string, maxLength: 8000}
+        aliases: {type: array, maxItems: 20, items: {type: string, maxLength: 128}}
+        cwe: {type: array, maxItems: 20, items: {type: string, example: CWE-506}}
+        severity:
+          type: array
+          maxItems: 4
+          items:
+            type: object
+            required: [type, score]
+            properties:
+              type: {type: string, enum: [CVSS_V2, CVSS_V3, CVSS_V4]}
+              score: {type: string, description: The CVSS vector}
+        affected:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items:
+            type: object
+            additionalProperties: false
+            required: [package]
+            properties:
+              package:
+                type: object
+                additionalProperties: false
+                required: [ecosystem, name]
+                properties:
+                  ecosystem: {type: string, example: npm}
+                  name: {type: string, maxLength: 214}
+                  purl: {type: string, maxLength: 500}
+              versions: {type: array, maxItems: 500, items: {type: string, maxLength: 100}, description: Exactly one of `versions` and `all_versions` is required}
+              all_versions: {type: boolean}
+        references:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [type, url]
+            properties:
+              type: {type: string, enum: [ADVISORY, ARTICLE, DETECTION, DISCUSSION, REPORT, FIX, INTRODUCED, GIT, PACKAGE, EVIDENCE, WEB]}
+              url: {type: string, maxLength: 500}
+    AdvisoryAffected:
+      type: object
+      example: {"items": [{"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "locator": "acme/api", "ref": "main", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "component": {"name": "acme-utils", "version": "2.3.1", "ecosystem": "npm", "purl": "pkg:npm/acme-utils@2.3.1", "path": "package-lock.json", "license": {"spdx": "MIT"}}}], "truncated": false}
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              asset_id: {type: string, format: uuid}
+              locator: {type: string}
+              ref: {type: string}
+              assessment_id: {type: string, format: uuid}
+              commit: {type: string}
+              component: {$ref: '#/components/schemas/Component'}
+        truncated: {type: boolean}
     AssetChange:
       type: object
       additionalProperties: false
@@ -4158,7 +5097,7 @@ components:
       type: object
       required: [type, repository]
       properties:
-        type: {type: string, enum: [git, image]}
+        type: {type: string, enum: [git, image, upload], description: '`upload` assesses an archive sent with `POST /uploads`: set `repository` to the asset locator (`upload/<name>`) and `commit` to the upload''s `commit`'}
         repository: {type: string, description: 'Asset locator: owner/repo, group/sub/project, or registry/repository'}
         provider: {type: string, enum: [github, gitlab], description: Git targets only; disambiguates equal paths}
         ref: {type: string, description: 'Branch (git) or tag (image). Default HEAD / latest'}
@@ -4174,6 +5113,7 @@ components:
             title: {type: string}
     AssessmentRequest:
       type: object
+      example: {"target": {"type": "git", "repository": "acme/api", "ref": "main"}, "notify": ["n8n-prod"], "trigger": {"origin": "n8n", "event": "release.requested", "context": {"ticket": "CHG-1042"}}}
       additionalProperties: false
       required: [target]
       properties:
@@ -4206,6 +5146,7 @@ components:
         detail: {type: string}
     Assessment:
       type: object
+      example: {"id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "request": {"target": {"type": "git", "repository": "acme/api", "ref": "main"}, "trigger": {"origin": "n8n", "event": "release.requested", "context": {"ticket": "CHG-1042"}}}, "requested_by": "ci-pipeline", "status": "succeeded", "verdict": "fail", "resolved_commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "ref_moved": false, "stages": [{"name": "inventory", "status": "ok"}, {"name": "malware", "status": "ok"}, {"name": "ioc", "status": "ok"}], "counts": {"total": 7, "new": 2, "waived": 0, "critical": 0, "high": 2, "medium": 3, "low": 2}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:33:12Z", "attempts": 1, "sbom_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "request_id": "req_01HZX3"}
       properties:
         id: {type: string, format: uuid}
         asset_id: {type: string, format: uuid}
@@ -4232,11 +5173,13 @@ components:
         request_id: {type: string}
     AssessmentPage:
       type: object
+      example: {"items": [{"id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "connection_id": "5d1a7c34-82f0-4e0b-b6c1-7a9e2f3d4b10", "request": {"target": {"type": "git", "repository": "acme/api", "ref": "main"}, "trigger": {"origin": "n8n", "event": "release.requested", "context": {"ticket": "CHG-1042"}}}, "requested_by": "ci-pipeline", "status": "succeeded", "verdict": "fail", "resolved_commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "ref_moved": false, "stages": [{"name": "inventory", "status": "ok"}, {"name": "malware", "status": "ok"}, {"name": "ioc", "status": "ok"}], "counts": {"total": 7, "new": 2, "waived": 0, "critical": 0, "high": 2, "medium": 3, "low": 2}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:33:12Z", "attempts": 1, "sbom_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "request_id": "req_01HZX3"}], "next_cursor": ""}
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Assessment'}}
         next_cursor: {type: string}
     Component:
       type: object
+      example: {"name": "lodash", "version": "4.17.20", "ecosystem": "npm", "purl": "pkg:npm/lodash@4.17.20", "path": "package-lock.json", "license": {"spdx": "MIT"}}
       properties:
         name: {type: string}
         version: {type: string}
@@ -4501,6 +5444,7 @@ components:
         name: {type: string, readOnly: true}
     ReportRequest:
       type: object
+      example: {"framework": "owasp-top10-2025", "scope": {"kind": "owner", "id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "name": "Payments team"}, "since": "2026-08-18T00:00:00Z", "format": "pdf"}
       additionalProperties: false
       required: [framework, scope]
       properties:
@@ -4518,6 +5462,7 @@ components:
             sla_high_days: {type: integer, minimum: 0, maximum: 3650, description: Patch window for high (default 90)}
     ReportJob:
       type: object
+      example: {"id": "b8c0d2e4-1f3a-4b5c-8d7e-9a0b1c2d3e4f", "framework": "owasp-top10-2025", "scope": {"kind": "owner", "id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "name": "Payments team"}, "since": "2026-08-18T00:00:00Z", "until": "2026-11-16T09:30:00Z", "format": "pdf", "status": "succeeded", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "size": 48213, "data_as_of": "2026-11-16T09:30:00Z", "scrs_version": "1.0.0", "summary": {"assets": 12, "gaps": 2, "findings_considered": 64, "open": 19, "unmapped": 3}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:30:41Z"}
       properties:
         id: {type: string, format: uuid}
         framework: {type: string}
@@ -4560,26 +5505,32 @@ components:
             rules_with_open_findings_by_cat: {type: object, additionalProperties: {type: integer}}
     Finding:
       type: object
+      example: {"id": "9a4d2e71-5c08-4f3b-a6d9-0e8b1c7f2a35", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "fingerprint": "vulnerability:npm:lodash:CVE-2021-23337", "ref": "main", "type": "vulnerability", "advisory_id": "CVE-2021-23337", "title": "lodash command injection in template", "severity": "high", "score": 78, "status": "open", "component": {"name": "lodash", "version": "4.17.20", "ecosystem": "npm", "purl": "pkg:npm/lodash@4.17.20", "path": "package-lock.json", "license": {"spdx": "MIT"}}, "guidance": {"summary": "Upgrade lodash", "fixed_versions": ["4.17.21"], "smallest_safe_upgrade": "4.17.21", "kev": false, "epss": 0.012}, "first_seen": "2026-11-16T09:30:00Z", "last_seen": "2026-11-16T09:30:00Z", "change": "new"}
       properties:
         id: {type: string, format: uuid}
         asset_id: {type: string, format: uuid}
         fingerprint: {type: string}
         ref: {type: string}
-        type: {type: string, enum: [vulnerability, malicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license, sast, dt_vulnerability, ai_review], description: '`ai_review` is a finding of the AI code review (see `POST /assets/{id}/ai-reviews`): written by a language model, marked `unverified` in its evidence, report-only and never part of a verdict. `dt_vulnerability` is a vulnerability only Dependency-Track reported (see `PUT /integrations/dependency-track`): report-only, and closed when Dependency-Track stops reporting it. Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`, or `SCRS-LICENSE-OUTBOUND:<project licence>:<expression>` for a runtime dependency incompatible with, or needing review against, the licence of the repository itself in a SaaS or distributed asset) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns. `sast` entries (advisory id `<tool>:<rule>`, evidence with tool, rule, CWE ids, path and lines, code hash, data-flow steps and `suppressed_in_code`; no code) gate only when new: a new critical fails, a new high warns; inline-suppressed entries never gate, and a suppression added for an open entry raises integrity entry `SCRS-SAST-SUPPRESSION-ADDED`. Vulnerability evidence carries `reachability` (status reachable, imported_only, not_reachable, unknown or unsupported; method, tool, confidence, file-and-line trace) when reachability ran; reachable adds 10 to the score and not reachable subtracts 15, known-exploited entries keep at least 45, and nothing is closed for being unreachable'}
+        type: {type: string, enum: [vulnerability, malicious_dependency, suspicious_dependency, malware, ioc_match, integrity, posture, misconfiguration, secret, code, yara_match, yara_alert, yara_hunt, ioc_alert, ioc_hunt, qa_failure, qa_untested, qa_performance, qa_config, qa_unconfigured, license, sast, dt_vulnerability, ai_review], description: '`ai_review` is a finding of the AI code review (see `POST /assets/{id}/ai-reviews`): written by a language model, marked `unverified` in its evidence, report-only and never part of a verdict. `dt_vulnerability` is a vulnerability only Dependency-Track reported (see `PUT /integrations/dependency-track`): report-only, and closed when Dependency-Track stops reporting it. Threat-intelligence types carry the source mode. `yara_match` and `ioc_match` (block) fail like malware, `yara_alert` and `ioc_alert` gate by severity, `yara_hunt` and `ioc_hunt` never gate. E2E QA types (`qa_*`) are report-only and never gate. `license` entries (advisory id `SCRS-LICENSE:<expression>`, or `SCRS-LICENSE-OUTBOUND:<project licence>:<expression>` for a runtime dependency incompatible with, or needing review against, the licence of the repository itself in a SaaS or distributed asset) follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns. `sast` entries (advisory id `<tool>:<rule>`, evidence with tool, rule, CWE ids, path and lines, code hash, data-flow steps and `suppressed_in_code`; no code) gate only when new: a new critical fails, a new high warns; inline-suppressed entries never gate, and a suppression added for an open entry raises integrity entry `SCRS-SAST-SUPPRESSION-ADDED`. Vulnerability evidence carries `reachability` (status reachable, imported_only, not_reachable, unknown or unsupported; method, tool, confidence, file-and-line trace) when reachability ran; reachable adds 10 to the score and not reachable subtracts 15, known-exploited entries keep at least 45, and nothing is closed for being unreachable'}
         advisory_id: {type: string, description: 'For YARA findings `YARA:<ruleset>:<rule>`'}
         title: {type: string}
         severity: {type: string, enum: [critical, high, medium, low, info, unknown]}
         score: {type: integer, minimum: 0, maximum: 100}
         status: {type: string, enum: [open, triaged, in_progress, accepted, suppressed, false_positive, fixed]}
         component: {$ref: '#/components/schemas/Component'}
-        evidence: {type: object}
+        evidence: {type: object, description: 'Type-specific detail. For an entry about a dependency that is new since the previous assessment of the ref (vulnerability, malicious_dependency, suspicious_dependency, license) it carries `introduced_by`: the revision (`commit`, `ref`, `assessment_id`) and the trigger''s `actor` and `origin`. The actor is whatever the trigger claimed, for example the pusher named in a webhook, never verified. It stays on the entry for its life.'}
         guidance: {type: object, description: 'summary, reference, kev, epss; for vulnerabilities fixed_versions, safe_versions (ascending, at most ten), smallest_safe_upgrade, latest_safe and safe_basis (advisories checked, whether the full local mirror set was used, and whether registry version lists or only advisory fixes were candidates) (VUL-008)'}
         first_seen: {type: string, format: date-time}
         last_seen: {type: string, format: date-time}
         waiver_until: {type: string, format: date-time}
+        assignee: {type: string, description: 'Who holds the entry (free text; absent when unassigned). Read live from the register, so it is not in an assessment''s frozen findings'}
+        assigned_at: {type: string, format: date-time}
+        comment_count: {type: integer, description: Comments on the entry; absent when none}
+        source_repository: {type: string, description: 'For an entry of a container image: the repository it was built from, when a link exists (see `GET /assets/{id}/links`); absent otherwise'}
         change: {type: string, enum: [new, existing]}
     RegisterSummary:
       type: object
+      example: {"total": 148, "open": 61, "by_status": {"open": 44, "triaged": 9, "in_progress": 8, "accepted": 12, "fixed": 75}, "open_by_severity": {"critical": 2, "high": 14, "medium": 29, "low": 16}, "open_by_type": {"vulnerability": 48, "license": 9, "sast": 4}, "waivers_expiring_30d": 3, "oldest_open_age_days": 87}
       properties:
         total: {type: integer}
         open: {type: integer, description: 'Entries in `open`, `triaged` or `in_progress`'}
@@ -4590,6 +5541,7 @@ components:
         oldest_open_age_days: {type: integer}
     RegisterTimeseries:
       type: object
+      example: {"days": 7, "items": [{"day": "2026-11-10", "detected": 4, "fixed": 1}, {"day": "2026-11-11", "detected": 0, "fixed": 2}, {"day": "2026-11-12", "detected": 7, "fixed": 0}]}
       properties:
         days: {type: integer}
         items:
@@ -4602,6 +5554,7 @@ components:
               fixed: {type: integer}
     RegisterTopAssets:
       type: object
+      example: {"items": [{"asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "locator": "acme/api", "open": 17, "open_by_severity": {"critical": 1, "high": 6, "medium": 10}, "max_score": 92}]}
       properties:
         items:
           type: array
@@ -4615,11 +5568,13 @@ components:
               max_score: {type: integer}
     RegisterExport:
       type: object
+      example: {"items": [{"id": "9a4d2e71-5c08-4f3b-a6d9-0e8b1c7f2a35", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "fingerprint": "vulnerability:npm:lodash:CVE-2021-23337", "ref": "main", "type": "vulnerability", "advisory_id": "CVE-2021-23337", "title": "lodash command injection in template", "severity": "high", "score": 78, "status": "open", "component": {"name": "lodash", "version": "4.17.20", "ecosystem": "npm", "purl": "pkg:npm/lodash@4.17.20", "path": "package-lock.json", "license": {"spdx": "MIT"}}, "guidance": {"summary": "Upgrade lodash", "fixed_versions": ["4.17.21"], "smallest_safe_upgrade": "4.17.21", "kev": false, "epss": 0.012}, "first_seen": "2026-11-16T09:30:00Z", "last_seen": "2026-11-16T09:30:00Z", "change": "new"}], "truncated": false}
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Finding'}}
         truncated: {type: boolean}
     FindingPage:
       type: object
+      example: {"items": [{"id": "9a4d2e71-5c08-4f3b-a6d9-0e8b1c7f2a35", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "fingerprint": "vulnerability:npm:lodash:CVE-2021-23337", "ref": "main", "type": "vulnerability", "advisory_id": "CVE-2021-23337", "title": "lodash command injection in template", "severity": "high", "score": 78, "status": "open", "component": {"name": "lodash", "version": "4.17.20", "ecosystem": "npm", "purl": "pkg:npm/lodash@4.17.20", "path": "package-lock.json", "license": {"spdx": "MIT"}}, "guidance": {"summary": "Upgrade lodash", "fixed_versions": ["4.17.21"], "smallest_safe_upgrade": "4.17.21", "kev": false, "epss": 0.012}, "first_seen": "2026-11-16T09:30:00Z", "last_seen": "2026-11-16T09:30:00Z", "change": "new"}], "next_cursor": "eyJpZCI6IjlhNGQyZTcxIn0"}
       properties:
         items: {type: array, items: {$ref: '#/components/schemas/Finding'}}
         next_cursor: {type: string}
@@ -4668,6 +5623,7 @@ components:
         value: {type: string}
     Subscription:
       type: object
+      example: {"id": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f", "name": "n8n-prod", "url": "https://n8n.example.com/webhook/scrs", "events": ["assessment.completed", "finding.created"], "profile": "summary", "egress_ack": true, "include_contacts": false, "connections": [], "enabled": true, "revision": 1, "created_at": "2026-11-16T09:30:00Z", "updated_at": "2026-11-16T09:30:00Z"}
       properties:
         id: {type: string, format: uuid}
         name: {type: string}
@@ -4742,7 +5698,7 @@ components:
           items:
             type: object
             properties:
-              class: {type: string, enum: [inbound_events, webhook_deliveries, closed_findings, scan_artifacts, sbom_documents, source_snapshots, remediation_plans, qa_reports, reports, expired_indicators, audit_log]}
+              class: {type: string, enum: [inbound_events, webhook_deliveries, closed_findings, scan_artifacts, sbom_documents, source_snapshots, uploaded_archives, remediation_plans, qa_reports, reports, expired_indicators, audit_log]}
               description: {type: string}
               guard: {type: string, description: What the class never purges}
               days: {type: [integer, 'null']}
@@ -5056,6 +6012,7 @@ components:
         max_advisories: {type: integer, minimum: 0, maximum: 30, default: 10, description: How many findings get an advisory, most important first}
     AISummary:
       type: object
+      example: {"id": "6a7b8c9d-0e1f-4a2b-8c3d-4e5f6a7b8c9d", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "provider_name": "local-qwen", "model": "qwen2.5-coder-32b", "ref": "main", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "status": "succeeded", "requested_by": "frontend-dashboard", "attempts": 1, "findings_considered": 7, "findings_excluded": 2, "advisories": 5, "input_tokens": 6120, "output_tokens": 1480, "incomplete": "", "redactions": {}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:31:05Z"}
       properties:
         id: {type: string, format: uuid}
         asset_id: {type: string, format: uuid}
@@ -5108,6 +6065,7 @@ components:
         paths: {type: array, maxItems: 40, items: {type: string, maxLength: 512}, description: Review only these source files (paths relative to the repository root)}
     AIReview:
       type: object
+      example: {"id": "3b4c5d6e-7f80-4192-a3b4-c5d6e7f8091a", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "provider_name": "local-qwen", "model": "qwen2.5-coder-32b", "locality": "local", "assessment_id": "c3e8a0f2-6b17-4d9a-8e55-2f0a9b7d1c44", "ref": "main", "commit": "3f9c2a1b7d4e5f60a8b9c0d1e2f3a4b5c6d7e8f9", "status": "succeeded", "requested_by": "frontend-dashboard", "attempts": 1, "files_reviewed": 10, "files_skipped": 2, "findings": 3, "input_tokens": 41230, "output_tokens": 3902, "incomplete": "", "redactions": {"aws_access_key": 1}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:36:50Z"}
       properties:
         id: {type: string, format: uuid}
         asset_id: {type: string, format: uuid}
@@ -5135,6 +6093,7 @@ components:
         completed_at: {type: [string, 'null'], format: date-time}
     LLMProvider:
       type: object
+      example: {"id": "0e9a8b2c-6f41-4d0e-9c1a-5b7d3f2a1c80", "name": "local-qwen", "kind": "openai_compatible", "base_url": "https://model.example.com/v1", "model": "qwen2.5-coder-32b", "max_tokens": 4096, "temperature": 0.2, "enabled": true, "has_api_key": true, "revision": 2, "created_at": "2026-11-16T09:30:00Z", "updated_at": "2026-11-16T09:30:00Z", "locality": "local", "source_allowed": true, "managed_by_environment": false}
       properties:
         id: {type: string, format: uuid}
         name: {type: string}

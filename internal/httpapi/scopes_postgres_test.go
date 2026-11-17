@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -65,7 +66,10 @@ func TestPostgresContractScopesMatchRouter(t *testing.T) {
 	rdb := redis.NewClient(opts)
 	defer rdb.Close()
 	artifacts := memoryArtifacts{}
+	var routes []string
+	routeObserver = func(pattern string) { routes = append(routes, pattern) }
 	handler := HandlerWithSecurity(nil, store, Security{Store: store, Redis: rdb, Assessments: jobs, Artifacts: artifacts, Notify: events, Live: &notify.Hub{MaxStreams: 10, PerToken: 2}, RelayEnabled: true, Status: NewPlatformStatus(nil, jobs, nil, nil)})
+	routeObserver = nil
 
 	var contract struct {
 		Paths map[string]map[string]any `yaml:"paths"`
@@ -114,6 +118,11 @@ func TestPostgresContractScopesMatchRouter(t *testing.T) {
 			}
 		}
 	}
+	t.Run("router routes are in the contract", func(t *testing.T) {
+		for _, problem := range routesMissingFromContract(routes, contract.Paths) {
+			t.Error(problem)
+		}
+	})
 	sort.Slice(ops, func(i, j int) bool { return ops[i].path+ops[i].method < ops[j].path+ops[j].method })
 	if len(ops) < 150 {
 		t.Fatalf("only %d token operations found", len(ops))
@@ -207,4 +216,51 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// routesMissingFromContract lists router patterns the contract does not
+// document. A pattern with a method must match an operation; a subtree
+// pattern ("/x/") must cover at least one contract path; any other pattern
+// must be a contract path. Wildcard names are ignored when comparing.
+func routesMissingFromContract(patterns []string, paths map[string]map[string]any) []string {
+	wildcard := regexp.MustCompile(`\{[^}]*\}`)
+	normalize := func(p string) string { return wildcard.ReplaceAllString(p, "{}") }
+	documented := map[string]bool{} // "METHOD path"
+	anyMethod := map[string]bool{}
+	var allPaths []string
+	for path, item := range paths {
+		n := normalize(path)
+		anyMethod[n] = true
+		allPaths = append(allPaths, n)
+		for method := range item {
+			if strings.Contains(" get post put patch delete ", " "+method+" ") {
+				documented[strings.ToUpper(method)+" "+n] = true
+			}
+		}
+	}
+	var problems []string
+	for _, pattern := range patterns {
+		method, path := "", pattern
+		if i := strings.Index(pattern, " "); i > 0 {
+			method, path = pattern[:i], pattern[i+1:]
+		}
+		path = normalize(strings.TrimPrefix(path, BasePath))
+		switch {
+		case method != "":
+			if !documented[method+" "+path] {
+				problems = append(problems, "router has "+pattern+" but the contract has no such operation")
+			}
+		case strings.HasSuffix(path, "/"):
+			covered := false
+			for _, p := range allPaths {
+				covered = covered || strings.HasPrefix(p, path)
+			}
+			if !covered {
+				problems = append(problems, "router subtree "+pattern+" covers no contract path")
+			}
+		case !anyMethod[path]:
+			problems = append(problems, "router has "+pattern+" but the contract has no such path")
+		}
+	}
+	return problems
 }

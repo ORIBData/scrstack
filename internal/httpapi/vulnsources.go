@@ -59,7 +59,10 @@ func (h vulnHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 404, "not found")
 			return
 		}
-		view, err := h.store.Advisory(ctx, strings.ToUpper(id[:3])+id[3:], r.URL.Query().Get("purl"))
+		if !strings.HasPrefix(id, "x_") {
+			id = strings.ToUpper(id[:3]) + id[3:]
+		}
+		view, err := h.store.Advisory(ctx, id, r.URL.Query().Get("purl"))
 		if err != nil {
 			vulnError(w, err)
 			return

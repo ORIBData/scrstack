@@ -27,7 +27,7 @@ func array(items map[string]any) map[string]any {
 func nullable(t string) map[string]any { return map[string]any{"type": []string{t, "null"}} }
 
 var findingBriefSchema = object([]string{"id", "type", "severity", "advisory_id", "title"}, map[string]any{
-	"id": str(), "type": str(), "severity": str(), "score": integer(), "advisory_id": str(), "title": str(), "change": str(), "component": map[string]any{"type": "object"}, "link": str(),
+	"id": str(), "type": str(), "severity": str(), "score": integer(), "advisory_id": str(), "title": str(), "change": str(), "component": map[string]any{"type": "object"}, "link": str(), "introduced_by": map[string]any{"type": "object"},
 })
 
 var assessmentData = object([]string{"assessment", "links"}, map[string]any{

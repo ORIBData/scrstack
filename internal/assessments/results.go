@@ -135,6 +135,17 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 				evidence, _ := json.Marshal(map[string]string{"path": path, "change": change, "before_sha256": before[path], "after_sha256": after[path]})
 				r.Findings = append(r.Findings, Finding{Type: "integrity", AdvisoryID: "SCRS-WORKFLOW-CHANGE", Title: "Workflow file changed since prior assessed revision", Severity: "high", Score: 60, Component: Component{Path: path}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Review workflow permissions, secret access, external actions and triggering branches before promotion.","automatic_changes":false}`)})
 			}
+			// INT-012 and INT-003: size signals, when the policy asks for them.
+			if policy, err := s.integrityPolicy(ctx, tx); err == nil {
+				first := s.firstTimeAuthor(ctx, tx, a.Request.Target.Repository, a.Request.Trigger.Actor, r.Commit)
+				for _, f := range sizeFindings(policy, prior, r.Files, priorWalked, first) {
+					if len(r.Findings) >= 10000 {
+						r.Complete = false
+						break
+					}
+					r.Findings = append(r.Findings, f)
+				}
+			}
 		}
 	}
 	// An API repository without a QA profile is reported once per complete
@@ -208,9 +219,15 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if err != nil {
 		return err
 	}
-	diff, err := s.componentDiff(ctx, tx, baseline, r.Components)
+	diff, addedPackages, err := s.componentDiff(ctx, tx, baseline, r.Components)
 	if err != nil {
 		return err
+	}
+	// MAL-004: a dependency that is new since the baseline is tagged with who
+	// brought it, on the entries about it, for triage. The actor is the
+	// trigger's claimed one (the pusher of a webhook), never verified.
+	for i := range unique {
+		tagIntroducedBy(&unique[i], addedPackages, a, r.Commit)
 	}
 	batch := &pgx.Batch{}
 	for i, component := range r.Components {
@@ -234,7 +251,7 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		}
 		component, _ := json.Marshal(f.Component)
 		snapshot, _ := json.Marshal(f)
-		batch.Queue(`INSERT INTO `+s.schema+`.findings(id,asset_id,fingerprint,ref,type,advisory_id,title,severity,score,component,evidence,guidance,last_assessment_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(fingerprint) DO UPDATE SET last_seen=clock_timestamp(),last_assessment_id=EXCLUDED.last_assessment_id,evidence=EXCLUDED.evidence,guidance=EXCLUDED.guidance,severity=EXCLUDED.severity,score=EXCLUDED.score,status=CASE WHEN findings.status='fixed' OR (findings.status='accepted' AND findings.waiver_until<=clock_timestamp()) THEN 'open' ELSE findings.status END,revision=findings.revision+1`, f.ID, f.AssetID, f.Fingerprint, f.Ref, f.Type, f.AdvisoryID, f.Title, f.Severity, f.Score, component, f.Evidence, f.Guidance, a.ID)
+		batch.Queue(`INSERT INTO `+s.schema+`.findings(id,asset_id,fingerprint,ref,type,advisory_id,title,severity,score,component,evidence,guidance,last_assessment_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT(fingerprint) DO UPDATE SET last_seen=clock_timestamp(),last_assessment_id=EXCLUDED.last_assessment_id,evidence=CASE WHEN jsonb_exists(findings.evidence,'introduced_by') AND NOT jsonb_exists(EXCLUDED.evidence,'introduced_by') THEN EXCLUDED.evidence || jsonb_build_object('introduced_by',findings.evidence->'introduced_by') ELSE EXCLUDED.evidence END,guidance=EXCLUDED.guidance,severity=EXCLUDED.severity,score=EXCLUDED.score,status=CASE WHEN findings.status='fixed' OR (findings.status='accepted' AND findings.waiver_until<=clock_timestamp()) THEN 'open' ELSE findings.status END,revision=findings.revision+1`, f.ID, f.AssetID, f.Fingerprint, f.Ref, f.Type, f.AdvisoryID, f.Title, f.Severity, f.Score, component, f.Evidence, f.Guidance, a.ID)
 		batch.Queue(`INSERT INTO `+s.schema+`.assessment_findings(assessment_id,finding_id,snapshot) VALUES($1,$2,$3)`, a.ID, f.ID, snapshot)
 		batch.Queue(`INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) VALUES($1,'detected',$2)`, f.ID, json.RawMessage(`{"assessment_id":"`+a.ID.String()+`"}`))
 	}
@@ -266,7 +283,7 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 		if err := s.suppressConfigured(ctx, tx, a, r); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id NOT IN ('SCRS-WORKFLOW-CHANGE','SCRS-SAST-SUPPRESSION-ADDED') AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND (type<>'sast' OR evidence->>'tool'=ANY($5)) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable, nonNil(r.SASTTools))
+		_, err = tx.Exec(ctx, `WITH closed AS (UPDATE `+s.schema+`.findings SET status='fixed',revision=revision+1 WHERE asset_id=$1 AND ref=$2 AND last_assessment_id<>$3 AND type=ANY($4) AND advisory_id NOT IN ('SCRS-WORKFLOW-CHANGE','SCRS-SAST-SUPPRESSION-ADDED','SCRS-LARGE-NEW-FILE','SCRS-CI-FILE-GROWTH') AND advisory_id NOT LIKE 'SCRS-EVENT-%' AND COALESCE(evidence->>'source','') NOT IN ('trivy','sarif') AND (type<>'sast' OR evidence->>'tool'=ANY($5)) AND status IN ('open','triaged','in_progress') RETURNING id) INSERT INTO `+s.schema+`.finding_events(finding_id,action,details) SELECT id,'fixed_by_complete_scan',jsonb_build_object('assessment_id',$3::text) FROM closed`, a.AssetID, a.Request.Target.Ref, a.ID, closable, nonNil(r.SASTTools))
 		if err != nil {
 			return err
 		}
@@ -348,13 +365,13 @@ func stringSet(ctx context.Context, tx pgx.Tx, query string, args ...any) (map[s
 }
 
 // componentDiff compares package identities with the baseline (OUT-006 diff).
-func (s *Store) componentDiff(ctx context.Context, tx pgx.Tx, baseline uuid.UUID, current []Component) ([]byte, error) {
+func (s *Store) componentDiff(ctx context.Context, tx pgx.Tx, baseline uuid.UUID, current []Component) ([]byte, map[string]bool, error) {
 	if baseline == uuid.Nil {
-		return []byte(`{"base_assessment_id":null}`), nil
+		return []byte(`{"base_assessment_id":null}`), nil, nil
 	}
 	before, err := stringSet(ctx, tx, `SELECT body->>'purl' FROM `+s.schema+`.components WHERE assessment_id=$1`, baseline)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	after := map[string]bool{}
 	for _, c := range current {
@@ -374,8 +391,19 @@ func (s *Store) componentDiff(ctx context.Context, tx pgx.Tx, baseline uuid.UUID
 	slices.Sort(added)
 	slices.Sort(removed)
 	addedTotal, removedTotal := len(added), len(removed)
+	// Every added package, for tagging who introduced it. A baseline with no
+	// components (its inventory did not complete) makes everything look new,
+	// so it names nobody.
+	var newPackages map[string]bool
+	if len(before) > 0 {
+		newPackages = map[string]bool{}
+		for _, purl := range added {
+			newPackages[purl] = true
+		}
+	}
 	added, removed = added[:min(len(added), 200)], removed[:min(len(removed), 200)]
-	return json.Marshal(map[string]any{"base_assessment_id": baseline, "components_added": added, "components_removed": removed, "added_total": addedTotal, "removed_total": removedTotal, "truncated": addedTotal > len(added) || removedTotal > len(removed)})
+	body, err := json.Marshal(map[string]any{"base_assessment_id": baseline, "components_added": added, "components_removed": removed, "added_total": addedTotal, "removed_total": removedTotal, "truncated": addedTotal > len(added) || removedTotal > len(removed)})
+	return body, newPackages, err
 }
 func (s *Store) Components(ctx context.Context, id uuid.UUID, after int) ([]Component, error) {
 	rows, err := s.pool.Query(ctx, `SELECT body FROM `+s.schema+`.components WHERE assessment_id=$1 AND ordinal>$2 ORDER BY ordinal LIMIT 101`, id, after)
@@ -419,7 +447,7 @@ func (s *Store) Findings(ctx context.Context, assessment, asset, after uuid.UUID
 		return out, rows.Err()
 	}
 
-	rows, err := s.pool.Query(ctx, `SELECT f.id,f.asset_id,f.fingerprint,f.ref,f.type,f.advisory_id,f.title,f.severity,f.score,CASE WHEN f.status='accepted' AND f.waiver_until<=clock_timestamp() THEN 'open' ELSE f.status END,f.component,f.evidence,f.guidance,f.first_seen,f.last_seen,f.waiver_until FROM `+s.schema+`.findings f WHERE f.id>$1 AND ($2='00000000-0000-0000-0000-000000000000'::uuid OR f.asset_id=$2) AND ($3='00000000-0000-0000-0000-000000000000'::uuid OR EXISTS(SELECT 1 FROM `+s.schema+`.assessment_findings af WHERE af.assessment_id=$3 AND af.finding_id=f.id)) ORDER BY f.id LIMIT 101`, after, asset, assessment)
+	rows, err := s.pool.Query(ctx, `SELECT f.id,f.asset_id,f.fingerprint,f.ref,f.type,f.advisory_id,f.title,f.severity,f.score,CASE WHEN f.status='accepted' AND f.waiver_until<=clock_timestamp() THEN 'open' ELSE f.status END,f.component,f.evidence,f.guidance,f.first_seen,f.last_seen,f.waiver_until,f.assignee,f.assigned_at,(SELECT count(*) FROM `+s.schema+`.finding_comments c WHERE c.finding_id=f.id),COALESCE((SELECT ra.locator FROM `+s.schema+`.asset_links l JOIN `+s.schema+`.assets ra ON ra.id=l.to_asset_id WHERE l.from_asset_id=f.asset_id AND l.kind='built_from' ORDER BY (l.source='manual') DESC,ra.locator LIMIT 1),'') FROM `+s.schema+`.findings f WHERE f.id>$1 AND ($2='00000000-0000-0000-0000-000000000000'::uuid OR f.asset_id=$2) AND ($3='00000000-0000-0000-0000-000000000000'::uuid OR EXISTS(SELECT 1 FROM `+s.schema+`.assessment_findings af WHERE af.assessment_id=$3 AND af.finding_id=f.id)) ORDER BY f.id LIMIT 101`, after, asset, assessment)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +456,7 @@ func (s *Store) Findings(ctx context.Context, assessment, asset, after uuid.UUID
 	for rows.Next() {
 		var f Finding
 		var component []byte
-		if err := rows.Scan(&f.ID, &f.AssetID, &f.Fingerprint, &f.Ref, &f.Type, &f.AdvisoryID, &f.Title, &f.Severity, &f.Score, &f.Status, &component, &f.Evidence, &f.Guidance, &f.FirstSeen, &f.LastSeen, &f.WaiverUntil); err != nil {
+		if err := rows.Scan(&f.ID, &f.AssetID, &f.Fingerprint, &f.Ref, &f.Type, &f.AdvisoryID, &f.Title, &f.Severity, &f.Score, &f.Status, &component, &f.Evidence, &f.Guidance, &f.FirstSeen, &f.LastSeen, &f.WaiverUntil, &f.Assignee, &f.AssignedAt, &f.CommentCount, &f.SourceRepository); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(component, &f.Component); err != nil {
@@ -512,4 +540,28 @@ func (s *Store) Files(ctx context.Context, id uuid.UUID) (json.RawMessage, error
 	var body json.RawMessage
 	err := s.pool.QueryRow(ctx, `SELECT body FROM `+s.schema+`.assessment_files WHERE assessment_id=$1`, id).Scan(&body)
 	return body, err
+}
+
+// introducedTypes are the entry types about a dependency, which a new
+// dependency can bring.
+var introducedTypes = map[string]bool{"vulnerability": true, "malicious_dependency": true, "suspicious_dependency": true, "license": true}
+
+// tagIntroducedBy records, in an entry's evidence, the revision and claimed
+// actor that added its component. An entry that already carries the tag keeps
+// the first one (the upsert preserves it).
+func tagIntroducedBy(f *Finding, added map[string]bool, a Assessment, commit string) {
+	if !introducedTypes[f.Type] || f.Component.PURL == "" || !added[f.Component.PURL] {
+		return
+	}
+	var evidence map[string]any
+	if json.Unmarshal(f.Evidence, &evidence) != nil || evidence == nil {
+		return
+	}
+	evidence["introduced_by"] = map[string]any{
+		"actor": a.Request.Trigger.Actor, "origin": a.Request.Trigger.Origin, "commit": commit,
+		"ref": a.Request.Target.Ref, "assessment_id": a.ID, "claimed": true,
+	}
+	if body, err := json.Marshal(evidence); err == nil {
+		f.Evidence = body
+	}
 }

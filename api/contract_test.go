@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -23,7 +26,7 @@ func TestOpenAPIUsesSCRSModulePaths(t *testing.T) {
 		t.Fatalf("unexpected OpenAPI version or server: %#v", contract)
 	}
 	for path := range contract.Paths {
-		if !strings.HasPrefix(path, "/system/") && !strings.HasPrefix(path, "/docs") && !strings.HasPrefix(path, "/connections") && !strings.HasPrefix(path, "/assets") && !strings.HasPrefix(path, "/tokens") && !strings.HasPrefix(path, "/assessments") && !strings.HasPrefix(path, "/register") && !strings.HasPrefix(path, "/remediation") && !strings.HasPrefix(path, "/feeds/") && !strings.HasPrefix(path, "/intel/") && !strings.HasPrefix(path, "/webhooks/") && !strings.HasPrefix(path, "/settings/") && !strings.HasPrefix(path, "/ingest/") && !strings.HasPrefix(path, "/owners") && !strings.HasPrefix(path, "/maintenance/") && !strings.HasPrefix(path, "/events/") && !strings.HasPrefix(path, "/qa/") && !strings.HasPrefix(path, "/llm/") && !strings.HasPrefix(path, "/ai-reviews/") && !strings.HasPrefix(path, "/summary-jobs/") && !strings.HasPrefix(path, "/schemas/") && !strings.HasPrefix(path, "/policies/") && !strings.HasPrefix(path, "/licenses/") && !strings.HasPrefix(path, "/reports") && !strings.HasPrefix(path, "/frameworks/") && !strings.HasPrefix(path, "/sboms/") && !strings.HasPrefix(path, "/sast/") && !strings.HasPrefix(path, "/reachability/") && !strings.HasPrefix(path, "/integrations/") && path != "/events" && path != "/audit" && path != "/webhooks" {
+		if !strings.HasPrefix(path, "/system/") && !strings.HasPrefix(path, "/docs") && !strings.HasPrefix(path, "/connections") && !strings.HasPrefix(path, "/assets") && !strings.HasPrefix(path, "/advisories") && !strings.HasPrefix(path, "/uploads") && !strings.HasPrefix(path, "/jobs") && !strings.HasPrefix(path, "/incidents") && !strings.HasPrefix(path, "/tokens") && !strings.HasPrefix(path, "/assessments") && !strings.HasPrefix(path, "/register") && !strings.HasPrefix(path, "/remediation") && !strings.HasPrefix(path, "/feeds/") && !strings.HasPrefix(path, "/intel/") && !strings.HasPrefix(path, "/webhooks/") && !strings.HasPrefix(path, "/settings/") && !strings.HasPrefix(path, "/ingest/") && !strings.HasPrefix(path, "/owners") && !strings.HasPrefix(path, "/maintenance/") && !strings.HasPrefix(path, "/events/") && !strings.HasPrefix(path, "/qa/") && !strings.HasPrefix(path, "/llm/") && !strings.HasPrefix(path, "/ai-reviews/") && !strings.HasPrefix(path, "/summary-jobs/") && !strings.HasPrefix(path, "/schemas/") && !strings.HasPrefix(path, "/policies/") && !strings.HasPrefix(path, "/licenses/") && !strings.HasPrefix(path, "/reports") && !strings.HasPrefix(path, "/frameworks/") && !strings.HasPrefix(path, "/sboms/") && !strings.HasPrefix(path, "/sast/") && !strings.HasPrefix(path, "/reachability/") && !strings.HasPrefix(path, "/integrations/") && path != "/events" && path != "/audit" && path != "/webhooks" {
 			t.Errorf("path %q does not use a module", path)
 		}
 	}
@@ -93,5 +96,53 @@ func TestOpenAPIOperationsDeclareScopes(t *testing.T) {
 	}
 	if operations < 150 {
 		t.Fatalf("only %d operations parsed", operations)
+	}
+}
+
+// Every schema example in the contract is valid against its own schema, so a
+// frontend that generates mocks from the examples never receives a shape the
+// API would not send (or one it would reject on input).
+func TestOpenAPISchemaExamplesAreValid(t *testing.T) {
+	var contract map[string]any
+	if err := yaml.Unmarshal(OpenAPI, &contract); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := json.Marshal(contract)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("openapi.json", doc); err != nil {
+		t.Fatal(err)
+	}
+	schemas := contract["components"].(map[string]any)["schemas"].(map[string]any)
+	checked := 0
+	for name, body := range schemas {
+		schema, ok := body.(map[string]any)
+		if !ok || schema["example"] == nil {
+			continue
+		}
+		compiled, err := compiler.Compile("openapi.json#/components/schemas/" + name)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		example, _ := json.Marshal(schema["example"])
+		value, err := jsonschema.UnmarshalJSON(bytes.NewReader(example))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if err := compiled.Validate(value); err != nil {
+			t.Errorf("%s example does not match its schema: %v", name, err)
+		}
+		checked++
+	}
+	if checked < 25 {
+		t.Errorf("only %d schema examples were checked", checked)
 	}
 }

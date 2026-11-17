@@ -3,8 +3,10 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,16 @@ func (m memoryArtifacts) GetSBOM(_ context.Context, key string) ([]byte, error) 
 		return b, nil
 	}
 	return nil, errors.New("missing")
+}
+func (m memoryArtifacts) PutUpload(_ context.Context, data []byte) (string, error) {
+	sum := sha256.Sum256(data)
+	key := "uploads/" + hex.EncodeToString(sum[:]) + ".tar.gz"
+	m[key] = data
+	return key, nil
+}
+func (m memoryArtifacts) DeleteObject(_ context.Context, key string) error {
+	delete(m, key)
+	return nil
 }
 func (m memoryArtifacts) GetReport(ctx context.Context, key string) ([]byte, error) {
 	return m.GetSBOM(ctx, key)

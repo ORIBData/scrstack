@@ -701,6 +701,104 @@ func TestPostgresP2Features(t *testing.T) {
 	}
 	must(call("POST", "/register/summary", admin, "", nil), 405)
 
+	// Assets registered by hand: create, import, discovery, delete, revisions.
+	var manual struct {
+		ID    uuid.UUID       `json:"id"`
+		Flags json.RawMessage `json:"flags"`
+	}
+	if err := json.Unmarshal(must(call("POST", "/assets", admin, `{"connection":"gh","locator":"org/new-repo","environment":"prod","criticality":3}`, nil), 201).Body.Bytes(), &manual); err != nil || !strings.Contains(string(manual.Flags), `"manual":true`) || !strings.Contains(string(manual.Flags), `"in_scope":true`) {
+		t.Fatal(err, string(manual.Flags))
+	}
+	var again struct {
+		ID uuid.UUID `json:"id"`
+	}
+	if err := json.Unmarshal(must(call("POST", "/assets", admin, `{"connection":"gh","locator":"ORG/New-Repo"}`, nil), 200).Body.Bytes(), &again); err != nil || again.ID != manual.ID {
+		t.Fatal("case-insensitive duplicate must return the existing asset", err)
+	}
+	must(call("POST", "/assets", admin, `{"connection":"gh","locator":"bad locator"}`, nil), 400)
+	must(call("POST", "/assets", admin, `{"connection":"gh","locator":"org/x","type":"container_image"}`, nil), 400)
+	must(call("POST", "/assets", admin, `{"connection":"gh","locator":"org/x","environment":"moon"}`, nil), 400)
+	must(call("POST", "/assets", admin, `{"connection":"nope","locator":"org/x"}`, nil), 404)
+	var bulkResult struct {
+		Items []struct {
+			Status  string `json:"status"`
+			InScope bool   `json:"in_scope"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(must(call("POST", "/assets:import", admin, `{"connection":"gh","items":[{"locator":"org/bulk-a"},{"locator":"org/new-repo"},{"locator":"other/outside"},{"locator":"no good"}]}`, nil), 207).Body.Bytes(), &bulkResult); err != nil || len(bulkResult.Items) != 4 {
+		t.Fatal(err, bulkResult)
+	}
+	for i, want := range []string{"created", "exists", "created", "invalid"} {
+		if bulkResult.Items[i].Status != want {
+			t.Fatalf("import item %d: %+v", i, bulkResult.Items)
+		}
+	}
+	if bulkResult.Items[2].InScope {
+		t.Fatal("an asset outside the connection scope must not be in scope")
+	}
+	must(call("POST", "/assets:import", admin, `{"connection":"gh","items":[]}`, nil), 400)
+	// Discovery must keep a manual asset accessible and follow the scope.
+	if _, err := store.Discover(ctx, "gh", staticInventory{{Type: "github_repo", Locator: "org/app"}}); err != nil {
+		t.Fatal(err)
+	}
+	var manualAsset struct {
+		Flags json.RawMessage `json:"flags"`
+	}
+	if err := json.Unmarshal(must(call("GET", "/assets/"+manual.ID.String(), admin, "", nil), 200).Body.Bytes(), &manualAsset); err != nil || !strings.Contains(string(manualAsset.Flags), `"accessible":true`) || !strings.Contains(string(manualAsset.Flags), `"in_scope":true`) {
+		t.Fatal(err, string(manualAsset.Flags))
+	}
+	var discoveredID uuid.UUID
+	if err := pool.QueryRow(ctx, `SELECT id FROM `+schema+`.assets WHERE locator='org/app'`).Scan(&discoveredID); err != nil {
+		t.Fatal(err)
+	}
+	must(call("DELETE", "/assets/"+discoveredID.String(), admin, "", nil), 409)
+	must(call("DELETE", "/assets/"+manual.ID.String(), admin, "", nil), 204)
+	must(call("GET", "/assets/"+manual.ID.String(), admin, "", nil), 404)
+	must(call("DELETE", "/assets/"+manual.ID.String(), admin, "", nil), 404)
+	var revisions struct {
+		Items []struct {
+			Commit      string `json:"commit"`
+			Assessments int    `json:"assessments"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(must(call("GET", "/assets/"+discoveredID.String()+"/revisions", admin, "", nil), 200).Body.Bytes(), &revisions); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range revisions.Items {
+		if r.Commit == "" || r.Assessments < 1 {
+			t.Fatalf("revision %+v", r)
+		}
+	}
+	must(call("GET", "/assets/"+discoveredID.String()+"/revisions?limit=0", admin, "", nil), 400)
+	must(call("GET", "/assets/"+discoveredID.String()+"/revisions?before=yesterday", admin, "", nil), 400)
+
+	// Local advisories over HTTP.
+	must(call("POST", "/advisories", admin, `{"summary":"ok","affected":[]}`, nil), 400)
+	newAdvisory := must(call("POST", "/advisories", admin, `{"summary":"internal-lib 2.0.1 ships a stealer","details":"Found in incident review.","aliases":["INC-7"],"affected":[{"package":{"ecosystem":"npm","name":"internal-lib"},"versions":["2.0.1"]}],"references":[{"type":"REPORT","url":"https://example.com/inc-7"}]}`, nil), 201)
+	var localAdvisory struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(newAdvisory.Body.Bytes(), &localAdvisory); err != nil || !strings.HasPrefix(localAdvisory.ID, "x_SCRS-") || newAdvisory.Header().Get("Location") != BasePath+"/advisories/"+localAdvisory.ID {
+		t.Fatal(err, newAdvisory.Header(), newAdvisory.Body.String())
+	}
+	if found := must(call("GET", "/advisories?q=stealer&origin=local", admin, "", nil), 200); !strings.Contains(found.Body.String(), localAdvisory.ID) {
+		t.Fatal(found.Body.String())
+	}
+	must(call("GET", "/advisories?limit=0", admin, "", nil), 400)
+	must(call("GET", "/advisories?withdrawn=maybe", admin, "", nil), 400)
+	must(call("GET", "/advisories?cursor=broken", admin, "", nil), 400)
+	for _, path := range []string{"/advisories/" + localAdvisory.ID, "/intel/vulnerabilities/" + localAdvisory.ID} {
+		if got := must(call("GET", path, admin, "", nil), 200); !strings.Contains(got.Body.String(), "internal-lib") {
+			t.Fatal(path, got.Body.String())
+		}
+	}
+	must(call("GET", "/advisories/"+localAdvisory.ID+"/affected", admin, "", nil), 200)
+	must(call("GET", "/advisories/x_SCRS-2000-0001", admin, "", nil), 404)
+	must(call("POST", "/advisories/"+localAdvisory.ID+":withdraw", admin, `{"reason":"short"}`, nil), 400)
+	must(call("POST", "/advisories/"+localAdvisory.ID+":withdraw", admin, `{"reason":"duplicate of another report"}`, nil), 200)
+	must(call("POST", "/advisories/"+localAdvisory.ID+":withdraw", admin, `{"reason":"duplicate of another report"}`, nil), 409)
+	must(call("DELETE", "/advisories/"+localAdvisory.ID, admin, "", nil), 405)
+
 	// Dependency-Track stops reporting express's vulnerability: its entry
 	// closes, its link goes, and the others stay.
 	setFindings(withoutB, 200)

@@ -124,3 +124,23 @@ func (c Client) Versions(ctx context.Context, system, name string) ([]string, er
 	}
 	return out, nil
 }
+
+// PublishedAt returns when a version was published to its registry, as
+// deps.dev reports it. A version with no recorded date answers a zero time.
+func (c Client) PublishedAt(ctx context.Context, system, name, version string) (time.Time, error) {
+	var v struct {
+		PublishedAt string `json:"publishedAt"`
+	}
+	path := "/systems/" + url.PathEscape(strings.ToLower(system)) + "/packages/" + url.PathEscape(name) + "/versions/" + url.PathEscape(version)
+	if err := c.get(ctx, path, &v); err != nil {
+		return time.Time{}, err
+	}
+	if v.PublishedAt == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, v.PublishedAt)
+	if err != nil {
+		return time.Time{}, nil
+	}
+	return t, nil
+}

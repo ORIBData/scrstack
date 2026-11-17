@@ -117,6 +117,9 @@ TLS, public health/readiness, unauthorized rejection, authorized assessment read
 Swagger/OpenAPI and active remediation capabilities. It uses
 `SCRS_ACCEPTANCE_API_TOKEN` (read scope) or falls back to the bootstrap token.
 Credentials are not printed and cross-origin redirects are rejected.
+`make pipeline-acceptance` goes further: it uploads a small archive with a write-scoped
+`SCRS_ACCEPTANCE_WRITE_TOKEN` and follows the assessment through the worker, scanner and storage.
+The full ordered checklist, with what to record, is [STAGING_ACCEPTANCE.md](STAGING_ACCEPTANCE.md).
 
 The API listens on HTTP port 7000 inside Docker (`SCRS_HTTP_ADDR=:7000`). Traefik terminates external HTTPS
 and preserves `/scrs/v1/*`. A published host port is unnecessary for that routing.
@@ -387,6 +390,7 @@ advisories for safe versions.
 
 | Variable | Service | Purpose |
 | --- | --- | --- |
+| `SCRS_ACTIONS_SWEEP_INTERVAL_HOURS` | worker | Reads each in-scope GitHub repository's Actions inventory (enabled, workflow list, run-number gaps) this often, 25 repositories per 15 minutes; 0 or unset is off. Needs the read-only Actions permission on the connection's credential; without it the repository shows `available: false` |
 | `SCRS_DEPSDEV_ENABLED` | worker | Licence metadata and version lists from deps.dev (default true; false evaluates packages without a declared or detected licence as "no licence found") |
 | `SCRS_DEPSDEV_URL`, `SCRS_DEPSDEV_PRIVATE_HOSTS` | worker | A deps.dev API mirror and its hostnames allowed to resolve to private addresses |
 | `SCRS_DEPSDEV_MAX_LOOKUPS` | worker | Licence lookups per assessment (default 2000); the rest are left unresolved and retried next time |

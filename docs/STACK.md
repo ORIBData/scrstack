@@ -4,6 +4,8 @@ SCRS is one public REST service, **SCRS Core** (`scrs-api`), with a set of priva
 
 - Contract and Swagger UI: `GET /scrs/v1/docs` (served by Core, unless `SCRS_SWAGGER_DOCS_ENABLE=false`).
 - Every endpoint with its scope, grouped by module: [API_REFERENCE.md](API_REFERENCE.md) (generated from the contract).
+- Verifying a deployment: [STAGING_ACCEPTANCE.md](STAGING_ACCEPTANCE.md) (acceptance scripts, restart, backup and load checks).
+- Building a UI: [FRONTEND_GUIDE.md](FRONTEND_GUIDE.md) (call order, roles, live events, pagination and concurrency).
 - Deployment: [DOKPLOY.md](DOKPLOY.md). Decisions: [ADR.md](ADR.md).
 
 ## Topology

@@ -17,6 +17,10 @@ type RegisterFilter struct {
 	Status   string
 	Severity string
 	Type     string
+	// Assignee matches an assignee exactly (ignoring case); Unassigned
+	// selects entries nobody holds. Setting both matches nothing.
+	Assignee   string
+	Unassigned bool
 }
 
 // effectiveStatus reads an expired waiver as open, as every register read does.
@@ -42,13 +46,19 @@ func (f RegisterFilter) where(first int) (string, []any) {
 	if f.Type != "" {
 		add("f.type=?", f.Type)
 	}
+	if f.Assignee != "" {
+		add("lower(f.assignee)=lower(?)", f.Assignee)
+	}
+	if f.Unassigned {
+		clause += " AND f.assignee=''"
+	}
 	return clause, args
 }
 
 // FindingsFiltered pages the register in id order, 101 rows at most.
 func (s *Store) FindingsFiltered(ctx context.Context, filter RegisterFilter, after uuid.UUID) ([]Finding, error) {
 	clause, args := filter.where(2)
-	rows, err := s.pool.Query(ctx, `SELECT f.id,f.asset_id,f.fingerprint,f.ref,f.type,f.advisory_id,f.title,f.severity,f.score,`+effectiveStatus+`,f.component,f.evidence,f.guidance,f.first_seen,f.last_seen,f.waiver_until FROM `+s.schema+`.findings f WHERE f.id>$1`+clause+` ORDER BY f.id LIMIT 101`, append([]any{after}, args...)...)
+	rows, err := s.pool.Query(ctx, `SELECT f.id,f.asset_id,f.fingerprint,f.ref,f.type,f.advisory_id,f.title,f.severity,f.score,`+effectiveStatus+`,f.component,f.evidence,f.guidance,f.first_seen,f.last_seen,f.waiver_until,f.assignee,f.assigned_at,(SELECT count(*) FROM `+s.schema+`.finding_comments c WHERE c.finding_id=f.id),COALESCE((SELECT ra.locator FROM `+s.schema+`.asset_links l JOIN `+s.schema+`.assets ra ON ra.id=l.to_asset_id WHERE l.from_asset_id=f.asset_id AND l.kind='built_from' ORDER BY (l.source='manual') DESC,ra.locator LIMIT 1),'') FROM `+s.schema+`.findings f WHERE f.id>$1`+clause+` ORDER BY f.id LIMIT 101`, append([]any{after}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +67,7 @@ func (s *Store) FindingsFiltered(ctx context.Context, filter RegisterFilter, aft
 	for rows.Next() {
 		var f Finding
 		var component []byte
-		if err := rows.Scan(&f.ID, &f.AssetID, &f.Fingerprint, &f.Ref, &f.Type, &f.AdvisoryID, &f.Title, &f.Severity, &f.Score, &f.Status, &component, &f.Evidence, &f.Guidance, &f.FirstSeen, &f.LastSeen, &f.WaiverUntil); err != nil {
+		if err := rows.Scan(&f.ID, &f.AssetID, &f.Fingerprint, &f.Ref, &f.Type, &f.AdvisoryID, &f.Title, &f.Severity, &f.Score, &f.Status, &component, &f.Evidence, &f.Guidance, &f.FirstSeen, &f.LastSeen, &f.WaiverUntil, &f.Assignee, &f.AssignedAt, &f.CommentCount, &f.SourceRepository); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(component, &f.Component); err != nil {

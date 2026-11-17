@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/actionscheck"
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/depsdev"
@@ -224,6 +225,7 @@ func pipelineCommand() error {
 		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
 			w.MaxImageBytes = limit
 		}
+		w.Uploads = artifacts
 		if os.Getenv("SCRS_SNAPSHOT_ARCHIVES") == "true" {
 			w.Snapshots = artifacts
 		}
@@ -320,6 +322,22 @@ func pipelineCommand() error {
 			if limit, err := strconv.Atoi(os.Getenv("SCRS_DEPSDEV_MAX_LOOKUPS")); err == nil && limit > 0 && limit <= 20000 {
 				w.DepsDevMaxLookups = limit
 			}
+		}
+		// GitHub Actions inventory and run-number gaps (INT-014, INT-015). Off
+		// unless an interval is set: it calls GitHub's API for every in-scope
+		// repository and needs the read-only Actions permission.
+		if hours, err := strconv.Atoi(os.Getenv("SCRS_ACTIONS_SWEEP_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*30 {
+			checker := actionscheck.Checker{Connections: providers, Store: store, API: connections.NewNativeAdapters()}
+			go func() {
+				for {
+					checker.Sweep(ctx, time.Duration(hours)*time.Hour, 25, 2*time.Second, logger)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(15 * time.Minute):
+					}
+				}
+			}()
 		}
 		// Compliance evidence reports (CMP-006).
 		reportPoll := 30 * time.Second

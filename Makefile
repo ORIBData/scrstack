@@ -191,6 +191,10 @@ scanner-test:
 deployment-acceptance:
 	@python3 scripts/run_with_env.py python3 scripts/deployment_acceptance.py
 
+.PHONY: pipeline-acceptance
+pipeline-acceptance:
+	@python3 scripts/run_with_env.py python3 scripts/pipeline_acceptance.py
+
 .PHONY: malware-test
 malware-test:
 	DOCKER=$(DOCKER) GO=$(GO) bash scripts/test_malware.sh

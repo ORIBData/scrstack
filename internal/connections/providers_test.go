@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
@@ -132,5 +133,46 @@ func TestOCICatalogAndPull(t *testing.T) {
 	}
 	if _, err := a.ImageArchive(context.Background(), c, json.RawMessage(`{}`), "docker.io/acme/api", "1.0", "", "linux/amd64", 1<<20, &bytes.Buffer{}); err == nil {
 		t.Fatal("image from another registry pulled with this connection")
+	}
+}
+
+// The source label an image carries comes back with the pull (CON-012); an
+// image without one, or with an oversized one, reports none.
+func TestImageArchiveInfoReturnsTheSourceLabel(t *testing.T) {
+	server := httptest.NewServer(registry.New())
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	push := func(repo string, labels map[string]string) string {
+		base, err := random.Image(1024, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := base.ConfigFile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg = cfg.DeepCopy()
+		cfg.Config.Labels = labels
+		image, err := mutate.ConfigFile(base, cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ref, _ := name.ParseReference(host + "/" + repo + ":1.0")
+		if err := remote.Write(ref, image); err != nil {
+			t.Fatal(err)
+		}
+		d, _ := image.Digest()
+		return d.String()
+	}
+	labelled := push("acme/labelled", map[string]string{"org.opencontainers.image.source": "https://github.com/acme/api"})
+	plain := push("acme/plain", map[string]string{"org.opencontainers.image.title": "plain"})
+	huge := push("acme/huge", map[string]string{"org.opencontainers.image.source": "https://github.com/acme/" + strings.Repeat("x", 600)})
+	a := NativeAdapters{Client: server.Client()}
+	c := Connection{Provider: "oci", Enabled: true, Config: json.RawMessage(`{"registry":"` + host + `","namespace":"acme"}`), Scope: Scope{Include: []string{host + "/acme/*"}}}
+	for repo, tc := range map[string]struct{ digest, label string }{"labelled": {labelled, "https://github.com/acme/api"}, "plain": {plain, ""}, "huge": {huge, ""}} {
+		info, err := a.ImageArchiveInfo(context.Background(), c, json.RawMessage(`{}`), host+"/acme/"+repo, "", tc.digest, "linux/amd64", 1<<20, &bytes.Buffer{})
+		if err != nil || info.Digest != tc.digest || info.SourceLabel != tc.label {
+			t.Errorf("%s: %+v %v", repo, info, err)
+		}
 	}
 }

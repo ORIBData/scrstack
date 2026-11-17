@@ -44,6 +44,7 @@ func (w Worker) enrich(ctx context.Context, a assessments.Assessment, output *sc
 	defer cancel()
 	stages = append(stages, w.licenseMetadata(budget, output))
 	stages = append(stages, w.safeVersions(budget, output))
+	stages = append(stages, w.dependencyPolicy(budget, output))
 	kind := "git"
 	if a.Request.Target.Type == "image" {
 		kind = "image"

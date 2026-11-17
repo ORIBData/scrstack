@@ -52,12 +52,25 @@ Discovered repositories and images, their owners and operator attributes.
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
 | GET | `/assets` | `read` | List assets |
+| POST | `/assets` | `write` | Register an asset by hand |
+| DELETE | `/assets/{id}` | `admin` | Delete a manually registered asset |
 | GET | `/assets/{id}` | `read` or `write` | Get an asset |
 | PATCH | `/assets/{id}` | `write` | Update owner and attributes |
+| GET | `/assets/{id}/actions` | `read` or `write` | GitHub Actions inventory of a repository |
+| POST | `/assets/{id}/actions:check` | `write` | Read a repository's Actions inventory now |
 | GET | `/assets/{id}/last-known-good` | `read` or `write` | Last known good revision |
+| GET | `/assets/{id}/links` | `read` or `write` | Image-to-source links of an asset |
+| POST | `/assets/{id}/links` | `write` | Link an image to its source |
+| DELETE | `/assets/{id}/links/{to}` | `write` | Remove an image-to-source link |
+| GET | `/assets/{id}/revisions` | `read` or `write` | Assessed revisions of an asset |
+| GET | `/assets/{id}/sbom-diff` | `read` or `write` | Compare the packages of two revisions |
+| GET | `/assets/{id}/uploads` | `read` or `write` | Archives uploaded for an asset |
+| DELETE | `/assets/{id}/uploads/{upload}` | `admin` | Delete an uploaded archive |
+| POST | `/assets:import` | `write` | Register many assets |
 | GET | `/owners` | `read` or `write` | List owners |
 | POST | `/owners` | `write` | Create an owner |
 | PATCH | `/owners/{id}` | `write` | Replace an owner's fields |
+| POST | `/uploads` | `write` | Upload a source archive |
 
 ## Mirrors
 
@@ -120,6 +133,10 @@ Deduplicated findings across assessments and their triage lifecycle.
 | GET | `/register/top-assets` | `read` or `write` | Assets with the most open findings |
 | GET | `/register/vex` | `read` or `write` | Register-wide VEX |
 | PATCH | `/register/{id}` | `write` | Change a finding's status |
+| PUT | `/register/{id}/assignee` | `write` | Assign a register entry |
+| GET | `/register/{id}/comments` | `read` or `write` | Comments on a register entry |
+| POST | `/register/{id}/comments` | `write` | Comment on a register entry |
+| DELETE | `/register/{id}/comments/{comment}` | `admin` | Delete a comment |
 | GET | `/register/{id}/events` | `read` or `write` | Finding history |
 
 ## Remediation
@@ -172,6 +189,11 @@ Versioned indicator-of-compromise bundles (admin).
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
+| GET | `/advisories` | `read` or `write` | Search advisories |
+| POST | `/advisories` | `write` | Create a local advisory |
+| GET | `/advisories/{id}` | `read` or `write` | Read one advisory |
+| GET | `/advisories/{id}/affected` | `read` or `write` | Components a local advisory names |
+| POST | `/advisories/{id}:withdraw` | `write` | Withdraw a local advisory |
 | GET | `/feeds/indicators` | `admin` | Active indicator bundle |
 | PUT | `/feeds/indicators` | `admin` | Import and activate an indicator bundle |
 | GET | `/intel/indicator-sources` | `read` or `write` | Indicator sources |
@@ -204,6 +226,10 @@ Versioned indicator-of-compromise bundles (admin).
 | PATCH | `/intel/yara-rulesets/{id}` | `write` | Change a YARA ruleset |
 | POST | `/intel/yara-rulesets/{id}:hunt` | `write` | Retro-hunt with a ruleset |
 | POST | `/intel/yara-rulesets:validate` | `write` | Compile YARA rules without saving |
+| GET | `/policies/dependencies` | `read` or `write` | Dependency checks policy |
+| PUT | `/policies/dependencies` | `admin` | Change the dependency checks |
+| GET | `/policies/integrity` | `read` or `write` | Behavioural and size signals policy |
+| PUT | `/policies/integrity` | `admin` | Change the integrity signals |
 
 ## Operations
 
@@ -215,6 +241,12 @@ Maintenance, inbound event log and retention (admin).
 | GET | `/events/inbound` | `admin` | Inbound event log |
 | GET | `/events/inbound/{id}` | `admin` | Get an inbound event |
 | POST | `/events/inbound/{id}:replay` | `admin` | Replay an event's assessment |
+| GET | `/incidents` | `read` or `write` | List incidents |
+| POST | `/incidents` | `admin` | Sweep what an account touched |
+| GET | `/incidents/{id}` | `read` or `write` | Read an incident |
+| GET | `/jobs` | `read` or `write` | List background jobs |
+| GET | `/jobs/{id}` | `read` or `write` | Read one job |
+| POST | `/jobs/{id}:cancel` | `admin` | Cancel a job |
 | POST | `/maintenance/rebuild` | `admin` | Re-assess current revisions |
 | POST | `/maintenance/redeliver-dead` | `admin` | Requeue all dead deliveries |
 | POST | `/maintenance/rescan` | `admin` | Rescan default branches |

@@ -288,6 +288,7 @@ and `:purge` (RET-001 to RET-007), using the policy ETag in `If-Match`.
 | `closed_findings` | Fixed, false-positive and suppressed entries with their history | Open, triaged, in-progress and accepted entries |
 | `scan_artifacts` | File inventories and component lists of superseded assessments | The newest successful assessment of each asset and ref; assessments that open entries point to |
 | `sbom_documents`, `source_snapshots` | S3 objects of superseded assessments | Objects another retained assessment still uses |
+| `uploaded_archives` | Uploaded source archives that a newer upload with the same label replaced | The newest upload of each asset and label; archives of queued or running assessments; legal hold |
 | `remediation_plans` | Stored plans | — |
 | `qa_reports` | Older QA report archives and scenario lists | The newest finished run per asset and kind |
 | `expired_indicators` | Indicators past `valid_until` | Unexpired indicators |

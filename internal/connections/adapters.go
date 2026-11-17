@@ -23,6 +23,12 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
+// StatusError is a provider answer other than 2xx; callers that treat a
+// missing permission differently from an outage read Status.
+type StatusError struct{ Status int }
+
+func (e *StatusError) Error() string { return fmt.Sprintf("provider returned HTTP %d", e.Status) }
+
 type NativeAdapters struct {
 	Client    *http.Client
 	GitHubAPI string // overridden only by tests
@@ -96,7 +102,7 @@ func (a NativeAdapters) send(ctx context.Context, method, target string, auth fu
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("provider returned HTTP %d", resp.StatusCode)
+		return nil, &StatusError{Status: resp.StatusCode}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (4<<20)+1))
 	if err != nil || len(data) > 4<<20 {

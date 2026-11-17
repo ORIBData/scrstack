@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
@@ -32,6 +33,17 @@ func registerFilter(r *http.Request) (assessments.RegisterFilter, bool) {
 		f.Asset = id
 	}
 	f.Status, f.Severity, f.Type = q.Get("status"), q.Get("severity"), q.Get("type")
+	f.Assignee = strings.TrimSpace(q.Get("assignee"))
+	if raw := q.Get("unassigned"); raw != "" {
+		unassigned, err := strconv.ParseBool(raw)
+		if err != nil {
+			return f, false
+		}
+		f.Unassigned = unassigned
+	}
+	if len(f.Assignee) > 100 {
+		return f, false
+	}
 	if (f.Status != "" && !registerStatuses[f.Status]) || (f.Severity != "" && !registerSeverities[f.Severity]) || len(f.Type) > 40 {
 		return f, false
 	}
@@ -147,7 +159,7 @@ func (h assessmentHandler) registerExport(ctx context.Context, w http.ResponseWr
 				w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 				w.Header().Set("Content-Disposition", `attachment; filename="register.csv"`)
 				out = csv.NewWriter(w)
-				_ = out.Write([]string{"id", "asset_id", "ref", "type", "advisory_id", "title", "severity", "score", "status", "component", "version", "purl", "first_seen", "last_seen", "waiver_until"})
+				_ = out.Write([]string{"id", "asset_id", "ref", "type", "advisory_id", "title", "severity", "score", "status", "component", "version", "purl", "first_seen", "last_seen", "waiver_until", "assignee"})
 			} else {
 				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Content-Disposition", `attachment; filename="register.json"`)
@@ -163,7 +175,7 @@ func (h assessmentHandler) registerExport(ctx context.Context, w http.ResponseWr
 				if f.WaiverUntil != nil {
 					until = f.WaiverUntil.UTC().Format(time.RFC3339)
 				}
-				_ = out.Write([]string{f.ID.String(), f.AssetID.String(), csvSafe(f.Ref), f.Type, csvSafe(f.AdvisoryID), csvSafe(f.Title), f.Severity, strconv.Itoa(f.Score), f.Status, csvSafe(f.Component.Name), csvSafe(f.Component.Version), csvSafe(f.Component.PURL), f.FirstSeen.UTC().Format(time.RFC3339), f.LastSeen.UTC().Format(time.RFC3339), until})
+				_ = out.Write([]string{f.ID.String(), f.AssetID.String(), csvSafe(f.Ref), f.Type, csvSafe(f.AdvisoryID), csvSafe(f.Title), f.Severity, strconv.Itoa(f.Score), f.Status, csvSafe(f.Component.Name), csvSafe(f.Component.Version), csvSafe(f.Component.PURL), f.FirstSeen.UTC().Format(time.RFC3339), f.LastSeen.UTC().Format(time.RFC3339), until, csvSafe(f.Assignee)})
 			} else {
 				if total > 0 {
 					_, _ = w.Write([]byte(","))

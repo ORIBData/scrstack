@@ -81,6 +81,14 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.importReport(w, r, principal)
 		return
 	}
+	if strings.HasSuffix(r.URL.Path, "/sbom-diff") {
+		h.sbomDiff(ctx, w, r)
+		return
+	}
+	if strings.HasSuffix(r.URL.Path, "/revisions") {
+		h.revisions(ctx, w, r)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/last-known-good") {
 		asset, err := uuid.Parse(r.PathValue("id"))
 		if err != nil {
@@ -462,8 +470,16 @@ func (h assessmentHandler) register(ctx context.Context, w http.ResponseWriter, 
 		return
 	}
 	id, err := uuid.Parse(parts[0])
-	if err != nil || len(parts) > 2 {
+	if err != nil || len(parts) > 3 || (len(parts) == 3 && parts[1] != "comments") {
 		writeError(w, 404, "not found")
+		return
+	}
+	if len(parts) >= 2 && parts[1] == "comments" {
+		h.comments(ctx, w, r, principal, id, parts[2:])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "assignee" {
+		h.assignee(ctx, w, r, principal, id)
 		return
 	}
 	if r.Method == "GET" && len(parts) == 2 && parts[1] == "events" {
@@ -734,4 +750,72 @@ func (h assessmentHandler) sbomDownload(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	h.sbom(ctx, w, r, a)
+}
+
+// revisions lists the assessed revisions of an asset, newest first (AST-001).
+func (h assessmentHandler) revisions(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	asset, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, 404, "asset unavailable")
+		return
+	}
+	q := r.URL.Query()
+	limit := 50
+	if raw := q.Get("limit"); raw != "" {
+		if limit, err = strconv.Atoi(raw); err != nil || limit < 1 || limit > 200 {
+			writeError(w, 400, "limit must be 1 to 200")
+			return
+		}
+	}
+	var before *time.Time
+	if raw := q.Get("before"); raw != "" {
+		t, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil {
+			writeError(w, 400, "before must be an RFC 3339 time")
+			return
+		}
+		before = &t
+	}
+	items, err := h.store.Revisions(ctx, asset, q.Get("ref"), before, limit)
+	if err != nil {
+		assessmentError(w, err)
+		return
+	}
+	next := ""
+	if len(items) == limit {
+		next = items[len(items)-1].CreatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	writeJSON(w, 200, map[string]any{"items": items, "next_before": next})
+}
+
+// sbomDiff compares the packages of two revisions of an asset (SBOM-diff).
+func (h assessmentHandler) sbomDiff(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+	asset, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, 404, "asset unavailable")
+		return
+	}
+	q := r.URL.Query()
+	limit := 500
+	if raw := q.Get("limit"); raw != "" {
+		if limit, err = strconv.Atoi(raw); err != nil || limit < 1 || limit > 5000 {
+			writeError(w, 400, "limit must be 1 to 5000")
+			return
+		}
+	}
+	if q.Get("from") == "" || q.Get("to") == "" {
+		writeError(w, 400, "from and to are required: a commit, an image digest or an assessment id")
+		return
+	}
+	diff, err := h.store.DiffSBOM(ctx, asset, q.Get("from"), q.Get("to"), limit)
+	switch {
+	case errors.Is(err, assessments.ErrNotFound):
+		writeError(w, 404, "no successful assessment of this asset matches from or to")
+	case errors.Is(err, assessments.ErrInput):
+		writeError(w, 400, "from and to must be a commit, an image digest or an assessment id, and an SBOM is limited to 200000 components")
+	case err != nil:
+		assessmentError(w, err)
+	default:
+		writeJSON(w, 200, diff)
+	}
 }
