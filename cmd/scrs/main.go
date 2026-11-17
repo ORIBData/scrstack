@@ -17,6 +17,7 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/embed"
 	"github.com/ORIBData/scrstack/internal/httpapi"
 	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/netguard"
@@ -197,10 +198,25 @@ func main() {
 	if n, err := strconv.Atoi(os.Getenv("SCRS_EVENTS_STREAMS_PER_TOKEN")); err == nil && n > 0 && n <= 100 {
 		live.PerToken = n
 	}
+	// Chronicle search and vector backfill need the self-hosted embedding
+	// server; without one those two endpoints answer 503.
+	var embedder httpapi.Embedder
+	if cfg, on, err := embed.ConfigFromEnv(); on {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "embedding is configured incorrectly: "+err.Error())
+			os.Exit(2)
+		}
+		client, err := embed.New(cfg, netguard.Hosts(os.Getenv("SCRS_EMBED_PRIVATE_HOSTS")))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "embedding is configured incorrectly: "+err.Error())
+			os.Exit(2)
+		}
+		embedder = client
+	}
 	platformStatus := httpapi.NewPlatformStatus(dependencyProbe, assessmentStore, sastClient, qaRunner).WithDependencyTrack(netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS")))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), LLMAllowSource: llm.AllowSourceToHosted(), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, Status: platformStatus, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{Embedder: embedder, GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), LLMAllowSource: llm.AllowSourceToHosted(), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, Status: platformStatus, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,

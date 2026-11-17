@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -114,9 +115,11 @@ func (w Worker) aiReview(ctx context.Context, r assessments.AIReview) (assessmen
 	knowledgeStore := w.Store.Knowledge()
 	budget := w.budgetFor(provider, settings)
 	problems, cutOff := 0, 0
+	// What the static analyzers already found, so the model builds on it.
+	toolNotes := w.staticAnalysisNotes(ctx, *r.AssessmentID)
 	for _, p := range paths {
 		code := string(snap.Files[p])
-		prompt := review.UserPrompt(p, code)
+		prompt := review.UserPromptWithTools(p, code, toolNotes[p])
 		in := knowledge.EstimateTokens(review.SystemPrompt + prompt)
 		if err := knowledgeStore.Reserve(ctx, *r.AssessmentID, budget, in, int64(provider.MaxTokens)); err != nil {
 			if errors.Is(err, knowledge.ErrBudget) {
@@ -231,4 +234,58 @@ func budgetMessage(err error) string {
 		return "the provider's monthly token cap was reached; raise SCRS_LLM_MONTHLY_INPUT_TOKENS and SCRS_LLM_MONTHLY_OUTPUT_TOKENS (0 removes a cap) or wait for the next month"
 	}
 	return "the token budget for this assessment was reached; raise SCRS_LLM_ASSESSMENT_INPUT_TOKENS and SCRS_LLM_ASSESSMENT_OUTPUT_TOKENS"
+}
+
+// staticAnalysisNotes reads the SAST entries of the assessment under review
+// and groups them by file. Failure to read them only means the model reviews
+// without that context.
+func (w Worker) staticAnalysisNotes(ctx context.Context, assessment uuid.UUID) map[string][]review.ToolNote {
+	var all []assessments.Finding
+	after := uuid.Nil
+	for page := 0; page < 10; page++ {
+		items, err := w.Store.Findings(ctx, assessment, uuid.Nil, after)
+		if err != nil {
+			break
+		}
+		all = append(all, items...)
+		if len(items) <= 100 {
+			break
+		}
+		after = items[99].ID
+	}
+	return notesFromFindings(all)
+}
+
+// notesFromFindings groups static-analysis entries by file, most severe
+// first, skipping lines the code itself suppresses.
+func notesFromFindings(findings []assessments.Finding) map[string][]review.ToolNote {
+	rank := map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+	out := map[string][]review.ToolNote{}
+	for _, f := range findings {
+		if f.Type != "sast" {
+			continue
+		}
+		var e struct {
+			Tool       string `json:"tool"`
+			RuleID     string `json:"rule_id"`
+			Path       string `json:"path"`
+			StartLine  int    `json:"start_line"`
+			Suppressed bool   `json:"suppressed_in_code"`
+		}
+		if json.Unmarshal(f.Evidence, &e) != nil || e.Path == "" || e.Suppressed {
+			continue
+		}
+		out[e.Path] = append(out[e.Path], review.ToolNote{Tool: e.Tool, Rule: e.RuleID, Line: e.StartLine, Severity: f.Severity, Title: f.Title})
+	}
+	for path := range out {
+		notes := out[path]
+		sort.SliceStable(notes, func(i, j int) bool {
+			if rank[notes[i].Severity] != rank[notes[j].Severity] {
+				return rank[notes[i].Severity] < rank[notes[j].Severity]
+			}
+			return notes[i].Line < notes[j].Line
+		})
+		out[path] = notes
+	}
+	return out
 }

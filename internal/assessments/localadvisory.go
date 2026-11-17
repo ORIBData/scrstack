@@ -12,15 +12,15 @@ import (
 	"unicode"
 
 	"github.com/ORIBData/scrstack/internal/advisory"
+	"github.com/ORIBData/scrstack/internal/semver"
 	"github.com/jackc/pgx/v5"
 )
 
 // Local advisories (OSV-008) are OSV records an operator writes for what no
 // public database knows, such as an internal package found compromised. They
 // are stored in advisory_records with origin "local" and ids x_SCRS-<year>-<n>.
-// They are searchable and show up in GET /intel/vulnerabilities/{id}; they do
-// not create register entries by themselves, and `affected` lists the
-// components that match them in the latest assessments.
+// They are searchable, show up in GET /intel/vulnerabilities/{id}, and open
+// register entries for the components they name (see localmatch.go).
 
 // OriginLocal is the origin of operator-written advisories.
 const OriginLocal = "local"
@@ -39,13 +39,16 @@ type LocalPackage struct {
 	PURL      string `json:"purl,omitempty"`
 }
 
-// LocalAffected is one affected package with its explicit versions. SCRS
-// carries no version comparators, so ranges are not accepted: list the
-// versions, or set all_versions for a package that is bad in every release.
+// LocalAffected is one affected package: explicit versions, semantic-version
+// ranges for ecosystems that order versions that way (npm, Go, crates.io,
+// NuGet, Hex, Pub), or all_versions for a package that is bad in every
+// release. Ranges of other ecosystems (PyPI, Maven, Debian, RubyGems) are
+// refused: list their versions instead.
 type LocalAffected struct {
-	Package     LocalPackage `json:"package"`
-	Versions    []string     `json:"versions,omitempty"`
-	AllVersions bool         `json:"all_versions,omitempty"`
+	Package     LocalPackage   `json:"package"`
+	Versions    []string       `json:"versions,omitempty"`
+	Ranges      []semver.Range `json:"ranges,omitempty"`
+	AllVersions bool           `json:"all_versions,omitempty"`
 }
 
 // LocalAdvisoryInput is the body of POST /advisories.
@@ -57,6 +60,12 @@ type LocalAdvisoryInput struct {
 	Affected   []LocalAffected      `json:"affected"`
 	References []advisory.Reference `json:"references"`
 	CWE        []string             `json:"cwe"`
+	// Malicious marks the package as malicious (a compromised release, a
+	// backdoor): its entries are `malicious_dependency`, critical, and fail the
+	// gate. Otherwise Rating (critical, high, medium or low; default high)
+	// sets the severity of a `vulnerability` entry.
+	Malicious bool   `json:"malicious"`
+	Rating    string `json:"rating"`
 }
 
 func inputError(format string, args ...any) error {
@@ -109,14 +118,28 @@ func (in LocalAdvisoryInput) validate() error {
 	if len(in.Affected) == 0 || len(in.Affected) > 50 {
 		return inputError("1 to 50 affected packages are required")
 	}
+	if in.Rating != "" && ratingScore[in.Rating] == 0 {
+		return inputError("rating must be critical, high, medium or low")
+	}
 	for _, a := range in.Affected {
 		switch {
 		case !ecosystemPattern.MatchString(a.Package.Ecosystem) || !printable(a.Package.Name, 214) || len(a.Package.PURL) > 500:
 			return inputError("each affected package needs an ecosystem and a name")
-		case a.AllVersions == (len(a.Versions) > 0):
-			return inputError("list the affected versions, or set all_versions, for %s", a.Package.Name)
+		case a.AllVersions && (len(a.Versions) > 0 || len(a.Ranges) > 0):
+			return inputError("all_versions cannot be combined with versions or ranges for %s", a.Package.Name)
+		case !a.AllVersions && len(a.Versions) == 0 && len(a.Ranges) == 0:
+			return inputError("list the affected versions or ranges, or set all_versions, for %s", a.Package.Name)
 		case len(a.Versions) > 500:
 			return inputError("at most 500 versions per package")
+		case len(a.Ranges) > 20:
+			return inputError("at most 20 ranges per package")
+		case len(a.Ranges) > 0 && !semver.Supported(a.Package.Ecosystem):
+			return inputError("ranges are supported for npm, Go, crates.io, NuGet, Hex and Pub; list the affected versions of %s", a.Package.Name)
+		}
+		for _, r := range a.Ranges {
+			if !r.Valid() {
+				return inputError("a range of %s needs a valid introduced version below its fixed or last_affected version, and not both fixed and last_affected", a.Package.Name)
+			}
 		}
 		for _, v := range a.Versions {
 			if !printable(v, 100) {
@@ -157,10 +180,32 @@ func (s *Store) CreateLocalAdvisory(ctx context.Context, in LocalAdvisoryInput, 
 		entry := map[string]any{"package": pkg}
 		if a.AllVersions {
 			entry["database_specific"] = map[string]any{"all_versions": true}
-		} else {
+		}
+		if len(a.Versions) > 0 {
 			entry["versions"] = a.Versions
 		}
+		if len(a.Ranges) > 0 {
+			ranges := make([]map[string]any, len(a.Ranges))
+			for j, r := range a.Ranges {
+				introduced := r.Introduced
+				if introduced == "" {
+					introduced = "0"
+				}
+				events := []map[string]string{{"introduced": introduced}}
+				if r.Fixed != "" {
+					events = append(events, map[string]string{"fixed": r.Fixed})
+				} else if r.LastAffected != "" {
+					events = append(events, map[string]string{"last_affected": r.LastAffected})
+				}
+				ranges[j] = map[string]any{"type": "SEMVER", "events": events}
+			}
+			entry["ranges"] = ranges
+		}
 		affected[i] = entry
+	}
+	rating := in.Rating
+	if rating == "" {
+		rating = "high"
 	}
 	aliases, severity, references, cwe := in.Aliases, in.Severity, in.References, in.CWE
 	if aliases == nil {
@@ -180,16 +225,42 @@ func (s *Store) CreateLocalAdvisory(ctx context.Context, in LocalAdvisoryInput, 
 		"modified": now.Format(time.RFC3339), "published": now.Format(time.RFC3339),
 		"aliases": aliases, "summary": strings.TrimSpace(in.Summary), "details": in.Details,
 		"severity": severity, "affected": affected, "references": references,
-		"database_specific": map[string]any{"cwe": cwe, "created_by": by},
+		"database_specific": map[string]any{"cwe": cwe, "created_by": by, "malicious": in.Malicious, "rating": rating},
 	})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.advisory_records(origin,id,cve,modified,withdrawn,record,raw) VALUES($1,$2,'',$3,false,$4,$4)`, OriginLocal, id, now, record); err != nil {
 		return nil, err
 	}
-	details, _ := json.Marshal(map[string]any{"id": id, "by": by, "packages": len(in.Affected)})
+	var adv localAdvisory
+	if err := json.Unmarshal(record, &adv); err != nil {
+		return nil, err
+	}
+	opened, err := s.applyLocalAdvisory(ctx, tx, adv)
+	if err != nil {
+		return nil, err
+	}
+	details, _ := json.Marshal(map[string]any{"id": id, "by": by, "packages": len(in.Affected), "malicious": in.Malicious, "entries_opened": opened})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('advisory.created',$1)`, details); err != nil {
 		return nil, err
 	}
-	return record, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return withCount(record, "register_entries_opened", int64(opened)), nil
+}
+
+// withCount adds a top-level count to a stored record for the response; the
+// stored OSV document is left as it is.
+func withCount(record json.RawMessage, key string, n int64) json.RawMessage {
+	var doc map[string]any
+	if json.Unmarshal(record, &doc) != nil {
+		return record
+	}
+	doc[key] = n
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return record
+	}
+	return out
 }
 
 // WithdrawLocalAdvisory marks a local advisory withdrawn with a reason. It is
@@ -232,11 +303,18 @@ func (s *Store) WithdrawLocalAdvisory(ctx context.Context, id, reason, by string
 	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.advisory_records SET withdrawn=true,modified=$3,record=$4,raw=$4 WHERE origin=$1 AND id=$2`, OriginLocal, id, now, updated); err != nil {
 		return nil, err
 	}
-	details, _ := json.Marshal(map[string]any{"id": id, "by": by})
+	closed, err := s.closeLocalAdvisoryFindings(ctx, tx, id, strings.TrimSpace(reason))
+	if err != nil {
+		return nil, err
+	}
+	details, _ := json.Marshal(map[string]any{"id": id, "by": by, "entries_closed": closed})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,details) VALUES('advisory.withdrawn',$1)`, details); err != nil {
 		return nil, err
 	}
-	return updated, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return withCount(updated, "register_entries_closed", closed), nil
 }
 
 // AdvisoryFilter narrows an advisory search. Empty fields match everything.
@@ -317,10 +395,12 @@ type AffectedComponent struct {
 	Component    Component `json:"component"`
 }
 
-// AffectedBy lists, for a local advisory, the components in the newest
-// successful assessment of each asset and ref that match one of its
-// affected packages and versions (at most 1000 rows). It reads stored
-// inventories only; nothing is rescanned and no register entry is created.
+// AffectedBy lists, for a local advisory that is not withdrawn, the
+// components in the newest successful assessment of each asset and ref that
+// match one of its affected packages, versions or ranges (at most 1000 rows).
+// It reads stored inventories only; nothing is rescanned. Register entries for
+// these components are opened when the advisory is created and at each later
+// assessment.
 func (s *Store) AffectedBy(ctx context.Context, id string) ([]AffectedComponent, error) {
 	if !localIDPattern.MatchString(id) {
 		return nil, ErrNotFound
@@ -333,26 +413,15 @@ func (s *Store) AffectedBy(ctx context.Context, id string) ([]AffectedComponent,
 	if err != nil {
 		return nil, err
 	}
-	var doc struct {
-		Affected []struct {
-			Package  LocalPackage `json:"package"`
-			Versions []string     `json:"versions"`
-			Spec     struct {
-				All bool `json:"all_versions"`
-			} `json:"database_specific"`
-		} `json:"affected"`
-	}
-	if err := json.Unmarshal(record, &doc); err != nil {
+	var adv localAdvisory
+	if err := json.Unmarshal(record, &adv); err != nil {
 		return nil, err
 	}
 	out := []AffectedComponent{}
-	for _, a := range doc.Affected {
-		if len(out) >= 1000 {
-			break
-		}
-		rows, err := s.pool.Query(ctx, `WITH latest AS (SELECT DISTINCT ON (asset_id,request->'target'->>'ref') id,asset_id,request->'target'->>'ref' AS ref,resolved_commit FROM `+s.schema+`.assessments WHERE status='succeeded' AND request->'remediation' IS NULL AND resolved_commit<>'' ORDER BY asset_id,request->'target'->>'ref',created_at DESC,id DESC)
-			SELECT l.asset_id::text,x.locator,COALESCE(l.ref,''),l.id::text,l.resolved_commit,c.body FROM latest l JOIN `+s.schema+`.components c ON c.assessment_id=l.id JOIN `+s.schema+`.assets x ON x.id=l.asset_id
-			WHERE lower(c.body->>'ecosystem')=lower($1) AND lower(c.body->>'name')=lower($2) AND ($3 OR c.body->>'version'=ANY($4)) ORDER BY x.locator,l.ref,c.ordinal LIMIT $5`, a.Package.Ecosystem, a.Package.Name, a.Spec.All, a.Versions, 1000-len(out))
+	seen := map[string]bool{}
+	for _, a := range adv.Affected {
+		rows, err := s.pool.Query(ctx, `WITH latest AS (SELECT DISTINCT ON (asset_id,request->'target'->>'ref') id,asset_id,request->'target'->>'ref' AS ref,resolved_commit FROM `+s.schema+`.assessments WHERE status='succeeded' AND request->'remediation' IS NULL AND request->'import' IS NULL ORDER BY asset_id,request->'target'->>'ref',created_at DESC)
+			SELECT l.asset_id::text,x.locator,COALESCE(l.ref,''),l.id::text,l.resolved_commit,c.body FROM latest l JOIN `+s.schema+`.components c ON c.assessment_id=l.id JOIN `+s.schema+`.assets x ON x.id=l.asset_id WHERE lower(replace(replace(c.body->>'name','_','-'),'.','-'))=lower(replace(replace($1,'_','-'),'.','-')) ORDER BY x.locator,l.ref,c.ordinal LIMIT 5000`, a.Package.Name)
 		if err != nil {
 			return nil, err
 		}
@@ -363,11 +432,17 @@ func (s *Store) AffectedBy(ctx context.Context, id string) ([]AffectedComponent,
 				rows.Close()
 				return nil, err
 			}
-			if err := json.Unmarshal(body, &hit.Component); err != nil {
-				rows.Close()
-				return nil, err
+			if err := json.Unmarshal(body, &hit.Component); err != nil || !adv.matches(hit.Component) {
+				continue
 			}
-			out = append(out, hit)
+			key := hit.AssessmentID + "\x00" + hit.Component.PURL + "\x00" + hit.Component.Path
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if len(out) < 1000 {
+				out = append(out, hit)
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {

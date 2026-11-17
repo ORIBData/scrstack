@@ -50,16 +50,19 @@ type Snapshotter interface {
 	Snapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error)
 }
 type Worker struct {
-	Source                   Snapshotter
-	Images                   ImageSource
-	MaxImageBytes            int64
-	Store                    *assessments.Store
-	Connections              *connections.Store
-	Artifacts                Artifacts
-	ScannerURL, ScannerToken string
-	Logger                   *slog.Logger
-	AutoRemediation          bool
-	Notify                   *notify.Store
+	Source Snapshotter
+	// RemediationURL and RemediationToken address a separate remediation
+	// sandbox (REM-002); empty, remediation uses the scanner and its token.
+	RemediationURL, RemediationToken string
+	Images                           ImageSource
+	MaxImageBytes                    int64
+	Store                            *assessments.Store
+	Connections                      *connections.Store
+	Artifacts                        Artifacts
+	ScannerURL, ScannerToken         string
+	Logger                           *slog.Logger
+	AutoRemediation                  bool
+	Notify                           *notify.Store
 	// Uploads reads the source archives behind `uploaded` assets; nil makes
 	// assessments of uploaded assets fail instead of fetching anything.
 	Uploads interface {
@@ -388,8 +391,9 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 			return err
 		}
 	}
-	endpoint := w.ScannerURL
+	endpoint, bearer := w.ScannerURL, w.ScannerToken
 	if a.Request.Remediation != nil {
+		endpoint, bearer = w.remediationTarget()
 		target, _ := url.Parse(endpoint)
 		target.Path = "/remediate"
 		query := url.Values{}
@@ -431,7 +435,7 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+w.ScannerToken)
+	request.Header.Set("Authorization", "Bearer "+bearer)
 	request.Header.Set("Content-Type", contentType)
 	client := &http.Client{Timeout: 4 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(request)
@@ -691,6 +695,17 @@ func (w Worker) runImage(ctx context.Context, a *assessments.Assessment, c conne
 	}
 	stages = append(stages, extra...)
 	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: result.digest, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: sbomDigest, Complete: true})
+}
+
+// remediationTarget is where a remediation job is sent and the token that
+// authorizes it: the separate sandbox (REM-002) when one is configured, the
+// scanner otherwise. A sandbox with no token of its own is refused, so the
+// scanner's token never goes to a different service.
+func (w Worker) remediationTarget() (endpoint, bearer string) {
+	if w.RemediationURL == "" {
+		return w.ScannerURL, w.ScannerToken
+	}
+	return w.RemediationURL, w.RemediationToken
 }
 
 // uploadArchive reads the archive an upload target names. The archive is

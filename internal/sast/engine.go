@@ -133,6 +133,9 @@ func (e *Engine) Analyze(ctx context.Context, root, scratch string, req Request)
 	}
 	sort.Strings(resp.Unsupported)
 	correlate(resp.Findings)
+	if req.Reachability {
+		resp.Imports = ScanImports(ws)
+	}
 	if req.Reachability && e.Reacher != nil {
 		dir := filepath.Join(scratch, "govulncheck")
 		_ = os.MkdirAll(dir, 0o700)

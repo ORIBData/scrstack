@@ -313,6 +313,9 @@ type Response struct {
 	Findings     []Finding      `json:"findings"`
 	Languages    map[string]int `json:"languages"`
 	Reachability *Reachability  `json:"reachability,omitempty"`
+	// Imports is the import-level fallback for npm and PyPI (REA-005), set
+	// whenever reachability was requested.
+	Imports *Imports `json:"imports,omitempty"`
 	// Unsupported lists detected languages no enabled analyzer covers.
 	Unsupported []string `json:"unsupported_languages"`
 	Truncated   bool     `json:"truncated"`

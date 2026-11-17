@@ -205,7 +205,7 @@ SHA-256 object-format repositories are not supported.
 The full list, by PRD milestone, is in the README roadmap. For this pipeline:
 
 - SAST and Go reachability run in `scrs-sast` when enabled (M9, see [SAST.md](SAST.md));
-  reachability beyond Go is unsupported.
+  reachability for npm and PyPI is import-level only, and other ecosystems beyond Go are unsupported.
 - NVD, CVE Program and VEX/CSAF advisory sources, and the source registry with per-source health (M4).
 - Retention classes beyond raw inbound events and the webhook delivery log, and the
   reset/rebuild/sensor-update maintenance actions (M5).

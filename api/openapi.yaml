@@ -150,7 +150,7 @@ tags:
   - name: Live events
     description: Server-sent events for frontends (OUT-004). Fire-and-forget notices of committed events; webhooks remain the guaranteed delivery path.
   - name: SAST
-    description: Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, run in the scrs-sast sandbox without SCRS secrets.
+    description: Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer), Go call-graph reachability and npm and PyPI import-level reachability, run in the scrs-sast sandbox without SCRS secrets.
   - name: LLM providers
     description: |
       Model endpoints (OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server) that draft QA tests and review code (admin).
@@ -1617,7 +1617,8 @@ paths:
       operationId: requestRemediation
       security: [{bearerAuth: [write]}]
       summary: Request a fix plan
-      description: Queues a sandboxed plan for one manifest of a completed assessment (`package-lock.json` with `in-place`, or `pom.xml` with `override`). Fetch the result from `/assessments/{id}/remediation`. Scope `write`.
+      description: |
+        Queues a sandboxed plan for one manifest of a completed assessment (`package-lock.json` with `in-place`, or `pom.xml` with `override`). The plan is advice only: SCRS never writes to the repository. It is computed by `osv-scanner fix` in a separate sandbox container (`scrs-remediator`) that has its own token and no database, storage, provider or scanner credentials, works in a disposable filesystem with CPU, memory and time limits, runs no package-manager scripts, and reaches only package registries and deps.dev through an allow-listed proxy. Fetch the result from `/assessments/{id}/remediation`. Scope `write`.
       parameters: [{$ref: '#/components/parameters/IdempotencyKey'}]
       requestBody:
         required: true
@@ -1956,7 +1957,7 @@ paths:
       operationId: getDelivery
       security: [{bearerAuth: [admin]}]
       summary: Get one delivery
-      description: Includes the payload. Scope `admin`.
+      description: 'One outbound delivery attempt to a subscription: the event sent (the signed payload, which can carry findings), the receiver''s HTTP status, the attempt count and the error if it failed. Use it to debug a receiver such as n8n; resend with `:redeliver`. Scope `admin`.'
       responses:
         '200': {description: Delivery, content: {application/json: {schema: {$ref: '#/components/schemas/Delivery'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2449,7 +2450,9 @@ paths:
       security: [{bearerAuth: [write]}]
       summary: Create a local advisory
       description: |
-        Writes an OSV 1.9.2 record for something no public database knows, such as an internal package found compromised (OSV-008). SCRS assigns the id `x_SCRS-<year>-<number>` (the `x_` prefix marks a local database). Name each affected package with its explicit `versions`, or `all_versions` true for a package bad in every release: SCRS has no version comparators, so ranges are not accepted. A reference needs an OSV type and an http or https URL. The advisory is searchable, appears in `GET /intel/vulnerabilities/{id}`, and `GET /advisories/{id}/affected` lists the components in the latest assessments that match it. It does not create register entries or change a verdict by itself. Audited. Scope `write`.
+        Writes an OSV 1.9.2 record for something no public database knows, such as an internal package found compromised (OSV-008). SCRS assigns the id `x_SCRS-<year>-<number>` (the `x_` prefix marks a local database).
+        Name each affected package by `versions` (exact), `ranges` (`introduced` inclusive, then `fixed` exclusive or `last_affected` inclusive; semantic versioning, so only npm, Go, crates.io, NuGet, Hex and Pub; other ecosystems such as PyPI and Maven take `versions`), or `all_versions` true. A package name matches ignoring case, and PyPI names ignore `-`, `_` and `.`.
+        **It opens register entries.** At creation SCRS matches the advisory against the newest stored inventory of every asset and ref, with no rescan, and every later assessment matches it too. A `malicious: true` advisory raises `malicious_dependency` entries (critical, fails the verdict, emits `malicious_dependency.reported`); otherwise `rating` (critical, high, medium or low; default high) sets the severity of a `vulnerability` entry. Entries close when a scan no longer finds the affected component, and at once when the advisory is withdrawn. The response is the stored record plus `register_entries_opened`. A reference needs an OSV type and an http or https URL. The advisory is searchable and appears in `GET /intel/vulnerabilities/{id}`; `GET /advisories/{id}/affected` lists what matches now. Audited. Scope `write`.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/LocalAdvisoryInput'}}}
@@ -2487,7 +2490,7 @@ paths:
       operationId: withdrawLocalAdvisory
       security: [{bearerAuth: [write]}]
       summary: Withdraw a local advisory
-      description: Marks a local advisory withdrawn with a reason (8 to 1000 characters). The record is kept and audited. Only local advisories can be withdrawn; public records are managed by their source. Scope `write`.
+      description: Marks a local advisory withdrawn with a reason (8 to 1000 characters). The record is kept and audited, its open register entries are closed (`fixed`, with an `advisory_withdrawn` event in each history) and the response carries `register_entries_closed`. Only local advisories can be withdrawn; public records are managed by their source. Scope `write`.
       requestBody:
         required: true
         content: {application/json: {schema: {type: object, additionalProperties: false, required: [reason], properties: {reason: {type: string, minLength: 8, maxLength: 1000}}}}}
@@ -2508,7 +2511,7 @@ paths:
       security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Components a local advisory names
       description: |
-        For a local advisory that is not withdrawn, the components in the newest successful assessment of each asset and ref whose ecosystem, name and version match an affected package (at most 1000 rows; `truncated` says when more exist). It reads stored inventories: nothing is rescanned and no register entry is created. Scope `read` or `write`.
+        For a local advisory that is not withdrawn, the components in the newest successful assessment of each asset and ref whose ecosystem, name and version match an affected package, version or range (at most 1000 rows; `truncated` says when more exist). It reads stored inventories: nothing is rescanned. The register entries for these components are opened when the advisory is created and at each later assessment. Scope `read` or `write`.
       responses:
         '200': {description: Matching components, content: {application/json: {schema: {$ref: '#/components/schemas/AdvisoryAffected'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -2894,7 +2897,7 @@ paths:
       operationId: reachabilityCapabilities
       security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
       summary: Reachability capabilities
-      description: Ecosystems, methods and tool versions for reachability (REA-007). Go uses the govulncheck call graph; every other ecosystem reports `unsupported`. A failed or skipped analysis is `unknown`, never `not_reachable` (REA-003). Scope `read` or `write`.
+      description: Ecosystems, methods and tool versions for reachability (REA-007). Go uses the govulncheck call graph (`reachable`, `imported_only`, `not_reachable`). npm and PyPI use an import-level reading of the repository's own source (`imported_only` when it imports the package, otherwise `unknown`, never `not_reachable`, because another dependency may still reach it). Other ecosystems report `unsupported`. A failed or skipped analysis is `unknown`, never `not_reachable` (REA-003). Scope `read` or `write`.
       responses:
         '200': {description: Capabilities, content: {application/json: {schema: {type: object, properties: {enabled_by_default: {type: boolean}, capabilities: {type: array, items: {type: object}}}}}}}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -3695,7 +3698,7 @@ paths:
       operationId: getInboundEvent
       security: [{bearerAuth: [admin]}]
       summary: Get an inbound event
-      description: Includes the raw body. Scope `admin`.
+      description: 'One stored webhook or registry delivery with its raw body, exactly as received (provider headers are not kept), the assessment it started if any, and how it arrived (`direct` or `relay`). The body can name people and repositories, so it needs `admin`. Replay it with `POST /events/inbound/{id}:replay`. Scope `admin`.'
       responses:
         '200': {description: Event, content: {application/json: {schema: {$ref: '#/components/schemas/InboundEvent'}}}}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -3950,6 +3953,24 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /knowledge:backfill:
+    post:
+      tags: [Advisories and summaries]
+      operationId: backfillKnowledgeVectors
+      security: [{bearerAuth: [admin]}]
+      summary: Index documents that have no vectors
+      description: |
+        Embeds documents stored while the embedding server was unavailable or before it was configured, oldest first, `limit` per call (default 25, at most 200), so chronicle search can find them. Call it repeatedly until `remaining` is 0; it is safe to repeat and runs one at a time (`409` while another is running). A document that fails to embed is counted in `failed` and tried again next call. `503` when no embedding server is configured. Scope `admin`.
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 25}}
+      responses:
+        '200': {description: Progress, content: {application/json: {schema: {type: object, properties: {model: {type: string}, embedded: {type: integer}, failed: {type: integer}, remaining: {type: integer, description: 'Documents still without vectors after this call'}}}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {description: No embedding server is configured, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /summary-jobs/{id}:
     parameters: [{$ref: '#/components/parameters/Id'}]
     get:
@@ -3986,6 +4007,29 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '429': {$ref: '#/components/responses/RateLimited'}
+  /assets/{id}/chronicle/search:
+    parameters: [{$ref: '#/components/parameters/Id'}]
+    get:
+      tags: [Advisories and summaries]
+      operationId: searchAssetChronicle
+      security: [{bearerAuth: [read]}, {bearerAuth: [write]}]
+      summary: Search the chronicle by meaning
+      description: |
+        Finds the parts of an asset's chronicle (advisories, summaries, code reviews) closest in meaning to a question, for example "what did we decide about the lodash finding?". The question is embedded by the self-hosted embedding server (nothing goes to a hosted provider) and compared with the stored chunks by cosine similarity; each hit is a chunk of text with its document, kind and `score` (0 to 1). Only documents of this asset are searched, superseded ones only with `include_superseded`. A document stored while embedding was unavailable has no vectors and cannot be found: `unindexed_documents` counts them, and `POST /knowledge:backfill` indexes them. `truncated` is true when the asset has more chunks than were compared. `503` when no embedding server is configured, `502` when it fails. Scope `read` or `write`.
+      parameters:
+        - {name: q, in: query, required: true, schema: {type: string, minLength: 1, maxLength: 500}, description: 'The question or topic in plain words'}
+        - {name: k, in: query, schema: {type: integer, minimum: 1, maximum: 20, default: 8}, description: 'How many hits to return'}
+        - {name: kind, in: query, schema: {type: string}, description: 'Comma separated document kinds to search, as for `GET /assets/{id}/chronicle`'}
+        - {name: finding_id, in: query, schema: {type: string, format: uuid}, description: 'Only documents about this register entry'}
+        - {name: include_superseded, in: query, schema: {type: boolean, default: false}}
+      responses:
+        '200': {description: Nearest chunks first, content: {application/json: {schema: {$ref: '#/components/schemas/ChronicleSearchResult'}}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '502': {description: The embedding server could not embed the question, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: No embedding server is configured, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
   /assets/{id}/ai-reviews:
     parameters: [{$ref: '#/components/parameters/Id'}]
     get:
@@ -4006,6 +4050,8 @@ paths:
       summary: Review the code with a self-hosted model
       description: |
         Queues a review of the asset's latest successful git assessment. The worker reads up to `max_files` source files, most risk-prone first (names such as auth, payment, handler, query, client, queue, config), one file per model call. Tests, vendored, generated and minified files, and files over 48 KiB, are skipped and counted in `files_skipped`.
+
+        Each file's prompt also lists what the static analyzers (gosec, Bandit, OpenGrep, Bearer) already reported for it in that assessment (up to 15 notes, skipping lines suppressed in code), so the model does not repeat them and looks for what they missed. Entries of this review are `ai_review`, unverified and report-only, as before.
 
         `provider_id` must be a provider whose `source_allowed` is true (see `GET /llm/providers`): a self-hosted provider, or a hosted one that was opted in with `POST /llm/providers/{id}:allow-source`. The call answers `409` otherwise, and the message says which step is missing. A commit whose verdict is `fail` is never sent to a model.
 
@@ -5024,8 +5070,21 @@ components:
                   ecosystem: {type: string, example: npm}
                   name: {type: string, maxLength: 214}
                   purl: {type: string, maxLength: 500}
-              versions: {type: array, maxItems: 500, items: {type: string, maxLength: 100}, description: Exactly one of `versions` and `all_versions` is required}
-              all_versions: {type: boolean}
+              versions: {type: array, maxItems: 500, items: {type: string, maxLength: 100}, description: 'Exact affected versions. Give `versions`, `ranges` or both, or `all_versions` alone'}
+              ranges:
+                type: array
+                maxItems: 20
+                description: Semantic-version intervals for npm, Go, crates.io, NuGet, Hex and Pub
+                items:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    introduced: {type: string, example: 1.0.0, description: 'First affected version; empty or 0 means from the first release'}
+                    fixed: {type: string, example: 1.2.3, description: 'First unaffected version (exclusive); not with `last_affected`'}
+                    last_affected: {type: string, description: 'Last affected version (inclusive); not with `fixed`'}
+              all_versions: {type: boolean, description: 'Every release is affected; cannot be combined with `versions` or `ranges`'}
+        malicious: {type: boolean, default: false, description: 'The package is malicious (a compromised release, a backdoor): entries are `malicious_dependency`, critical, and fail the verdict'}
+        rating: {type: string, enum: [critical, high, medium, low], default: high, description: Severity of the `vulnerability` entries; ignored when `malicious`}
         references:
           type: array
           maxItems: 50
@@ -5460,6 +5519,7 @@ components:
             sbom_max_age_days: {type: integer, minimum: 0, maximum: 3650, description: An asset without an SBOM this recent is a gap (default 30)}
             sla_critical_days: {type: integer, minimum: 0, maximum: 3650, description: PCI DSS 6.3.3 patch window for critical (default 30)}
             sla_high_days: {type: integer, minimum: 0, maximum: 3650, description: Patch window for high (default 90)}
+            include_ai_summaries: {type: boolean, default: false, description: 'Adds the newest AI-written assessment summary of each asset in scope (see `POST /assessments/{id}/summaries`), marked unverified, in the json, md and pdf formats (csv is unchanged). It changes no count, mapping or gap; the notice `ai_summary_notice` travels with it'}
     ReportJob:
       type: object
       example: {"id": "b8c0d2e4-1f3a-4b5c-8d7e-9a0b1c2d3e4f", "framework": "owasp-top10-2025", "scope": {"kind": "owner", "id": "2f7b9d60-1a4c-4e83-b5d2-6c0e8a1f3b97", "name": "Payments team"}, "since": "2026-08-18T00:00:00Z", "until": "2026-11-16T09:30:00Z", "format": "pdf", "status": "succeeded", "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "size": 48213, "data_as_of": "2026-11-16T09:30:00Z", "scrs_version": "1.0.0", "summary": {"assets": 12, "gaps": 2, "findings_considered": 64, "open": 19, "unmapped": 3}, "created_at": "2026-11-16T09:30:00Z", "completed_at": "2026-11-16T09:30:41Z"}
@@ -6037,6 +6097,28 @@ components:
         error: {type: string}
         created_at: {type: string, format: date-time}
         completed_at: {type: [string, 'null'], format: date-time}
+    ChronicleSearchResult:
+      type: object
+      example: {"query": "lodash prototype pollution", "model": "BAAI/bge-small-en-v1.5", "hits": [{"document_id": "6a7b8c9d-0e1f-4a2b-8c3d-4e5f6a7b8c9d", "seq": 0, "text": "Upgrade lodash to fix the prototype pollution flaw.", "score": 0.91, "kind": "advisory", "title": "Upgrade lodash", "asset_id": "0b6f1c1e-3d52-4a6e-9f4a-1d2c3b4a5e60", "created_at": "2026-11-16T09:30:00Z"}], "candidates": 120, "truncated": false, "unindexed_documents": 0}
+      properties:
+        query: {type: string}
+        model: {type: string, description: 'The embedding model; vectors of other models are never compared'}
+        hits:
+          type: array
+          items:
+            type: object
+            properties:
+              document_id: {type: string, format: uuid, description: 'Read the whole document with `GET /assets/{id}/chronicle`'}
+              seq: {type: integer, description: Chunk number within the document}
+              text: {type: string}
+              score: {type: number, description: Cosine similarity}
+              kind: {type: string}
+              title: {type: string}
+              asset_id: {type: string, format: uuid}
+              created_at: {type: string, format: date-time}
+        candidates: {type: integer, description: Chunks compared}
+        truncated: {type: boolean}
+        unindexed_documents: {type: integer, description: 'Documents of this asset with no vectors; run `POST /knowledge:backfill`'}
     KnowledgeDocument:
       type: object
       description: A text in an asset's chronicle.

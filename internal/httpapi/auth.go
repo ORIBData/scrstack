@@ -30,6 +30,8 @@ type TokenStore interface {
 }
 type principalKey struct{}
 type Security struct {
+	// Embedder embeds text for chronicle search and backfill; nil answers 503.
+	Embedder Embedder
 	// ActionsAPI reads GitHub Actions inventories; nil uses GitHub itself (tests only).
 	ActionsAPI          actionscheck.API
 	GitHubWebhookSecret string
@@ -351,6 +353,9 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/assessments/{id}/summaries", security.protect("read|write", aiSummaries))
 		mux.Handle("GET "+BasePath+"/summary-jobs/{id}", security.protect("read|write", aiSummaries))
 		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle", security.protect("read|write", aiSummaries))
+		knowledgeAPI := &knowledgeHandler{store: security.Assessments, embedder: security.Embedder}
+		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle/search", security.protect("read|write", http.HandlerFunc(knowledgeAPI.search)))
+		mux.Handle("POST "+BasePath+"/knowledge:backfill", security.protect("admin", http.HandlerFunc(knowledgeAPI.backfill)))
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write", qaH))
 		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger", qaH))
 		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger", qaH))

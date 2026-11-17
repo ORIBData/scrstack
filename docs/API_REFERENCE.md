@@ -348,7 +348,7 @@ Server-sent events for frontends (OUT-004). Fire-and-forget notices of committed
 
 ## SAST
 
-Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer) and Go reachability, run in the scrs-sast sandbox without SCRS secrets.
+Bundled static analyzers (gosec, Bandit, OpenGrep, Bearer), Go call-graph reachability and npm and PyPI import-level reachability, run in the scrs-sast sandbox without SCRS secrets.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -398,6 +398,8 @@ Which findings are described: vulnerabilities (SCRS's own and Dependency-Track's
 | GET | `/assessments/{id}/summaries` | `read` or `write` | List an assessment's summary jobs |
 | POST | `/assessments/{id}/summaries` | `write` or `trigger` | Write advisories and a summary for an assessment |
 | GET | `/assets/{id}/chronicle` | `read` or `write` | The asset's chronicle of advisories, summaries and reviews |
+| GET | `/assets/{id}/chronicle/search` | `read` or `write` | Search the chronicle by meaning |
+| POST | `/knowledge:backfill` | `admin` | Index documents that have no vectors |
 | GET | `/summary-jobs/{id}` | `read` or `write` | Get a summary job |
 
 ## AI review

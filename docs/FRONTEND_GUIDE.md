@@ -130,8 +130,9 @@ fixes per day, not the number open at the end of that day; label the chart accor
   (also `GET /intel/vulnerabilities/{id}`).
 - Local advisories (for example an internal package found compromised): `POST /advisories`
   with explicit `versions` or `all_versions: true`. SCRS assigns `x_SCRS-<year>-<n>`.
-  `GET /advisories/{id}/affected` shows which stored components match. A local advisory does
-  not create register findings yet.
+  `GET /advisories/{id}/affected` shows which stored components match. A local advisory opens
+  register entries at once (`register_entries_opened` in the response) and at each later scan; use
+  `malicious: true` for a compromised package, which fails the verdict. Withdrawing closes the entries.
 - Withdraw with `POST /advisories/{id}:withdraw` (kept and audited).
 
 ### Jobs
@@ -163,10 +164,14 @@ the per-kind endpoints, which carry the results. It lists work, not schedules:
 
 ### Reports, licences, SAST, QA, AI
 
-- Reports: `POST /reports` returns a job; poll `GET /reports/{id}` until `succeeded`, then
+- Ask the chronicle: `GET /assets/{id}/chronicle/search?q=...` returns the nearest chunks of the asset's
+  advisories, summaries and reviews with a `score`; show `unindexed_documents` as "N documents not searchable yet"
+  and offer admins `POST /knowledge:backfill` (call until `remaining` is 0). `503` means no embedding server.
+- Reports: `POST /reports` returns a job; add `params.include_ai_summaries: true` to append each asset's newest
+  AI-written summary (always labelled unverified; json, md and pdf only); poll `GET /reports/{id}` until `succeeded`, then
   `GET /reports/{id}/download`. Frameworks come from `GET /reports/frameworks`.
 - Licences: `GET /assets/{id}/licenses`, policy at `/policies/license`.
-- SAST: `/sast/settings`, `/assets/{id}/sast`. QA: `/assets/{id}/qa/*`, runs at `/qa/runs/{id}`.
+- SAST and reachability: `/sast/settings`, `/assets/{id}/sast`. A vulnerability entry's `evidence.reachability.status` is `reachable`, `imported_only`, `not_reachable`, `unknown` or `unsupported` with a `method` (`call_graph` for Go, `import_graph` for npm and PyPI); never treat `unknown` as safe. QA: `/assets/{id}/qa/*`, runs at `/qa/runs/{id}`.
 - AI summaries and code review: `POST /assessments/{id}/summaries`,
   `POST /assets/{id}/ai-reviews`. Both are jobs; poll `GET /summary-jobs/{id}` and
   `GET /ai-reviews/{id}`. They need an enabled provider (`GET /llm/providers`); a hosted
@@ -205,6 +210,5 @@ the per-kind endpoints, which carry the results. It lists work, not schedules:
 
 ## 7. Not available yet
 
-These have no endpoint, so do not design screens that depend on them: register
-entries created from local advisories, comment editing, and finding assignment notifications. See `docs/PRD_PROGRESS_AND_AUDIT.md` for the
+These have no endpoint, so do not design screens that depend on them: comment editing, and finding assignment notifications. See `docs/PRD_PROGRESS_AND_AUDIT.md` for the
 full list.

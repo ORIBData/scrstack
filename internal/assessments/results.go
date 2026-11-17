@@ -159,6 +159,10 @@ func (s *Store) Complete(ctx context.Context, a Assessment, r Result) error {
 	if err := s.licenseFindings(ctx, tx, a, &r); err != nil {
 		return err
 	}
+	// Entries for local advisories (OSV-008).
+	if err := s.localAdvisoryFindings(ctx, tx, a, &r); err != nil {
+		return err
+	}
 	files, err := json.Marshal(r.Files)
 	if err != nil {
 		return ErrInput

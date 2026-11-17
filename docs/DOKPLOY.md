@@ -109,6 +109,15 @@ readiness allows the worker to start. PostgreSQL, Redis and evidence S3 stay ext
 The rebuildable feed cache is a local Docker volume. Review scanner resource limits
 and [pipeline operating constraints](ASSESSMENT_PIPELINE.md) before deploying.
 
+Guided remediation (REM-002) runs in its own container, `scrs-remediator`: the scanner image
+in the `remediation` role, answering only `/remediate` with `SCRS_REMEDIATION_API_TOKEN` (a
+third random token, different from the scanner's). It holds no database, storage, provider or
+scanner credentials, shares one internal network (`remediation`) only with the worker and the
+egress proxy, works in a 256 MiB `noexec` tmpfs, and is limited to 1 CPU, `SCRS_REMEDIATION_MEMORY`
+(default 1g), 128 processes and the request's 4-minute timeout. The scanner itself no longer
+serves `/remediate` (`SCRS_SCANNER_ROLE=scan`). Existing deployments must add
+`SCRS_REMEDIATION_API_TOKEN` before updating the stack.
+
 ## External HTTPS acceptance and optional HTTP node port
 
 Set `SCRS_PUBLIC_BASE_URL=https://your-domain` (or the same URL with `/scrs/v1`)

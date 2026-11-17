@@ -105,7 +105,11 @@ A pay-per-token bill needs a ceiling. Besides the per-assessment budget, every *
 
 **Deployment:** `scrs-embed` (TEI CPU) in the main stack and `compose.model-host.yaml` for the second machine; see [MODEL_HOST.md](MODEL_HOST.md).
 
-Not yet built: similarity search over the chronicle through the API, backfilling vectors for documents stored without them, rendering summaries into the PDF reports, and merging the QA runner's linters with the AI review. QA test generation gets the guard automatically because it uses the client.
+**Chronicle search and backfill.** `GET /assets/{id}/chronicle/search?q=` embeds the question with the same self-hosted server (so the API container joins the internal `embed` network and holds `SCRS_EMBED_*`), compares it with the asset's stored chunks by cosine similarity and returns the nearest chunks with their document and score; `unindexed_documents` says how many documents have no vectors yet. `POST /knowledge:backfill` (admin) embeds those, `limit` documents per call, until `remaining` is 0. Both answer 503 without an embedding server.
+
+**Summaries in reports.** A report requested with `params.include_ai_summaries: true` adds each asset's newest assessment summary to the json, Markdown and PDF output under an "AI-written summaries (unverified)" heading with a notice; it changes no count, mapping or gap, and csv is unchanged.
+
+Not yet built: running real linters in the QA runner and merging their output into the AI review (the review still reads the static-analysis findings, not a linter's), and automatic backfill on a schedule. QA test generation gets the guard automatically because it uses the client.
 
 ## Next
 
@@ -116,3 +120,5 @@ Not yet built: similarity search over the chronicle through the API, backfilling
 6. **Real linters in the QA runner**, merged with the model's review in one result. Needs a job-kind design (the runner has only functional and performance today).
    - The AI review is already stored as `ai_review` entries; the merge adds linter results beside them under one asset view.
 7. **pgvector backend**, if your server has it.
+
+**Static analysis in the review.** Each file's prompt now lists what the static analyzers (gosec, Bandit, OpenGrep, Bearer) already reported for it in the assessment under review (up to 15 notes, most severe first, skipping lines suppressed in code), inside an untrusted-data block, with the instruction not to repeat them and to look for what they missed. They are the linters this stack has; running dedicated linters (ESLint, Ruff, golangci-lint) in the QA runner remains unbuilt.

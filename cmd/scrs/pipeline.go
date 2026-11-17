@@ -181,6 +181,11 @@ func pipelineCommand() error {
 		} else {
 			engine.MaxImageBytes = 400 << 20
 		}
+		if role := os.Getenv("SCRS_SCANNER_ROLE"); !scanner.ValidRole(role) {
+			return errors.New("SCRS_SCANNER_ROLE must be all, scan or remediation")
+		} else {
+			engine.Role = role
+		}
 		if _, err := os.Stat(engine.Binary); err != nil {
 			return errors.New("pinned OSV-Scanner binary unavailable")
 		}
@@ -228,6 +233,12 @@ func pipelineCommand() error {
 		w.Uploads = artifacts
 		if os.Getenv("SCRS_SNAPSHOT_ARCHIVES") == "true" {
 			w.Snapshots = artifacts
+		}
+		// REM-002: guided remediation can run in its own sandbox container with
+		// its own token; unset, it uses the scanner.
+		w.RemediationURL, w.RemediationToken = os.Getenv("SCRS_REMEDIATION_URL"), os.Getenv("SCRS_REMEDIATION_API_TOKEN")
+		if w.RemediationURL != "" && len(w.RemediationToken) < 32 {
+			return errors.New("set a random SCRS_REMEDIATION_API_TOKEN of at least 32 characters, separate from the scanner token, when SCRS_REMEDIATION_URL is set")
 		}
 		dispatcher := &notify.Dispatcher{Store: events, Logger: logger, Document: store.ProfileDocument}
 		go dispatcher.Run(ctx)

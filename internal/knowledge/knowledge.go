@@ -611,3 +611,65 @@ func boundary(text string, max int) int {
 }
 
 func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
+
+// LatestByAssets returns, for each of the assets, its current (not
+// superseded) document of a kind, newest first among the assets. Assets
+// without one are left out.
+func (s *Store) LatestByAssets(ctx context.Context, assets []uuid.UUID, kind string) ([]Document, error) {
+	if len(assets) == 0 {
+		return []Document{}, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+documentColumns+` FROM (SELECT DISTINCT ON (asset_id) * FROM `+s.schema+`.knowledge_documents WHERE asset_id=ANY($1) AND kind=$2 AND superseded_at IS NULL ORDER BY asset_id,created_at DESC,id DESC) d ORDER BY created_at DESC,id`, assets, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Document{}
+	for rows.Next() {
+		d, err := scanDocument(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// MissingVectors returns documents with no chunk embedded by the model,
+// oldest first, at most limit, with how many there are in all. Superseded
+// documents are included: the chronicle keeps them searchable.
+func (s *Store) MissingVectors(ctx context.Context, model string, limit int) ([]Document, int, error) {
+	if model == "" {
+		return nil, 0, ErrInput
+	}
+	if limit < 1 || limit > 500 {
+		limit = 25
+	}
+	var remaining int
+	where := ` FROM ` + s.schema + `.knowledge_documents d WHERE NOT EXISTS(SELECT 1 FROM ` + s.schema + `.knowledge_chunks c WHERE c.document_id=d.id AND c.embed_model=$1)`
+	if err := s.pool.QueryRow(ctx, `SELECT count(*)`+where, model).Scan(&remaining); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+documentColumns+where+` ORDER BY d.created_at,d.id LIMIT $2`, model, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []Document{}
+	for rows.Next() {
+		d, err := scanDocument(rows)
+		if err != nil {
+			return nil, 0, err
+		}
+		out = append(out, d)
+	}
+	return out, remaining, rows.Err()
+}
+
+// CountMissingVectors counts an asset's documents with no chunk embedded by
+// the model, so a search can say its answer is incomplete.
+func (s *Store) CountMissingVectors(ctx context.Context, asset uuid.UUID, model string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `SELECT count(*) FROM `+s.schema+`.knowledge_documents d WHERE d.asset_id=$1 AND NOT EXISTS(SELECT 1 FROM `+s.schema+`.knowledge_chunks c WHERE c.document_id=d.id AND c.embed_model=$2)`, asset, model).Scan(&n)
+	return n, err
+}

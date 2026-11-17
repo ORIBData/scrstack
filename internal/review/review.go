@@ -103,7 +103,38 @@ Rules:
 
 // UserPrompt wraps a file, with line numbers, as untrusted data.
 func UserPrompt(filePath, code string) string {
-	return "Review this " + Language(filePath) + " file: " + filePath + "\n\n" + guard.Untrusted("source:"+filePath, NumberLines(code))
+	return UserPromptWithTools(filePath, code, nil)
+}
+
+// ToolNote is something a static-analysis tool already reported for a file.
+type ToolNote struct {
+	Tool     string
+	Rule     string
+	Line     int
+	Severity string
+	Title    string
+}
+
+// MaxToolNotes bounds the notes shown with one file.
+const MaxToolNotes = 15
+
+// UserPromptWithTools is UserPrompt plus what the static analyzers (gosec,
+// Bandit, OpenGrep, Bearer) already found in the file, so the model does not
+// repeat their findings and can look for what they miss. The notes are data,
+// like the code: rule titles come from third-party rule packs.
+func UserPromptWithTools(filePath, code string, notes []ToolNote) string {
+	prompt := "Review this " + Language(filePath) + " file: " + filePath + "\n\n" + guard.Untrusted("source:"+filePath, NumberLines(code))
+	if len(notes) == 0 {
+		return prompt
+	}
+	if len(notes) > MaxToolNotes {
+		notes = notes[:MaxToolNotes]
+	}
+	var b strings.Builder
+	for _, n := range notes {
+		fmt.Fprintf(&b, "line %d: [%s] %s %s: %s\n", n.Line, n.Severity, n.Tool, n.Rule, clip(strings.Join(strings.Fields(n.Title), " "), 160))
+	}
+	return prompt + "\n\nStatic analysis tools already report the following for this file. Do not repeat them; report related problems they missed.\n\n" + guard.Untrusted("static-analysis:"+filePath, b.String())
 }
 
 // NumberLines prefixes every line with its number, so the model's line

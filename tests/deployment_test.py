@@ -30,6 +30,7 @@ class DeploymentTest(unittest.TestCase):
             'SCRS_SAST_IMAGE': 'example/scrs-sast:scrs_2026_11_15_v123456abcdef',
             'SCRS_SAST_API_TOKEN': 'synthetic-sast-token-at-least-32-characters',
             'SCRS_EMBED_API_KEY': 'synthetic-embed-key-at-least-32-characters',
+            'SCRS_REMEDIATION_API_TOKEN': 'synthetic-remediation-token-at-least-32-characters',
         }
         with tempfile.NamedTemporaryFile(mode='w') as env:
             env.write('\n'.join(f'{key}={value}' for key,value in values.items())); env.flush()
@@ -54,6 +55,28 @@ class DeploymentTest(unittest.TestCase):
             self.assertFalse(set(env) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN'})
             self.assertNotIn('ports', config['services'][service])
         self.assertEqual(scanner['environment']['SCRS_REMEDIATION_ENABLED'], 'true')
+
+        # REM-002: guided remediation runs in its own sandbox container: its own
+        # token, one private network shared only with the worker and the egress
+        # proxy, no SCRS secrets, a disposable filesystem and resource limits.
+        remediator=config['services']['scrs-remediator']
+        self.assertEqual(set(remediator['networks']), {'remediation'})
+        self.assertTrue(config['networks']['remediation']['internal'])
+        self.assertEqual(remediator['environment']['SCRS_SCANNER_ROLE'], 'remediation')
+        self.assertEqual(scanner['environment']['SCRS_SCANNER_ROLE'], 'scan')
+        self.assertNotEqual(remediator['environment']['SCRS_SCANNER_API_TOKEN'], scanner['environment']['SCRS_SCANNER_API_TOKEN'])
+        self.assertFalse(set(remediator['environment']) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN', 'SCRS_CLAMD_ADDRESS'})
+        self.assertNotIn('ports', remediator)
+        self.assertTrue(remediator['read_only'])
+        self.assertEqual(remediator['cap_drop'], ['ALL'])
+        self.assertTrue(remediator['pids_limit'] and remediator['mem_limit'] and remediator['cpus'])
+        self.assertTrue(any(str(t).startswith('/work') for t in remediator.get('tmpfs', [])))
+        for other in ('scrs-api', 'scrs-clamav', 'scrs-scanner', 'scrs-sast', 'scrs-qa-runner', 'scrs-embed'):
+            self.assertNotIn('remediation', config['services'][other].get('networks', {}), other)
+        self.assertEqual(set(config['services']['scrs-egress-proxy']['networks']) & {'remediation'}, {'remediation'})
+        worker_env=config['services']['scrs-worker']['environment']
+        self.assertEqual(worker_env['SCRS_REMEDIATION_URL'], 'http://scrs-remediator:8081/remediate')
+        self.assertEqual(worker_env['SCRS_REMEDIATION_API_TOKEN'], remediator['environment']['SCRS_SCANNER_API_TOKEN'])
 
         # The Karate runner: its own router and hostname, private qa network
         # shared with the API and worker, and no SCRS secrets.
@@ -97,7 +120,7 @@ class DeploymentTest(unittest.TestCase):
 
         # Self-hosted embeddings: internal only, pinned by digest, holding none
         # of the platform's secrets, and no text can leave to a hosted provider
-        # because the worker reaches it over the internal network only.
+        # because the worker and API reach it over the internal network only.
         embed = config['services']['scrs-embed']
         self.assertIn('@sha256:', embed['image'])
         self.assertEqual(set(embed['networks']), {'embed', 'embed-fetch'})
@@ -107,7 +130,10 @@ class DeploymentTest(unittest.TestCase):
         self.assertFalse(set(embed['environment']) & {'SCRS_MASTER_KEY', 'SCRS_DATABASE_URL', 'SCRS_S3_SECRET_KEY', 'SCRS_BOOTSTRAP_API_TOKEN', 'SCRS_SCANNER_API_TOKEN', 'SCRS_QA_RUNNER_TOKEN', 'SCRS_SAST_API_TOKEN'})
         self.assertEqual(embed['environment']['AUTO_TRUNCATE'], 'false')
         self.assertIn('embed', config['services']['scrs-worker']['networks'])
-        self.assertNotIn('embed', api['networks'])
+        # The API embeds the question of a chronicle search, so it joins the
+        # internal embed network too (still no route out).
+        self.assertIn('embed', api['networks'])
+        self.assertEqual(api['environment']['SCRS_EMBED_API_KEY'], embed['environment']['API_KEY'])
         self.assertEqual(config['services']['scrs-worker']['environment']['SCRS_EMBED_API_KEY'], embed['environment']['API_KEY'])
         # LLM providers declared in the environment: the API holds the declarations
         # and the sealing key; source code to a hosted provider is off by default

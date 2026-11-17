@@ -57,6 +57,15 @@ services:
       SCRS_REACHABILITY_ENABLED: ${SCRS_REACHABILITY_ENABLED:-false}
       SCRS_QA_RUNNER_ALLOW_HTTP: ${SCRS_QA_RUNNER_ALLOW_HTTP:-true}
       SCRS_LLM_PRIVATE_HOSTS: ${SCRS_LLM_PRIVATE_HOSTS:-}
+      # Chronicle search (GET /assets/{id}/chronicle/search) and the vector
+      # backfill (POST /knowledge:backfill) embed with the same self-hosted
+      # server as the worker; an empty URL answers 503 on those two endpoints.
+      SCRS_EMBED_URL: ${SCRS_EMBED_URL:-http://scrs-embed:80/v1}
+      SCRS_EMBED_MODEL: ${SCRS_EMBED_MODEL:-BAAI/bge-small-en-v1.5}
+      SCRS_EMBED_DIM: ${SCRS_EMBED_DIM:-384}
+      SCRS_EMBED_MAX_CHARS: ${SCRS_EMBED_MAX_CHARS:-1500}
+      SCRS_EMBED_API_KEY: ${SCRS_EMBED_API_KEY:-}
+      SCRS_EMBED_PRIVATE_HOSTS: ${SCRS_EMBED_PRIVATE_HOSTS:-scrs-embed}
       # LLM providers declared in the environment: SCRS_LLM_PROVIDERS lists
       # names (for example "hosted,local"); each is described by the
       # SCRS_LLM_PROVIDER_<NAME>_* variables below. A hosted OpenAI-compatible
@@ -102,6 +111,7 @@ services:
       - proxy
       - qa
       - sast
+      - embed
     labels:
       - "traefik.enable=true"
       - "traefik.docker.network=${SCRS_TRAEFIK_NETWORK:-dokploy-network}"
@@ -141,6 +151,9 @@ services:
       <<: *scrs-storage-env
       SCRS_MASTER_KEY: ${SCRS_MASTER_KEY:?Set SCRS_MASTER_KEY}
       SCRS_SCANNER_URL: http://scrs-scanner:8081/scan
+      # Guided remediation runs in its own sandbox container with its own token.
+      SCRS_REMEDIATION_URL: http://scrs-remediator:8081/remediate
+      SCRS_REMEDIATION_API_TOKEN: ${SCRS_REMEDIATION_API_TOKEN:?Set a random remediation sandbox token, separate from SCRS_SCANNER_API_TOKEN}
       SCRS_MAX_IMAGE_BYTES: ${SCRS_MAX_IMAGE_BYTES:-419430400}
       SCRS_SNAPSHOT_ARCHIVES: ${SCRS_SNAPSHOT_ARCHIVES:-false}
       SCRS_RESCAN_INTERVAL_HOURS: ${SCRS_RESCAN_INTERVAL_HOURS:-0}
@@ -218,7 +231,9 @@ services:
         condition: service_completed_successfully
       scrs-scanner:
         condition: service_healthy
-    networks: [default, scanning, qa, sast, embed]
+      scrs-remediator:
+        condition: service_healthy
+    networks: [default, scanning, remediation, qa, sast, embed]
     read_only: true
     # YARA patterns from TAXII feeds compile in a scratch directory.
     tmpfs: ["/tmp:size=67108864,mode=1777,noexec,nosuid"]
@@ -234,6 +249,8 @@ services:
     restart: unless-stopped
     environment:
       SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set SCRS_SCANNER_API_TOKEN}
+      # Scans only: guided remediation has its own container (scrs-remediator).
+      SCRS_SCANNER_ROLE: scan
       SCRS_OSV_DB: /feeds/current
       SCRS_WORK_ROOT: /work
       SCRS_CLAMD_ADDRESS: ${SCRS_CLAMD_ADDRESS:-scrs-clamav:3310}
@@ -259,6 +276,41 @@ services:
       retries: 3
       # First deploy waits for feed-sync to download and validate the OSV
       # archives (npm alone is ~220 MiB); the worker starts once this is healthy.
+      start_period: 15m
+      start_interval: 10s
+
+  # Guided remediation sandbox (REM-002). It is the scanner image in the
+  # `remediation` role: it answers only /remediate, with its own token, holds
+  # no database, storage, provider or scanner credentials, works in a
+  # disposable tmpfs with its own CPU, memory, process and time limits, and
+  # reaches the internet only through scrs-egress-proxy (registries and deps.dev).
+  # It has no route to the scanner, ClamAV or the other internal networks.
+  scrs-remediator:
+    image: ${SCRS_IMAGE:?Set SCRS_IMAGE}
+    command: ["scanner"]
+    restart: unless-stopped
+    environment:
+      SCRS_SCANNER_ROLE: remediation
+      SCRS_SCANNER_API_TOKEN: ${SCRS_REMEDIATION_API_TOKEN:?Set a random remediation sandbox token, separate from SCRS_SCANNER_API_TOKEN}
+      SCRS_OSV_DB: /feeds/current
+      SCRS_WORK_ROOT: /work
+      SCRS_REMEDIATION_ENABLED: ${SCRS_REMEDIATION_ENABLED:-true}
+      SCRS_REMEDIATION_PROXY: http://scrs-egress-proxy:8082
+    networks: [remediation]
+    volumes: ["scrs-feeds:/feeds:ro"]
+    tmpfs: ["/work:size=268435456,mode=1777,noexec,nosuid"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: ${SCRS_REMEDIATION_MEMORY:-1g}
+    cpus: 1
+    pids_limit: 128
+    labels: ["traefik.enable=false"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/scrs", "scanner-healthcheck"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
       start_period: 15m
       start_interval: 10s
 
@@ -302,7 +354,7 @@ services:
     image: ${SCRS_IMAGE:?Set SCRS_IMAGE}
     command: ["egress-proxy"]
     restart: unless-stopped
-    networks: [default, scanning]
+    networks: [default, scanning, remediation]
     read_only: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -475,13 +527,16 @@ volumes:
 networks:
   scanning:
     internal: true
+  # Worker <-> scrs-remediator <-> scrs-egress-proxy only; no other route.
+  remediation:
+    internal: true
   # API and worker <-> Karate runner only; no route out.
   qa:
     internal: true
   # Worker and API <-> scrs-sast <-> scrs-sast-egress; no other route out.
   sast:
     internal: true
-  # Worker <-> scrs-embed only; no route out.
+  # API and worker <-> scrs-embed only; no route out.
   embed:
     internal: true
   # Lets scrs-embed download its model on first start; remove it from the

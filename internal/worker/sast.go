@@ -76,7 +76,7 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 			stages = append(stages, assessments.Stage{Name: "sast", Status: "failed", Detail: err.Error()})
 		}
 		if settings.Reachability {
-			applyReachability(output.Findings, &sast.Reachability{Status: "failed", Detail: err.Error()}, w.weights())
+			applyReachability(output.Findings, &sast.Reachability{Status: "failed", Detail: err.Error()}, nil, w.weights())
 			stages = append(stages, assessments.Stage{Name: "reachability", Status: "failed", Detail: "analysis unavailable; vulnerability entries are unknown"})
 		}
 		return stages, nil
@@ -103,7 +103,7 @@ func (w Worker) analyzeSource(ctx context.Context, a *assessments.Assessment, ar
 		if r == nil {
 			r = &sast.Reachability{Status: "failed", Detail: "no reachability result"}
 		}
-		counts := applyReachability(output.Findings, r, w.weights())
+		counts := applyReachability(output.Findings, r, resp.Imports, w.weights())
 		status := r.Status
 		if status == "skipped" {
 			status = "ok"
@@ -201,7 +201,7 @@ var goAdvisory = regexp.MustCompile(`^GO-\d{4}-\d+$`)
 // govulncheck verdict for their advisory and module; a Go entry without a
 // verdict, or from a failed analysis, is unknown; other ecosystems are
 // unsupported. Nothing is closed because it is unreachable.
-func applyReachability(findings []assessments.Finding, r *sast.Reachability, weights [2]int) map[string]int {
+func applyReachability(findings []assessments.Finding, r *sast.Reachability, imports *sast.Imports, weights [2]int) map[string]int {
 	counts := map[string]int{}
 	verdicts := map[string]sast.Verdict{}
 	for _, v := range r.Verdicts {
@@ -229,6 +229,24 @@ func applyReachability(findings []assessments.Finding, r *sast.Reachability, wei
 				}
 			} else {
 				result["detail"] = r.Detail
+			}
+		}
+		// REA-005: npm and PyPI have no call graph. A package the repository's
+		// own source imports is imported_only; one it does not import stays
+		// unknown, since another dependency may still reach it.
+		if base := strings.ToLower(strings.SplitN(f.Component.Ecosystem, ":", 2)[0]); base == "npm" || base == "pypi" {
+			result["tool"], result["version"] = "scrs-imports", "1"
+			switch {
+			case imports == nil || imports.Status == "skipped":
+				result["detail"] = "no JavaScript, TypeScript or Python source was found to read imports from"
+			default:
+				status = sast.Unknown
+				if steps := imports.ImportedSteps(f.Component.Ecosystem, f.Component.Name); len(steps) > 0 {
+					status, method, trace = sast.ImportedOnly, "import_graph", steps
+				} else {
+					method = "import_graph"
+					result["detail"] = "the repository's own source does not import this package; it may still be reached through another dependency"
+				}
 			}
 		}
 		result["status"], result["method"] = status, method

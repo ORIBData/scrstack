@@ -6,11 +6,13 @@ import (
 	"errors"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/compliance"
+	"github.com/ORIBData/scrstack/internal/knowledge"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -336,6 +338,29 @@ func (s *Store) ReportInput(ctx context.Context, j ReportJob) (compliance.Pack, 
 	ids := make([]uuid.UUID, len(in.Assets))
 	for i, a := range in.Assets {
 		ids[i] = a.ID
+	}
+	if j.Params.IncludeAISummaries {
+		docs, err := s.Knowledge().LatestByAssets(ctx, ids, knowledge.KindAssessmentSummary)
+		if err != nil {
+			return pack, in, err
+		}
+		locators := map[uuid.UUID]string{}
+		for _, a := range in.Assets {
+			locators[a.ID] = a.Locator
+		}
+		for _, d := range docs {
+			if d.AssetID == nil || len(in.AISummaries) >= 200 {
+				continue
+			}
+			text := d.Body
+			if len(text) > 4000 {
+				text = text[:4000] + "..."
+			}
+			model, _ := d.Provenance["model"].(string)
+			provider, _ := d.Provenance["provider"].(string)
+			in.AISummaries = append(in.AISummaries, compliance.AISummary{AssetID: *d.AssetID, Locator: locators[*d.AssetID], Ref: d.Ref, Provider: provider, Model: model, CreatedAt: d.CreatedAt, Headline: d.Title, Text: text})
+		}
+		sort.Slice(in.AISummaries, func(i, k int) bool { return in.AISummaries[i].Locator < in.AISummaries[k].Locator })
 	}
 	// Entries open at some point in the window: seen before it ended and
 	// not closed before it began.

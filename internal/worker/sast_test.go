@@ -30,7 +30,7 @@ func TestApplyReachability(t *testing.T) {
 		{Advisory: "GO-2026-0001", Module: "example.com/lib", Status: sast.ImportedOnly, Method: "import_graph"},
 		{Advisory: "GO-2026-0002", Module: "example.com/lib", Status: sast.NotReachable, Method: "call_graph"},
 	}}
-	counts := applyReachability(findings, r, [2]int{DefaultReachableWeight, DefaultNotReachableWeight})
+	counts := applyReachability(findings, r, nil, [2]int{DefaultReachableWeight, DefaultNotReachableWeight})
 	read := func(f assessments.Finding) map[string]any {
 		var e map[string]any
 		_ = json.Unmarshal(f.Evidence, &e)
@@ -60,7 +60,7 @@ func TestApplyReachability(t *testing.T) {
 		t.Fatalf("counts %v", counts)
 	}
 	failed := []assessments.Finding{vuln("Go", "golang.org/x/text", "GO-2022-1059", 45, `{}`)}
-	applyReachability(failed, &sast.Reachability{Status: "failed", Detail: "module download refused"}, [2]int{10, -15})
+	applyReachability(failed, &sast.Reachability{Status: "failed", Detail: "module download refused"}, nil, [2]int{10, -15})
 	if read(failed[0])["status"] != sast.Unknown || failed[0].Score != 45 {
 		t.Fatalf("failed analysis: %v", read(failed[0]))
 	}
@@ -79,5 +79,52 @@ func TestSASTFindingAndStage(t *testing.T) {
 	}
 	if s := sastStage(sast.Response{Runs: []sast.Run{{Analyzer: "gosec", Status: "failed"}}}, 0); s.Status != "failed" {
 		t.Fatalf("failed stage %+v", s)
+	}
+}
+
+// REA-005: npm and PyPI entries are imported_only when the repository's own
+// source imports the package, and unknown otherwise, never not_reachable.
+func TestApplyReachabilityImportLevel(t *testing.T) {
+	vuln := func(eco, name string) assessments.Finding {
+		return assessments.Finding{Type: "vulnerability", AdvisoryID: "GHSA-test", Score: 40, Component: assessments.Component{Name: name, Ecosystem: eco}, Evidence: json.RawMessage(`{}`), Guidance: json.RawMessage(`{}`)}
+	}
+	imports := &sast.Imports{Tool: "scrs-imports", Version: "1", Status: "ok", Files: 2,
+		NPM:  map[string][]sast.Step{"lodash": {{Path: "src/a.js", Line: 3}}},
+		PyPI: map[string][]sast.Step{"bs4": {{Path: "app.py", Line: 1}}}}
+	findings := []assessments.Finding{vuln("npm", "lodash"), vuln("npm", "express"), vuln("PyPI", "beautifulsoup4"), vuln("PyPI", "requests"), vuln("Maven", "org.x:y")}
+	counts := applyReachability(findings, &sast.Reachability{Status: "skipped", Detail: "no Go modules"}, imports, [2]int{10, -15})
+	read := func(f assessments.Finding) map[string]any {
+		var e map[string]any
+		_ = json.Unmarshal(f.Evidence, &e)
+		out, _ := e["reachability"].(map[string]any)
+		return out
+	}
+	for i, want := range []string{sast.ImportedOnly, sast.Unknown, sast.ImportedOnly, sast.Unknown, sast.Unsupported} {
+		if got := read(findings[i])["status"]; got != want {
+			t.Errorf("finding %d: %v, want %s", i, got, want)
+		}
+		if findings[i].Score != 40 {
+			t.Errorf("finding %d: imported_only and unknown must not move the score: %d", i, findings[i].Score)
+		}
+	}
+	if got := read(findings[0]); got["method"] != "import_graph" || got["tool"] != "scrs-imports" || got["confidence"] != "medium" {
+		t.Fatalf("imported entry: %v", got)
+	}
+	if trace, _ := read(findings[0])["trace"].([]any); len(trace) != 1 {
+		t.Fatalf("trace: %v", read(findings[0]))
+	}
+	if d, _ := read(findings[1])["detail"].(string); !strings.Contains(d, "another dependency") {
+		t.Fatalf("an unknown entry explains itself: %v", read(findings[1]))
+	}
+	if counts[sast.ImportedOnly] != 2 || counts[sast.Unknown] != 2 || counts[sast.Unsupported] != 1 {
+		t.Fatalf("counts %v", counts)
+	}
+	// Without a usable import scan the entries stay unsupported, as before.
+	for _, none := range []*sast.Imports{nil, {Status: "skipped"}} {
+		again := []assessments.Finding{vuln("npm", "lodash")}
+		applyReachability(again, &sast.Reachability{Status: "skipped"}, none, [2]int{10, -15})
+		if got := read(again[0])["status"]; got != sast.Unsupported {
+			t.Fatalf("no import data: %v", got)
+		}
 	}
 }

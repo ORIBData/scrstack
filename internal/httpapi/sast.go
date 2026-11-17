@@ -73,7 +73,9 @@ func (h sastHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"enabled_by_default": h.defaults.Reachability, "capabilities": []map[string]any{
 			{"ecosystem": "Go", "method": "call_graph", "tool": "govulncheck", "version": version, "statuses": []string{sast.Reachable, sast.ImportedOnly, sast.NotReachable, sast.Unknown}, "notes": "Module sources come through the go-modules egress proxy; private modules and the standard library report unknown."},
 			{"ecosystem": "Rust", "method": "none", "status": sast.Unsupported, "notes": "Rust call analysis compiles the code; it is not offered (REA-006)."},
-			{"ecosystem": "npm, PyPI, Maven, NuGet, RubyGems, Pub, CocoaPods, SwiftURL", "method": "none", "status": sast.Unsupported, "notes": "No verified open-source call-graph analyzer (spike S12)."},
+			{"ecosystem": "npm", "method": "import_graph", "tool": "scrs-imports", "version": "1", "statuses": []string{sast.ImportedOnly, sast.Unknown}, "notes": "Reads the imports of the repository's own JavaScript and TypeScript source. A package it imports is imported_only; any other stays unknown, never not_reachable, because another dependency may still reach it."},
+			{"ecosystem": "PyPI", "method": "import_graph", "tool": "scrs-imports", "version": "1", "statuses": []string{sast.ImportedOnly, sast.Unknown}, "notes": "As for npm, on Python source. A distribution is matched to its module names by its own name and a short table of common differences (for example beautifulsoup4 and bs4); others stay unknown."},
+			{"ecosystem": "Maven, NuGet, RubyGems, Pub, CocoaPods, SwiftURL", "method": "none", "status": sast.Unsupported, "notes": "No verified open-source call-graph analyzer (spike S12) and no import-level reader."},
 		}})
 	case path == "/sast/settings":
 		h.globalSettings(ctx, w, r, principal)
