@@ -42,6 +42,7 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-031 | STIG by owner-uploaded XCCDF with an SCRS starter mapping | Accepted |
 | ADR-032 | PDF reports from a built-in, deterministic writer | Accepted |
 | ADR-033 | Dependency-Track export through a transactional upload queue | Accepted |
+| ADR-034 | Guarded model calls, self-hosted embeddings and a portable knowledge store | Accepted |
 
 ## ADR-001 Go module
 
@@ -245,6 +246,8 @@ OpenGrep was added to the PRD's set because it is the only bundled analyzer for 
 
 It can run in the Dokploy stack on an internal network or on its own VM. Keploy was evaluated and rejected because it needs root and eBPF and records traffic.
 
+**Amendment (2026-11-16):** The runner is a QA, performance and load service only. It never handles SBOMs, MBOMs, vulnerabilities, malware or integrity data. Traefik publishes it for operators who run standalone jobs; those jobs are not recorded by SCRS. Lint is not a job kind.
+
 **Evidence:** `make qa-runner-test`, `make qa-runner-image-test`, `TestPostgresQAPipeline`.
 
 ## ADR-022 LLM adapter
@@ -352,3 +355,34 @@ Finding types without a CWE (vulnerable and malicious dependencies, integrity, s
 **Why:** a crash between completion and upload cannot lose a push, and Dependency-Track being down never affects an assessment (section 15).
 
 **Consequences:** uploads are visible and retryable through the API, and finished rows are pruned after 90 days.
+
+**Amendment (2026-11-16):**
+- `uploaded` only means Dependency-Track accepted the BOM, which it processes afterwards. The worker checks the event token (`GET /api/v1/event/token/{token}`), then the project's `lastBomImport` (`GET /api/v1/project/lookup`), and records `processing` as `processed`, `unconfirmed` or `failed`.
+- `:test` reads the key's team permissions (`GET /api/v1/team/self`) and requires `BOM_UPLOAD` and `PROJECT_CREATION_UPLOAD`. The earlier probe (`GET /api/v1/event/token/{random}`) only proved the key was valid.
+- A permanent upload failure, or an import that did not happen, emits `dependency_track.upload_failed`, and `GET /system/status` reports a `dependency_track` component.
+
+**Amendment 2 (2026-11-16): reading findings back and sharing triage.**
+- Each processed upload registers a `dtrack_projects` row. With `import_findings`, the worker reads `GET /api/v1/finding/project/{uuid}?suppressed=true` about every 30 minutes and stores one `dtrack_findings` row per DT finding, linked to a register entry.
+- One vulnerability is one entry. DT findings of a component that share any ID (vulnerability ID or alias) form a cluster. A cluster joins the register entry SCRS already has for the same normalised package URL and a shared ID. Otherwise it becomes a `dt_vulnerability` entry (report-only, never in a verdict, closed by absence from DT).
+- With `sync_triage`, the register wins. A decision made through `PATCH /register/{id}` is written with `PUT /api/v1/analysis` at the next sync. DT's analysis is imported only for an `open` entry that SCRS has not written to, and hiding a finding needs every DT finding of the cluster to agree.
+- Projects are named `<provider>/<locator>`; pull request and commit-only scans are not uploaded by default; tags are opt-in because DT requires `PORTFOLIO_MANAGEMENT` to change them.
+- **Why:** SCRS's own matching and DT's analyzers find different things, and two lists of the same vulnerability with two severities is worse than either. SAST and DAST stay in SCRS because DT only analyses components.
+
+## ADR-034 Guarded model calls and the knowledge store
+
+**Decision:**
+- Every model call passes `internal/llm/guard` inside the client: prompts and answers are screened for credentials, the process's own secrets and exfiltration markup, and the guard cannot be disabled by a caller.
+- Prompts for enrichment are built from typed, allowlisted fields (findings and advisory text), not from evidence or source. Repository and advisory text enters a prompt only wrapped as untrusted data.
+- Embeddings come only from a self-hosted OpenAI-compatible server. No text goes to a provider for embedding.
+- The knowledge store uses standard PostgreSQL only: vectors as bytes, exact cosine search after filtering by asset, kind and model. A native extension cannot be layered over a plain connection (`CREATE EXTENSION` needs files on the server and a superuser or a trusted extension), so pgvector is an optional later backend, not the foundation.
+- Knowledge documents have no foreign keys to assets, assessments or findings, so retention does not delete the chronicle.
+- A per-assessment token ceiling is checked before each call, and a cut-off answer is never stored as complete.
+
+**Why:** a pattern-based guard cannot prove that no secret is present, so the stronger control is not sending free text at all; the guard is the second layer. Portable storage meets the goal (any PostgreSQL) that a custom extension could not.
+
+**Amendment 2 (2026-11-16):** Advisories and summaries use a typed allowlist of findings and advisory text, so any provider may write them; they are stored in the knowledge store as a chronicle where each text supersedes the previous one. Embeddings come from `scrs-embed` (TEI, CPU, bge-small) on an internal network. The self-hosted code model runs on a second machine with llama.cpp (not vLLM: its CPU build needs bf16 weights and AVX-512, and its API key covers only `/v1`) behind Traefik with an IP allowlist and an API key.
+
+**Amendment 3 (2026-11-16):** The fixed cost of a dedicated model host is a poor fit for staging and early production, so the adapter supports a hosted and a self-hosted provider side by side, declared in the environment (`SCRS_LLM_PROVIDERS`) or through the API. Source code still goes only to a self-hosted provider by default; a hosted provider may receive it only with the platform switch `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` and an audited, per-provider acknowledgement that is withdrawn when its endpoint changes. Hosted providers have a monthly token cap. `deploy/compose.model-host.yaml` stays as the supported path for customers whose data must stay on their hardware.
+
+**Consequences (original):** source code was sent only to a self-hosted model; Amendment 3 makes a hosted provider possible by opt-in. A provider is `local` when its host is in `SCRS_LLM_PRIVATE_HOSTS`, checked when a code review or unit-test generation is requested and again when the worker runs it. AI code review stores report-only `ai_review` entries marked unverified, never part of a verdict. See [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md#decision-where-source-code-may-go-amended-2026-11-16).
+

@@ -59,6 +59,7 @@ var retentionDefs = []classDef{
 	{"scan_artifacts", "File inventories and component lists of superseded assessments", "the newest successful assessment of each asset and ref; assessments that open entries point to; legal hold", 0, false},
 	{"sbom_documents", "SBOMs of superseded assessments (S3 and index)", "the current revision of each tracked ref; legal hold", 0, true},
 	{"source_snapshots", "Stored source archives of superseded assessments", "the current revision of each tracked ref; legal hold", 0, true},
+	{"uploaded_archives", "Uploaded source archives that a newer upload with the same label replaced", "the newest upload of each asset and label; archives of queued or running assessments; legal hold", 0, true},
 	{"remediation_plans", "Stored remediation plans", "assets on legal hold", 0, true},
 	{"qa_reports", "QA report archives and scenario lists of older runs", "the newest finished run of each asset and kind; legal hold", 0, true},
 	{"reports", "Compliance evidence reports (CMP-006)", "queued and running reports", 0, true},
@@ -235,6 +236,8 @@ func (s *Store) candidates(class string) string {
 		return s.supersededSQL(`x.sbom_key<>''`)
 	case "source_snapshots":
 		return s.supersededSQL(`x.snapshot_key<>''`)
+	case "uploaded_archives":
+		return `SELECT u.id FROM ` + s.schema + `.uploads u JOIN ` + s.schema + `.assets a ON a.id=u.asset_id WHERE u.created_at<clock_timestamp()-($1*interval '1 day') AND NOT a.legal_hold AND EXISTS(SELECT 1 FROM ` + s.schema + `.uploads n WHERE n.asset_id=u.asset_id AND n.label=u.label AND (n.created_at>u.created_at OR (n.created_at=u.created_at AND n.id>u.id))) AND NOT EXISTS(SELECT 1 FROM ` + s.schema + `.assessments x WHERE x.asset_id=u.asset_id AND x.status IN ('queued','running') AND x.request->'target'->>'commit'=left(u.sha256,40))`
 	case "remediation_plans":
 		return `SELECT r.assessment_id FROM ` + s.schema + `.remediation_results r JOIN ` + s.schema + `.assessments x ON x.id=r.assessment_id JOIN ` + s.schema + `.assets a ON a.id=x.asset_id WHERE r.created_at<clock_timestamp()-($1*interval '1 day') AND NOT a.legal_hold`
 	case "qa_reports":
@@ -320,7 +323,7 @@ func (s *Store) purgeClass(ctx context.Context, tx pgx.Tx, class string, days in
 	case "closed_findings":
 		// One statement: dependent rows go first in data-modifying CTEs;
 		// foreign keys are checked when the statement ends.
-		n, err := exec(`WITH doomed AS (` + pick + `), i AS (UPDATE ` + s.schema + `.integrity_events SET finding_id=NULL WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), e AS (DELETE FROM ` + s.schema + `.finding_events WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), af AS (DELETE FROM ` + s.schema + `.assessment_findings WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1) DELETE FROM ` + s.schema + `.findings WHERE id IN (SELECT id FROM doomed)`)
+		n, err := exec(`WITH doomed AS (` + pick + `), i AS (UPDATE ` + s.schema + `.integrity_events SET finding_id=NULL WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), e AS (DELETE FROM ` + s.schema + `.finding_events WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), fc AS (DELETE FROM ` + s.schema + `.finding_comments WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1), af AS (DELETE FROM ` + s.schema + `.assessment_findings WHERE finding_id IN (SELECT id FROM doomed) RETURNING 1) DELETE FROM ` + s.schema + `.findings WHERE id IN (SELECT id FROM doomed)`)
 		return n, nil, err
 	case "scan_artifacts":
 		ids, err := keys(`SELECT id::text FROM (` + pick + `) d`)
@@ -356,6 +359,30 @@ func (s *Store) purgeClass(ctx context.Context, tx pgx.Tx, class string, days in
 			return 0, nil, err
 		}
 		unused, err := s.unreferenced(ctx, tx, `SELECT 1 FROM `+s.schema+`.assessments WHERE `+column+`=$1`, cleared)
+		return int64(len(ids)), unused, err
+	case "uploaded_archives":
+		ids, err := keys(`SELECT id::text FROM (` + pick + `) d`)
+		if err != nil || len(ids) == 0 {
+			return 0, nil, err
+		}
+		rows, err := tx.Query(ctx, `DELETE FROM `+s.schema+`.uploads WHERE id=ANY($1::uuid[]) RETURNING object_key`, ids)
+		if err != nil {
+			return 0, nil, err
+		}
+		var cleared []string
+		for rows.Next() {
+			var k string
+			if err := rows.Scan(&k); err != nil {
+				rows.Close()
+				return 0, nil, err
+			}
+			cleared = append(cleared, k)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return 0, nil, err
+		}
+		unused, err := s.unreferenced(ctx, tx, `SELECT 1 FROM `+s.schema+`.uploads WHERE object_key=$1`, cleared)
 		return int64(len(ids)), unused, err
 	case "remediation_plans":
 		ids, err := keys(`SELECT assessment_id::text FROM (` + pick + `) d`)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/knowledge"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -102,7 +103,7 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 			config jsonb NOT NULL, scope jsonb NOT NULL, credential_ciphertext bytea NOT NULL,
 			secret_key_id text NOT NULL, status jsonb NOT NULL DEFAULT '{}',
 			created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(),
-			CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci'))
+			CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci','upload'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.assets (
 			id uuid PRIMARY KEY, type text NOT NULL, locator text NOT NULL,
@@ -118,9 +119,9 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 		`CREATE UNIQUE INDEX IF NOT EXISTS assets_connection_locator_uq ON ` + schema + `.assets(connection_id,type,locator)`,
 		`CREATE INDEX IF NOT EXISTS assets_connection_idx ON ` + schema + `.assets(connection_id)`,
 		`CREATE INDEX IF NOT EXISTS assets_locator_id_idx ON ` + schema + `.assets(locator,id)`,
-		// 2026111401: GitLab, Harbor and generic OCI providers.
+		// 2026111401: GitLab, Harbor and generic OCI providers. 2026111701: the built-in `upload` provider behind uploaded archives.
 		`ALTER TABLE ` + schema + `.connections DROP CONSTRAINT IF EXISTS connections_provider_check`,
-		`ALTER TABLE ` + schema + `.connections ADD CONSTRAINT connections_provider_check CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci'))`,
+		`ALTER TABLE ` + schema + `.connections ADD CONSTRAINT connections_provider_check CHECK (provider IN ('github','gitlab','dockerhub','gar','harbor','oci','upload'))`,
 		`CREATE TABLE IF NOT EXISTS ` + schema + `.api_tokens (
    id uuid PRIMARY KEY, name text NOT NULL UNIQUE, prefix text NOT NULL,
    secret_hash bytea NOT NULL UNIQUE CHECK(octet_length(secret_hash)=32),
@@ -154,6 +155,11 @@ func bootstrapConnectionTables(ctx context.Context, pool *pgxpool.Pool, schema s
 	for _, ddl := range notify.Schema(schema) {
 		if _, err := tx.Exec(ctx, ddl); err != nil {
 			return errors.New("notification schema migration failed")
+		}
+	}
+	for _, ddl := range knowledge.Schema(schema) {
+		if _, err := tx.Exec(ctx, ddl); err != nil {
+			return errors.New("knowledge schema migration failed")
 		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO `+schema+`.schema_migrations(version) VALUES (2026111301),(2026111401),(2026111402) ON CONFLICT DO NOTHING`); err != nil {

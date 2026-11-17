@@ -208,6 +208,26 @@ func (g *githubIngest) read(w http.ResponseWriter, r *http.Request) ([]byte, boo
 	return body, true
 }
 
+// pushCommit is one commit of a push event, in the fields GitHub and GitLab
+// share. Author and Committer carry a login on GitHub (`username`) and only
+// a name and email on GitLab.
+type pushCommit struct {
+	ID        string   `json:"id"`
+	Message   string   `json:"message"`
+	Timestamp string   `json:"timestamp"`
+	Added     []string `json:"added"`
+	Removed   []string `json:"removed"`
+	Modified  []string `json:"modified"`
+	Author    struct {
+		Name     string `json:"name"`
+		Email    string `json:"email"`
+		Username string `json:"username"`
+	} `json:"author"`
+	Committer struct {
+		Username string `json:"username"`
+	} `json:"committer"`
+}
+
 type githubPayload struct {
 	Ref        string `json:"ref"`
 	RefType    string `json:"ref_type"`
@@ -226,13 +246,7 @@ type githubPayload struct {
 	Pusher struct {
 		Name string `json:"name"`
 	} `json:"pusher"`
-	Commits []struct {
-		ID       string   `json:"id"`
-		Message  string   `json:"message"`
-		Added    []string `json:"added"`
-		Removed  []string `json:"removed"`
-		Modified []string `json:"modified"`
-	} `json:"commits"`
+	Commits     []pushCommit `json:"commits"`
 	PullRequest struct {
 		Number int    `json:"number"`
 		Title  string `json:"title"`
@@ -462,7 +476,32 @@ func (g *githubIngest) pushSignals(ctx context.Context, p githubPayload, bundle 
 	if isBranch {
 		branches = append(branches, branch)
 	}
+	signals = append(signals, g.authorSignals(ctx, p, isBranch && branch == p.Repository.DefaultBranch, claimed)...)
 	return append(signals, matchPatterns(bundle, map[string][]string{"git_branch_regex": branches, "commit_message_regex": messages, "file_path_regex": paths}, repo, p.Ref, p.After, claimed)...)
+}
+
+// authorSignals records who authored a push and returns the behavioural
+// signals the integrity policy asks for (INT-003). A failure to record never
+// stops the push from being handled.
+func (g *githubIngest) authorSignals(ctx context.Context, p githubPayload, defaultBranch bool, claimed string) []assessments.IntegrityEvent {
+	if p.Deleted || len(p.Commits) == 0 || p.After == "" {
+		return nil
+	}
+	observation := assessments.PushObservation{Repository: p.Repository.FullName, Ref: p.Ref, Commit: p.After, Pusher: claimed, DefaultBranch: defaultBranch}
+	for _, c := range p.Commits {
+		author := c.Author.Username
+		if author == "" {
+			author = c.Author.Email
+		}
+		at, _ := time.Parse(time.RFC3339, c.Timestamp)
+		routine := strings.HasPrefix(c.Message, "Merge ") || strings.EqualFold(c.Committer.Username, "web-flow")
+		observation.Commits = append(observation.Commits, assessments.AuthoredCommit{Author: author, Login: c.Author.Username, At: at, Routine: routine})
+	}
+	signals, err := g.store.ObservePush(ctx, observation)
+	if err != nil {
+		return nil
+	}
+	return signals
 }
 
 // matchPatterns applies INT-008 operator patterns to event fields. Generic
@@ -547,13 +586,7 @@ func gitlabPayload(header string, body []byte) (string, githubPayload, bool) {
 			Path          string `json:"path_with_namespace"`
 			DefaultBranch string `json:"default_branch"`
 		} `json:"project"`
-		Commits []struct {
-			ID       string   `json:"id"`
-			Message  string   `json:"message"`
-			Added    []string `json:"added"`
-			Removed  []string `json:"removed"`
-			Modified []string `json:"modified"`
-		} `json:"commits"`
+		Commits    []pushCommit `json:"commits"`
 		Attributes struct {
 			IID          int    `json:"iid"`
 			Title        string `json:"title"`
@@ -593,14 +626,6 @@ func gitlabPayload(header string, body []byte) (string, githubPayload, bool) {
 	}
 	p.Ref, p.After, p.Pusher.Name = raw.Ref, raw.After, raw.Username
 	p.Created, p.Deleted = raw.Before == zeroSHA, raw.After == zeroSHA
-	for _, c := range raw.Commits {
-		p.Commits = append(p.Commits, struct {
-			ID       string   `json:"id"`
-			Message  string   `json:"message"`
-			Added    []string `json:"added"`
-			Removed  []string `json:"removed"`
-			Modified []string `json:"modified"`
-		}{c.ID, c.Message, c.Added, c.Removed, c.Modified})
-	}
+	p.Commits = raw.Commits
 	return "push", p, true
 }

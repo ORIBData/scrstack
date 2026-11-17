@@ -12,6 +12,7 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/google/uuid"
 )
@@ -28,6 +29,9 @@ type qaHandler struct {
 	secrets Sealer
 	reports QAReportReader
 	runner  *qa.Runner
+	// llmHosts are the self-hosted model servers (SCRS_LLM_PRIVATE_HOSTS).
+	llmHosts    map[string]bool
+	allowSource bool
 }
 
 var errQAAdmin = errors.New("admin scope required")
@@ -38,7 +42,7 @@ func qaError(w http.ResponseWriter, err error) {
 		writeError(w, 403, err.Error())
 	case errors.Is(err, errNoSealer):
 		writeError(w, 503, err.Error())
-	case errors.Is(err, assessments.ErrQAProfile), errors.Is(err, assessments.ErrQANoAssessment), errors.Is(err, assessments.ErrQABlocked), errors.Is(err, assessments.ErrQAProvider):
+	case errors.Is(err, assessments.ErrQAProfile), errors.Is(err, assessments.ErrQANoAssessment), errors.Is(err, assessments.ErrQABlocked), errors.Is(err, assessments.ErrQAProvider), errors.Is(err, assessments.ErrQASource):
 		writeError(w, 409, err.Error())
 	case errors.Is(err, assessments.ErrQAState):
 		writeError(w, 409, "not allowed in the current state")
@@ -160,6 +164,19 @@ func (h qaHandler) asset(ctx context.Context, w http.ResponseWriter, r *http.Req
 		}
 		if !readBody(w, r, &input) {
 			return
+		}
+		if input.Kind == "unit" {
+			// Unit tests are written from source files, which go to a
+			// self-hosted model, or to a hosted one that was acknowledged.
+			if p, err := h.store.QAProfileFor(ctx, asset); err == nil && p.LLMProviderID != nil {
+				policy := llm.SourcePolicy{Private: h.llmHosts, AllowHosted: h.allowSource}
+				if provider, err := h.store.LLMProviderByID(ctx, *p.LLMProviderID); err == nil {
+					if _, ok := policy.Check(llmSettings(provider), provider.SourceAckAt != nil); !ok {
+						qaError(w, assessments.ErrQASource)
+						return
+					}
+				}
+			}
 		}
 		g, err := h.store.EnqueueQAGeneration(ctx, asset, input.Kind, input.QAGenerationOptions, principal.Name)
 		if err != nil {

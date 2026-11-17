@@ -74,6 +74,8 @@ func (t Target) assetTypes() []string {
 	switch {
 	case t.Type == "image":
 		return []string{"container_image"}
+	case t.Type == "upload":
+		return []string{"uploaded"}
 	case t.Provider == "github":
 		return []string{"github_repo"}
 	case t.Provider == "gitlab":
@@ -115,7 +117,26 @@ type Request struct {
 	} `json:"trigger,omitempty"`
 }
 
+// uploadLocator is how an uploaded asset is named: `upload/<name>`.
+var uploadLocatorPattern = regexp.MustCompile(`^upload/[a-z0-9][a-z0-9._-]{0,99}$`)
+
 func (r *Request) Validate() error {
+	if r.Target.Type == "upload" {
+		// Upload targets: Repository holds the asset locator, Commit the first
+		// 40 hex digits of the archive's SHA-256 and Ref a free label.
+		r.Target.Repository = strings.ToLower(r.Target.Repository)
+		r.Target.Commit = strings.ToLower(r.Target.Commit)
+		if r.Target.Ref == "" {
+			r.Target.Ref = "upload"
+		}
+		if !uploadLocatorPattern.MatchString(r.Target.Repository) || !commitPattern.MatchString(r.Target.Commit) || !tagPattern.MatchString(r.Target.Ref) || r.Target.PullRequest != nil || r.Target.Provider != "" || r.Target.Platform != "" || len(r.Connection) > 100 || len(r.Notify) > 10 {
+			return ErrInput
+		}
+		if len(r.Trigger.Origin) > 100 || len(r.Trigger.Event) > 100 || len(r.Trigger.DeliveryID) > 128 || len(r.Trigger.Actor) > 100 || !validContext(r.Trigger.Context) {
+			return ErrInput
+		}
+		return nil
+	}
 	if r.Target.Type == "image" {
 		// Image targets: Repository holds the locator, Ref the tag, Commit the digest.
 		r.Target.Repository = strings.ToLower(r.Target.Repository)
@@ -250,6 +271,15 @@ type Finding struct {
 	FirstSeen   time.Time       `json:"first_seen"`
 	LastSeen    time.Time       `json:"last_seen"`
 	WaiverUntil *time.Time      `json:"waiver_until,omitempty"`
+	// Assignee is who the entry is assigned to (free text; empty when
+	// unassigned) and CommentCount how many comments it has. Both are read
+	// live from the register, not from an assessment's frozen snapshot.
+	Assignee     string     `json:"assignee,omitempty"`
+	AssignedAt   *time.Time `json:"assigned_at,omitempty"`
+	CommentCount int        `json:"comment_count,omitempty"`
+	// SourceRepository is the repository a container image was built from
+	// (CON-012), when one is linked; empty for other assets.
+	SourceRepository string `json:"source_repository,omitempty"`
 	// Change is "new" or "existing" relative to the baseline assessment.
 	Change string `json:"change,omitempty"`
 }
@@ -372,8 +402,9 @@ func maliciousType(t string) bool {
 func huntOnly(t string) bool { return t == "yara_hunt" || t == "ioc_hunt" }
 
 // reportOnly reports E2E QA findings (qa_failure, qa_untested,
-// qa_performance, qa_config, qa_unconfigured): they inform, never gate.
-func reportOnly(t string) bool { return strings.HasPrefix(t, "qa_") }
+// qa_performance, qa_config, qa_unconfigured) and AI code review entries
+// (ai_review): they inform, never gate.
+func reportOnly(t string) bool { return strings.HasPrefix(t, "qa_") || t == "ai_review" }
 
 // closableTypes lists finding types whose producing stages all completed, so
 // their absence from this scan is evidence of a fix rather than lost coverage.
@@ -383,20 +414,21 @@ func closableTypes(stages []Stage) []string {
 		ok[s.Name] = s.Status == "ok"
 	}
 	producers := map[string][]string{
-		"vulnerability":        {"inventory", "sbom", "match_vuln"},
-		"malicious_dependency": {"inventory", "match_malicious"},
-		"malware":              {"malware"},
-		"posture":              {"malware"},
-		"ioc_match":            {"ioc"},
-		"ioc_alert":            {"ioc"},
-		"ioc_hunt":             {"ioc"},
-		"integrity":            {"integrity"},
-		"yara_match":           {"yara_x"},
-		"yara_alert":           {"yara_x"},
-		"yara_hunt":            {"yara_x"},
-		"qa_unconfigured":      {"integrity"},
-		"license":              {"inventory", "license"},
-		"sast":                 {"sast"},
+		"vulnerability":         {"inventory", "sbom", "match_vuln"},
+		"malicious_dependency":  {"inventory", "match_malicious"},
+		"malware":               {"malware"},
+		"posture":               {"malware"},
+		"ioc_match":             {"ioc"},
+		"ioc_alert":             {"ioc"},
+		"ioc_hunt":              {"ioc"},
+		"integrity":             {"integrity"},
+		"yara_match":            {"yara_x"},
+		"yara_alert":            {"yara_x"},
+		"yara_hunt":             {"yara_x"},
+		"qa_unconfigured":       {"integrity"},
+		"license":               {"inventory", "license"},
+		"suspicious_dependency": {"inventory", "dependency_policy"},
+		"sast":                  {"sast"},
 	}
 	types := []string{}
 	for kind, needed := range producers {

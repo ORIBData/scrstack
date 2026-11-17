@@ -85,10 +85,12 @@ SCRS bundles open-source static analyzers and a Go reachability tool (ADR-018). 
 | Status | Meaning |
 | --- | --- |
 | `reachable` | The project's code calls the vulnerable function. `trace` gives file and line from the caller to the symbol. |
-| `imported_only` | The vulnerable package is imported but not called. |
+| `imported_only` | Go: the vulnerable package is imported but not called. npm and PyPI: the repository's own source imports the package (`method: import_graph`; `trace` lists up to five places). |
 | `not_reachable` | The module is required but the vulnerable package is not imported. |
-| `unknown` | The analysis failed or was skipped, there is no verdict for the advisory, or the entry is from the Go standard library (analysed against the analyzer's toolchain, not your Go version). |
-| `unsupported` | Every non-Go ecosystem: no verified open-source call-graph analyzer exists (spike S12). |
+| `unknown` | The analysis failed or was skipped, there is no verdict for the advisory, or the entry is from the Go standard library (analysed against the analyzer's toolchain, not your Go version). For npm and PyPI: the repository's own source does not import the package, which says nothing about whether a dependency of it is reached. |
+| `unsupported` | Ecosystems other than Go, npm and PyPI, and npm or PyPI entries of a repository with no JavaScript, TypeScript or Python source: no verified open-source call-graph analyzer exists (spike S12). |
+
+**Import-level fallback (REA-005).** For npm and PyPI the SAST service reads the imports of the repository's own JavaScript, TypeScript and Python files (`require`, `import`, dynamic `import()`, `export ... from`, Python `import` and `from ... import`; dependency and build directories are skipped). A package is matched by name; a PyPI distribution is also matched to its module names (its own name with `-` as `_`, and a short table such as `beautifulsoup4` to `bs4`). It never reports `not_reachable`, and it moves no score. It is a reading of text, not a call graph: a dynamic or computed import is missed.
 
 **Safety rules:**
 - A failed or skipped analysis is never `not_reachable` (REA-003).

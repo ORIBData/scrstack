@@ -109,6 +109,15 @@ readiness allows the worker to start. PostgreSQL, Redis and evidence S3 stay ext
 The rebuildable feed cache is a local Docker volume. Review scanner resource limits
 and [pipeline operating constraints](ASSESSMENT_PIPELINE.md) before deploying.
 
+Guided remediation (REM-002) runs in its own container, `scrs-remediator`: the scanner image
+in the `remediation` role, answering only `/remediate` with `SCRS_REMEDIATION_API_TOKEN` (a
+third random token, different from the scanner's). It holds no database, storage, provider or
+scanner credentials, shares one internal network (`remediation`) only with the worker and the
+egress proxy, works in a 256 MiB `noexec` tmpfs, and is limited to 1 CPU, `SCRS_REMEDIATION_MEMORY`
+(default 1g), 128 processes and the request's 4-minute timeout. The scanner itself no longer
+serves `/remediate` (`SCRS_SCANNER_ROLE=scan`). Existing deployments must add
+`SCRS_REMEDIATION_API_TOKEN` before updating the stack.
+
 ## External HTTPS acceptance and optional HTTP node port
 
 Set `SCRS_PUBLIC_BASE_URL=https://your-domain` (or the same URL with `/scrs/v1`)
@@ -117,12 +126,27 @@ TLS, public health/readiness, unauthorized rejection, authorized assessment read
 Swagger/OpenAPI and active remediation capabilities. It uses
 `SCRS_ACCEPTANCE_API_TOKEN` (read scope) or falls back to the bootstrap token.
 Credentials are not printed and cross-origin redirects are rejected.
+`make pipeline-acceptance` goes further: it uploads a small archive with a write-scoped
+`SCRS_ACCEPTANCE_WRITE_TOKEN` and follows the assessment through the worker, scanner and storage.
+The full ordered checklist, with what to record, is [STAGING_ACCEPTANCE.md](STAGING_ACCEPTANCE.md).
 
 The API listens on HTTP port 7000 inside Docker (`SCRS_HTTP_ADDR=:7000`). Traefik terminates external HTTPS
 and preserves `/scrs/v1/*`. A published host port is unnecessary for that routing.
 If an HTTP node port is needed for local VPS diagnostics, add
 `deploy/compose.nodeport.yaml`; it binds `SCRS_HTTP_NODE_PORT` (default 7000) to **127.0.0.1**
 only and forwards it to the container's port 7000, e.g. `curl http://127.0.0.1:7000/scrs/v1/system/readyz`.
+Probes: `/system/healthz` and `/system/readyz` are public and answer only `ok` or `unavailable` (load balancers).
+A frontend status page should call `GET /system/status` with a `read` token. It reports `api`, `postgres`, `redis`,
+`s3`, `worker` (heartbeat), `scanner`, `feeds`, `sast`, `qa_runner` and `dependency_track` (only while the Dependency-Track link is on) as `ok`, `degraded`, `down` or `not_configured`,
+and always answers `200`, so read its `status` field. The QA runner's own `/healthz` returns 503 with the names of
+failed prerequisites (`karate`, `work_dir`, `java`, `gatling_classpath`), which makes Docker mark it unhealthy.
+
+Each API instance also watches that status every 30 seconds. A status that holds for three checks (about 90 seconds,
+starting two minutes after boot, so a redeploy stays quiet) is announced once across instances as a `system.degraded`
+event (lists the failing components) or, when it returns to `ok`, `system.recovered` (with the duration). Subscribe a
+webhook to them (`events: ["system.degraded","system.recovered"]`) or receive them on `GET /events`. Announcements
+are stored in PostgreSQL, so an outage of PostgreSQL itself cannot be announced: the live stream drops and clients
+should treat a reconnect as a reason to call `GET /system/status`.
 Keep external consumers on the HTTPS domain. Certificate renewal remains owned by
 Dokploy/Traefik and needs operational verification separately.
 
@@ -260,8 +284,12 @@ How the two services connect:
 - **Public router.** Traefik gives the runner its own router (`SCRS_QA_ROUTER_NAME`),
   certificate and hostname, with an http→https redirect. Every call also needs the
   runner's bearer token.
+- **Operator route.** The public router exists for operators who run standalone QA,
+  performance and load jobs on the runner. These jobs are independent of SCRS
+  assessments and of supply-chain checks, and SCRS does not record them. See
+  [QA_TESTING.md](QA_TESTING.md#standalone-operator-use).
 - **Allowlist.** The default `SCRS_QA_RUNNER_ALLOWED_CIDRS=127.0.0.1/32` lets nobody
-  in from outside. Add the CIDRs of tools that should call the runner directly.
+  in from outside. Add the CIDRs of the operators and tools that should call the runner directly.
 - **Ports.** Each service has its own container port (7000 and 8090), and both are
   published on 443 by hostname. Neither binds a host port.
 - **DNS.** Create a record for `SCRS_QA_DOMAIN` pointing at the VPS.
@@ -276,7 +304,17 @@ How the two services connect:
 | `SCRS_QA_RUNNER_URL`, `SCRS_QA_RUNNER_ALLOW_HTTP` | API, worker | Default to the private runner; set an https URL and `false` for a runner on another host |
 | `SCRS_QA_RUNNER_CA_FILE` | API, worker | PEM file trusted for a privately issued runner certificate |
 | `SCRS_QA_MAX_ACTIVE` | worker | Runs on the runner at once (default 4) |
-| `SCRS_QA_GENERATION_ENABLED` | worker | `false` disables LLM test generation |
+| `SCRS_QA_GENERATION_ENABLED` | worker | `false` disables LLM test generation and AI code review |
+| `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Your own model servers (Ollama, vLLM). Besides allowing private addresses and http, this list marks a provider `local`, which may always be sent source code. A hosted provider needs the two opt-ins instead. |
+| `SCRS_LLM_PROVIDERS`, `SCRS_LLM_PROVIDER_HOSTED_*`, `SCRS_LLM_PROVIDER_LOCAL_*` | API | Providers declared in the environment (names `hosted` and `local`; settings are `KIND`, `MODEL`, `BASE_URL`, `API_KEY`, `MAX_TOKENS`, `TEMPERATURE`, `ALLOW_SOURCE`). They exist when the API starts; the environment owns them. See [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md#providers-from-the-environment) |
+| `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED` | API, worker | `true` lets an acknowledged hosted provider receive source code (default `false`). Set it on both |
+| `SCRS_LLM_MONTHLY_INPUT_TOKENS`, `SCRS_LLM_MONTHLY_OUTPUT_TOKENS` | worker | Monthly token cap per hosted provider (defaults 20000000 and 4000000; `0` removes a cap) |
+| `SCRS_LLM_ASSESSMENT_INPUT_TOKENS`, `SCRS_LLM_ASSESSMENT_OUTPUT_TOKENS` | worker | Token ceiling for the model work of one assessment (defaults 300000 and 60000) |
+| `SCRS_LLM_TIMEOUT_SECONDS` | API, worker | One model call's time limit (default 360; 900 for a CPU model) |
+| `SCRS_AI_REVIEW_MAX_FILE_BYTES` | worker | Largest source file sent for AI code review (default 49152) |
+| `SCRS_EMBED_API_KEY` | `scrs-embed`, worker | Required. Key for the embedding service |
+| `SCRS_EMBED_URL`, `SCRS_EMBED_MODEL`, `SCRS_EMBED_DIM`, `SCRS_EMBED_MAX_CHARS`, `SCRS_EMBED_PRIVATE_HOSTS` | worker | The self-hosted embedding service (defaults: `scrs-embed`, bge-small, 384, 1500). Empty URL turns embedding off. See [MODEL_HOST.md](MODEL_HOST.md) |
+| `SCRS_EMBED_MEMORY`, `SCRS_EMBED_CPUS` | `scrs-embed` | Resource limits (defaults 2g, 2) |
 | `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Self-hosted model hosts (Ollama, vLLM) allowed to resolve privately and use http |
 
 **Runner isolation in the shared stack.** The runner executes repository test code on
@@ -361,6 +399,7 @@ advisories for safe versions.
 
 | Variable | Service | Purpose |
 | --- | --- | --- |
+| `SCRS_ACTIONS_SWEEP_INTERVAL_HOURS` | worker | Reads each in-scope GitHub repository's Actions inventory (enabled, workflow list, run-number gaps) this often, 25 repositories per 15 minutes; 0 or unset is off. Needs the read-only Actions permission on the connection's credential; without it the repository shows `available: false` |
 | `SCRS_DEPSDEV_ENABLED` | worker | Licence metadata and version lists from deps.dev (default true; false evaluates packages without a declared or detected licence as "no licence found") |
 | `SCRS_DEPSDEV_URL`, `SCRS_DEPSDEV_PRIVATE_HOSTS` | worker | A deps.dev API mirror and its hostnames allowed to resolve to private addresses |
 | `SCRS_DEPSDEV_MAX_LOOKUPS` | worker | Licence lookups per assessment (default 2000); the rest are left unresolved and retried next time |

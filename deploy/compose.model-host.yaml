@@ -1,0 +1,94 @@
+# SCRS self-hosted model server, for the second machine (Dokploy with Traefik).
+#
+# It serves a code-capable model through llama.cpp's OpenAI-compatible server.
+# SCRS sends source code only to a provider of this kind: add the machine's DNS
+# name to SCRS_LLM_PRIVATE_HOSTS on the SCRS stack, then add the provider with
+# POST /llm/providers (kind openai_compatible, base_url https://<domain>/v1,
+# api_key = SCRS_MODEL_API_KEY). See docs/MODEL_HOST.md.
+#
+# Protection, in layers:
+#   - Traefik terminates TLS (Let's Encrypt) and routes only /v1 (the llama.cpp
+#     server's other endpoints, such as /props and /slots, are never exposed).
+#   - An IP allowlist admits only the SCRS machine (SCRS_MODEL_ALLOWED_CIDRS);
+#     the default admits nobody.
+#   - The server requires the API key (LLAMA_API_KEY) as a bearer token. Several
+#     keys may be given, comma-separated, so a key can be rotated without
+#     downtime: deploy "old,new", move SCRS to "new", then deploy "new".
+#   - Traefik also rate-limits and caps the request body, so a leaked key or a
+#     runaway client cannot hold the machine.
+#
+# Check a deployment with scripts/check_model_host.sh (see docs/MODEL_HOST.md).
+#
+# Why llama.cpp and not vLLM on this box: vLLM's CPU build runs a 7B model in
+# bf16 (about 14 GB of weights, more than a 16 GB machine can spare) and its
+# CPU image needs AVX-512; it does not read GGUF on x86 CPU. llama.cpp runs the
+# 4-bit GGUF (about 5 GB) on ordinary AVX2 CPUs. Use vLLM only on a GPU machine.
+#
+# Labels manage routing. Do not add a second Domains UI router or StripPrefix.
+services:
+  scrs-model:
+    # Pinned by digest (the 'server' tag moves). Upgrade by changing the digest.
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:7751a6c0dc3d019c231d42678abbb0fac1a13a24c17c956109ed27533139f280
+    restart: unless-stopped
+    command: ["--no-webui", "--timeout", "900"]
+    environment:
+      # One key, or several separated by commas (rotation).
+      LLAMA_API_KEY: ${SCRS_MODEL_API_KEY:?Set SCRS_MODEL_API_KEY to a random key (openssl rand -hex 32)}
+      # Downloaded into the volume on first start (about 5 GB); needs internet then.
+      LLAMA_ARG_HF_REPO: ${SCRS_MODEL_HF_REPO:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M}
+      LLAMA_ARG_ALIAS: ${SCRS_MODEL_NAME:-qwen2.5-coder-7b}
+      # One request at a time: on CPU, parallel slots only slow each other down.
+      LLAMA_ARG_N_PARALLEL: "1"
+      # Context for one request: the file, the instructions and the answer.
+      LLAMA_ARG_CTX_SIZE: ${SCRS_MODEL_CTX:-32768}
+      # Physical cores, leaving one or two for the system.
+      LLAMA_ARG_THREADS: ${SCRS_MODEL_THREADS:-6}
+      # No slot monitoring endpoint (it is not routed either).
+      LLAMA_ARG_ENDPOINT_SLOTS: "0"
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8080"
+    volumes:
+      - scrs-model-cache:/root/.cache
+    networks: [proxy]
+    expose:
+      - "8080"
+    security_opt: [no-new-privileges:true]
+    mem_limit: ${SCRS_MODEL_MEMORY:-11g}
+    pids_limit: 256
+    healthcheck:
+      # /health answers 503 while the model loads, then 200.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 900s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=${SCRS_TRAEFIK_NETWORK:-dokploy-network}"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.rule=Host(`${SCRS_MODEL_DOMAIN:?Set SCRS_MODEL_DOMAIN to this machine's DNS hostname}`) && PathPrefix(`/v1`)"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.entrypoints=${SCRS_HTTPS_ENTRYPOINT:-websecure}"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.tls=true"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.tls.certresolver=${SCRS_CERT_RESOLVER:-letsencrypt}"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.middlewares=${SCRS_MODEL_ROUTER_NAME:-scrs-model}-allow,${SCRS_MODEL_ROUTER_NAME:-scrs-model}-limit,${SCRS_MODEL_ROUTER_NAME:-scrs-model}-body"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.service=${SCRS_MODEL_ROUTER_NAME:-scrs-model}"
+      - "traefik.http.services.${SCRS_MODEL_ROUTER_NAME:-scrs-model}.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-allow.ipallowlist.sourcerange=${SCRS_MODEL_ALLOWED_CIDRS:-127.0.0.1/32}"
+      # Requests per second per client address, and the largest request body
+      # (a source file and its instructions are far below 4 MiB).
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-limit.ratelimit.average=${SCRS_MODEL_RATE_PER_SECOND:-5}"
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-limit.ratelimit.burst=${SCRS_MODEL_RATE_BURST:-10}"
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-body.buffering.maxrequestbodybytes=${SCRS_MODEL_MAX_BODY_BYTES:-4194304}"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-http.rule=Host(`${SCRS_MODEL_DOMAIN}`)"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-http.entrypoints=${SCRS_HTTP_ENTRYPOINT:-web}"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-http.middlewares=${SCRS_MODEL_ROUTER_NAME:-scrs-model}-https"
+      - "traefik.http.routers.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-http.service=${SCRS_MODEL_ROUTER_NAME:-scrs-model}"
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-https.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.${SCRS_MODEL_ROUTER_NAME:-scrs-model}-https.redirectscheme.permanent=true"
+
+volumes:
+  scrs-model-cache:
+
+networks:
+  proxy:
+    external: true
+    name: ${SCRS_TRAEFIK_NETWORK:-dokploy-network}

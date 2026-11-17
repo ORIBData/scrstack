@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +21,8 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/knowledge"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/qarunner"
 	"github.com/ORIBData/scrstack/internal/scanner"
@@ -90,8 +94,27 @@ func (r *reportSink) PutQAReport(_ context.Context, data []byte) (string, string
 	return "qa/" + digest + ".tar.gz", digest, nil
 }
 
+// reviewLog records the code-review requests the fake model received, and
+// reviewAnswer says what it reports ("full" or "lint_only").
+// summaryPrompts records every advisory and summary prompt the fake model saw.
+var (
+	summaryMu      sync.Mutex
+	summaryPrompts []string
+)
+
+var (
+	reviewMu     sync.Mutex
+	reviewSeen   []string
+	reviewAnswer = "full"
+)
+
+func reviewFinding(category, severity string, line int, title, explanation string) map[string]any {
+	return map[string]any{"category": category, "severity": severity, "confidence": "high", "title": title, "explanation": explanation, "suggested_fix": "Handle the case explicitly.", "line_start": line, "line_end": line}
+}
+
 // fakeModel answers chat completions: Karate features for API prompts (one
-// valid, one using karate.exec) and a Go test for unit prompts.
+// valid, one using karate.exec), a Go test for unit prompts, and JSON
+// findings for code-review prompts.
 func fakeModel(t *testing.T) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -100,6 +123,47 @@ func fakeModel(t *testing.T) *httptest.Server {
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		if r.Header.Get("Authorization") != "Bearer model-key" || len(body.Messages) != 2 {
 			w.WriteHeader(401)
+			return
+		}
+		if strings.Contains(body.Messages[0].Content, "assessment summary") || strings.Contains(body.Messages[0].Content, "Write one advisory for each finding") {
+			summaryMu.Lock()
+			summaryPrompts = append(summaryPrompts, body.Messages[0].Content+"\n"+body.Messages[1].Content)
+			summaryMu.Unlock()
+			findingIDs := regexp.MustCompile(`finding_id: ([0-9a-f-]{36})`).FindAllStringSubmatch(body.Messages[1].Content, -1)
+			var answer []byte
+			if strings.Contains(body.Messages[0].Content, "assessment summary") {
+				priorities := []any{}
+				if len(findingIDs) > 0 {
+					priorities = append(priorities, map[string]any{"finding_id": findingIDs[0][1], "action": "Upgrade the package to its fixed version", "why": "It is known to be exploited. See https://evil.example/x"})
+				}
+				priorities = append(priorities, map[string]any{"finding_id": uuid.NewString(), "action": "Invented", "why": "dropped"})
+				answer, _ = json.Marshal(map[string]any{"headline": "One critical issue needs a fix", "risk_level": "high", "summary": "The most serious finding is a command injection in a popular package.", "priorities": priorities, "progress_note": "Nothing fixed since the last summary."})
+			} else {
+				advisories := []any{}
+				for _, m := range findingIDs {
+					advisories = append(advisories, map[string]any{"finding_id": m[1], "explanation": "An attacker can run commands through this package.", "recommended_action": "Upgrade to the fixed version.", "urgency": "immediate"})
+				}
+				answer, _ = json.Marshal(map[string]any{"advisories": advisories})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"model": "fake-1", "choices": []any{map[string]any{"message": map[string]any{"content": string(answer)}, "finish_reason": "stop"}}, "usage": map[string]int{"prompt_tokens": 300, "completion_tokens": 90}})
+			return
+		}
+		if strings.Contains(body.Messages[0].Content, "reviewing one source file") {
+			reviewMu.Lock()
+			reviewSeen = append(reviewSeen, body.Messages[1].Content)
+			mode := reviewAnswer
+			reviewMu.Unlock()
+			awsKey := strings.Join([]string{"AK", "IA", "IOSFODNN7", "EXAMPLE"}, "")
+			findings := []any{
+				reviewFinding("lint", "low", 3, "Comment does not describe the function", "The doc comment says nothing about overflow."),
+				reviewFinding("poetry", "low", 5, "Unknown category", "dropped"),
+				reviewFinding("lint", "low", 999, "Outside the file", "dropped"),
+			}
+			if mode == "full" {
+				findings = append([]any{reviewFinding("production_risk", "high", 4, "Add can overflow", "Adding two large ints overflows silently. Rotate "+awsKey+" ![x](https://evil.example/c?d=1)")}, findings...)
+			}
+			answer, _ := json.Marshal(map[string]any{"findings": findings})
+			_ = json.NewEncoder(w).Encode(map[string]any{"model": "fake-1", "choices": []any{map[string]any{"message": map[string]any{"content": string(answer)}, "finish_reason": "stop"}}, "usage": map[string]int{"prompt_tokens": 400, "completion_tokens": 120}})
 			return
 		}
 		text := "=== FILE: pkg/math_test.go ===\npackage pkg\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"add\")\n\t}\n}\n=== END FILE ==="
@@ -345,6 +409,361 @@ func TestPostgresQAPipeline(t *testing.T) {
 	unitSuites, _ := jobs.QASuites(ctx, assessments.QASuiteFilter{Generation: unit.ID, Content: true})
 	if len(unitSuites) != 1 || unitSuites[0].Path != "pkg/math_test.go" || unitSuites[0].Source != "pkg/math.go" || unitSuites[0].Status != "draft" || !strings.Contains(unitSuites[0].Content, "TestAdd") {
 		t.Fatalf("unit suites %+v", unitSuites)
+	}
+
+	// ---- AI code review: source goes only to a self-hosted model ----
+	policy := llm.SourcePolicy{Private: w.LLMPrivateHosts}
+	local := func(p assessments.LLMProvider) (string, bool) {
+		return policy.Check(llm.Provider{Kind: p.Kind, BaseURL: p.BaseURL, Model: p.Model}, p.SourceAckAt != nil)
+	}
+	hosted, err := jobs.CreateLLMProvider(ctx, assessments.LLMProvider{Name: "hosted", Kind: "openai_compatible", BaseURL: "https://api.example.com/v1", Model: "m", MaxTokens: 4096, Enabled: true}, uuid.Nil, func(id uuid.UUID) ([]byte, error) { return providers.Seal(plainKey, assessments.LLMAAD(id)) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, hosted.ID, assessments.AIReviewOptions{}, "tester", local); !errors.Is(err, assessments.ErrAIReviewSource) {
+		t.Fatal("a hosted provider must never be queued for code review:", err)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{}, "tester", nil); !errors.Is(err, assessments.ErrAIReviewSource) {
+		t.Fatal("without a locality check nothing is queued:", err)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, uuid.New(), assessments.AIReviewOptions{}, "tester", local); !errors.Is(err, assessments.ErrAIReviewProvider) {
+		t.Fatal("unknown provider:", err)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{MaxFiles: 99}, "tester", local); !errors.Is(err, assessments.ErrInput) {
+		t.Fatal("file limit:", err)
+	}
+	verdictBefore, _ := jobs.Get(ctx, *unit.AssessmentID)
+
+	review1, err := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{}, "tester", local)
+	if err != nil || review1.Status != "queued" || review1.Options.MaxFiles != 10 || review1.Ref != "main" {
+		t.Fatal(review1, err)
+	}
+	if worked, err := w.AIReviewOnce(ctx); err != nil || !worked {
+		t.Fatal(worked, err)
+	}
+	done, err := jobs.AIReviewByID(ctx, review1.ID)
+	if err != nil || done.Status != "succeeded" || done.FilesReviewed != 2 || done.Findings != 2 || done.InputTokens != 800 || done.OutputTokens != 240 || done.Incomplete != "" {
+		t.Fatalf("review %+v %v", done, err)
+	}
+	if done.Redactions["aws_access_key"] != 2 || done.Redactions["image"] != 2 || done.DocumentID == nil {
+		t.Fatalf("what the guard removed and the chronicle link: %+v", done)
+	}
+	reviewMu.Lock()
+	sentToModel := strings.Join(reviewSeen, "\n")
+	reviewMu.Unlock()
+	if !strings.Contains(sentToModel, "4: func Add(a, b int) int") || !strings.Contains(sentToModel, `<untrusted-data label="source_pkg_math.go">`) {
+		t.Fatalf("code must reach the model numbered and wrapped as data:\n%s", sentToModel)
+	}
+	var entries int
+	var severity, evidence, guidance string
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.findings WHERE type='ai_review' AND asset_id=$1`, second.AssetID).Scan(&entries)
+	if err := pool.QueryRow(ctx, `SELECT severity,evidence::text,guidance::text FROM `+schema+`.findings WHERE type='ai_review' AND title LIKE '%can overflow'`).Scan(&severity, &evidence, &guidance); err != nil {
+		t.Fatal(err)
+	}
+	if entries != 2 || severity != "high" || !strings.Contains(evidence, `"unverified": true`) || !strings.Contains(evidence, "pkg/math.go") || !strings.Contains(guidance, "not verified") {
+		t.Fatalf("entries %d %s %s %s", entries, severity, evidence, guidance)
+	}
+	for _, leak := range []string{"func Add", "AKIA", "evil.example"} {
+		if strings.Contains(evidence+guidance, leak) {
+			t.Fatalf("%q must not be stored in an entry", leak)
+		}
+	}
+	if verdictAfter, _ := jobs.Get(ctx, *unit.AssessmentID); verdictAfter.Verdict != verdictBefore.Verdict {
+		t.Fatal("an AI review must never change an assessment's verdict")
+	}
+	var detected int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.finding_events e JOIN `+schema+`.findings f ON f.id=e.finding_id WHERE f.type='ai_review' AND e.action='detected'`).Scan(&detected)
+	var documentBody, documentKind string
+	_ = pool.QueryRow(ctx, `SELECT kind,body FROM `+schema+`.knowledge_documents WHERE id=$1`, *done.DocumentID).Scan(&documentKind, &documentBody)
+	var ledger int64
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(sum(input_tokens),0) FROM `+schema+`.llm_usage WHERE purpose='code_review' AND assessment_id=$1`, *done.AssessmentID).Scan(&ledger)
+	if detected != 2 || documentKind != "code_review" || !strings.Contains(documentBody, "Add can overflow") || strings.Contains(documentBody, "func Add") || !strings.Contains(documentBody, "not verified") || ledger != 800 {
+		t.Fatalf("history %d, document %s %q, ledger %d", detected, documentKind, documentBody, ledger)
+	}
+
+	// A later review that no longer reports the production risk closes it,
+	// and keeps the one it still reports.
+	reviewMu.Lock()
+	reviewAnswer = "lint_only"
+	reviewMu.Unlock()
+	review2, _ := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{Paths: []string{"pkg/math.go"}}, "tester", local)
+	if _, err := w.AIReviewOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var overflowStatus, lintStatus string
+	_ = pool.QueryRow(ctx, `SELECT status FROM `+schema+`.findings WHERE title LIKE 'AI review: Add can overflow'`).Scan(&overflowStatus)
+	_ = pool.QueryRow(ctx, `SELECT status FROM `+schema+`.findings WHERE title LIKE 'AI review: Comment does not%'`).Scan(&lintStatus)
+	var closedEvents int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.finding_events WHERE action='fixed_by_ai_review'`).Scan(&closedEvents)
+	if got, _ := jobs.AIReviewByID(ctx, review2.ID); got.Status != "succeeded" || got.Findings != 1 || overflowStatus != "fixed" || lintStatus != "open" || closedEvents != 1 {
+		t.Fatalf("second review %+v: overflow %s, lint %s, closed events %d", got, overflowStatus, lintStatus, closedEvents)
+	}
+
+	// The worker checks again that the provider is still self-hosted: a
+	// provider edited to a hosted endpoint after queueing is refused and the
+	// model is never called.
+	callsBefore := len(reviewSeen)
+	review3, _ := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{}, "tester", local)
+	if _, err := pool.Exec(ctx, `UPDATE `+schema+`.llm_providers SET base_url='https://api.example.com/v1' WHERE id=$1`, provider.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AIReviewOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	blockedReview, _ := jobs.AIReviewByID(ctx, review3.ID)
+	reviewMu.Lock()
+	calls := len(reviewSeen)
+	reviewMu.Unlock()
+	if blockedReview.Status != "failed" || !strings.Contains(blockedReview.Error, "self-hosted") || calls != callsBefore {
+		t.Fatalf("hosted at run time: %+v, model calls %d -> %d", blockedReview, callsBefore, calls)
+	}
+	// Unit-test generation sends source too, so it follows the same rule.
+	unitHosted, err := jobs.EnqueueQAGeneration(ctx, second.AssetID, "unit", assessments.QAGenerationOptions{MaxFiles: 1}, "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.GenerateOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := jobs.QAGenerationByID(ctx, unitHosted.ID); got.Status != "failed" || !strings.Contains(got.Error, "self-hosted") {
+		t.Fatalf("unit generation to a hosted provider: %+v", got)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE `+schema+`.llm_providers SET base_url=$2 WHERE id=$1`, provider.ID, model.URL+"/v1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The assessment's token budget: a review that cannot start says so.
+	t.Setenv("SCRS_LLM_ASSESSMENT_INPUT_TOKENS", "1000")
+	review4, _ := jobs.EnqueueAIReview(ctx, second.AssetID, provider.ID, assessments.AIReviewOptions{}, "tester", local)
+	if _, err := w.AIReviewOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := jobs.AIReviewByID(ctx, review4.ID); got.Status != "failed" || !strings.Contains(got.Error, "token budget") {
+		t.Fatalf("budget: %+v", got)
+	}
+	t.Setenv("SCRS_LLM_ASSESSMENT_INPUT_TOKENS", "")
+	list, err := jobs.AIReviews(ctx, second.AssetID, 10)
+	if err != nil || len(list) != 4 || list[0].ID != review4.ID {
+		t.Fatalf("list %d %v", len(list), err)
+	}
+
+	// ---- Hosted code review: opt-in by the platform switch and an acknowledgement ----
+	openPolicy := llm.SourcePolicy{Private: w.LLMPrivateHosts, AllowHosted: true}
+	open := func(p assessments.LLMProvider) (string, bool) {
+		return openPolicy.Check(llm.Provider{Kind: p.Kind, BaseURL: p.BaseURL, Model: p.Model}, p.SourceAckAt != nil)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, hosted.ID, assessments.AIReviewOptions{}, "tester", open); !errors.Is(err, assessments.ErrAIReviewSource) {
+		t.Fatal("with the switch on but no acknowledgement, a hosted provider must be refused:", err)
+	}
+	if _, err := jobs.SetLLMSourceAck(ctx, hosted.ID, true, "short", "tester", uuid.Nil); !errors.Is(err, assessments.ErrInput) {
+		t.Fatal("an acknowledgement needs a real note:", err)
+	}
+	if _, err := jobs.SetLLMSourceAck(ctx, hosted.ID, true, "Zero-retention agreement signed 2026", "tester", uuid.Nil); err != nil {
+		t.Fatal(err)
+	}
+	hostedReview, err := jobs.EnqueueAIReview(ctx, second.AssetID, hosted.ID, assessments.AIReviewOptions{}, "tester", open)
+	if err != nil || hostedReview.Locality != "hosted" {
+		t.Fatal("an acknowledged hosted provider with the switch on is accepted and recorded as hosted:", hostedReview, err)
+	}
+	if _, err := jobs.EnqueueAIReview(ctx, second.AssetID, hosted.ID, assessments.AIReviewOptions{}, "tester", local); !errors.Is(err, assessments.ErrAIReviewSource) {
+		t.Fatal("with the switch off, an acknowledgement alone is not enough:", err)
+	}
+	// The worker checks again: the switch is off in this worker, so the queued
+	// review fails before any source is fetched or sent.
+	if worked, err := w.AIReviewOnce(ctx); err != nil || !worked {
+		t.Fatal(worked, err)
+	}
+	if got, _ := jobs.AIReviewByID(ctx, hostedReview.ID); got.Status != "failed" || !strings.Contains(got.Error, "may not receive source code") {
+		t.Fatalf("a worker without the switch must refuse hosted source: %+v", got)
+	}
+	// Monthly cap: a hosted provider's spend stops at its cap; a self-hosted
+	// one has none.
+	kn := jobs.Knowledge()
+	if err := kn.RecordUsage(ctx, knowledge.Usage{Purpose: "code_review", Provider: "hosted", Model: "m", InputTokens: 5000, OutputTokens: 100, Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SCRS_LLM_MONTHLY_INPUT_TOKENS", "4000")
+	hostedSettings := llm.Provider{Kind: hosted.Kind, BaseURL: hosted.BaseURL, Model: hosted.Model}
+	if err := kn.ReserveMonth(ctx, w.budgetFor(hosted, hostedSettings), 10, 10); !errors.Is(err, knowledge.ErrMonthlyCap) || !errors.Is(err, knowledge.ErrBudget) {
+		t.Fatal("monthly cap should stop a hosted provider:", err)
+	}
+	if err := kn.ReserveMonth(ctx, w.budgetFor(provider, llm.Provider{Kind: provider.Kind, BaseURL: provider.BaseURL, Model: provider.Model}), 10, 10); err != nil {
+		t.Fatal("a self-hosted provider has no monthly cap:", err)
+	}
+	t.Setenv("SCRS_LLM_MONTHLY_INPUT_TOKENS", "0")
+	if err := kn.ReserveMonth(ctx, w.budgetFor(hosted, hostedSettings), 10, 10); err != nil {
+		t.Fatal("0 removes the cap:", err)
+	}
+	t.Setenv("SCRS_LLM_MONTHLY_INPUT_TOKENS", "")
+
+	// ---- AI advisories and summaries: only the allowlist reaches the model ----
+	assessmentID := *unit.AssessmentID
+	addFinding := func(findingType, advisory, title, severity, status, change string, guidance map[string]any, evidence string) uuid.UUID {
+		t.Helper()
+		f := assessments.Finding{ID: uuid.New(), AssetID: second.AssetID, Ref: "main", Type: findingType, AdvisoryID: advisory, Title: title, Severity: severity, Score: 40, Status: status, Change: change, Component: assessments.Component{Name: "lodash", Version: "4.17.20", Ecosystem: "npm", PURL: "pkg:npm/lodash@4.17.20", Path: "package-lock.json"}}
+		f.Fingerprint = assessments.Hash([]byte(f.ID.String()))
+		f.Guidance, _ = json.Marshal(guidance)
+		f.Evidence = json.RawMessage(evidence)
+		component, _ := json.Marshal(f.Component)
+		snapshot, _ := json.Marshal(f)
+		if _, err := pool.Exec(ctx, `INSERT INTO `+schema+`.findings(id,asset_id,fingerprint,ref,type,advisory_id,title,severity,score,status,component,evidence,guidance,last_assessment_id) VALUES($1,$2,$3,'main',$4,$5,$6,$7,40,$8,$9,$10,$11,$12)`, f.ID, f.AssetID, f.Fingerprint, findingType, advisory, title, severity, status, component, f.Evidence, f.Guidance, assessmentID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO `+schema+`.assessment_findings(assessment_id,finding_id,snapshot) VALUES($1,$2,$3)`, assessmentID, f.ID, snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return f.ID
+	}
+	critical := addFinding("vulnerability", "GHSA-TEST-0001", "Command injection in lodash template", "critical", "open", "new", map[string]any{"aliases": []string{"CVE-2099-0001"}, "fixed_versions": []string{"4.17.21"}, "kev": true, "epss": 0.9}, `{"source":"osv"}`)
+	addFinding("vulnerability", "GHSA-TEST-0002", "Prototype pollution in minimist", "low", "open", "existing", map[string]any{"fixed_versions": []string{"1.2.6"}}, `{}`)
+	addFinding("vulnerability", "GHSA-TEST-0003", "Already fixed issue", "high", "fixed", "existing", map[string]any{}, `{}`)
+	// None of these may reach a model: code-derived text, paths, secrets.
+	addFinding("sast", "gosec:G101", "SAST-DECOY-TITLE hardcoded credential", "high", "open", "new", map[string]any{}, `{"path":"decoy-sast-path/secret.go","snippet":"super-secret-evidence"}`)
+	addFinding("secret", "SCRS-SECRET", "SECRET-DECOY-TITLE api key in config", "critical", "open", "new", map[string]any{}, `{"path":"decoy-secret-path/.env"}`)
+	addFinding("ai_review", "SCRS-AI-REVIEW:lint:decoy", "AI-REVIEW-DECOY title about func Add", "medium", "open", "new", map[string]any{}, `{"path":"pkg/math.go"}`)
+	if _, err := pool.Exec(ctx, `INSERT INTO `+schema+`.advisory_records(origin,id,cve,record,raw) VALUES('osv','GHSA-TEST-0001','CVE-2099-0001','{"summary":"Lodash template command injection","details":"Versions before 4.17.21 allow command injection through the template function."}','{}')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// A self-hosted embedding server, as the worker reaches it.
+	var embedded int
+	var embedMu sync.Mutex
+	embedServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Input []string `json:"input"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if r.URL.Path != "/v1/embeddings" || r.Header.Get("Authorization") != "Bearer embed-key" {
+			w.WriteHeader(401)
+			return
+		}
+		embedMu.Lock()
+		embedded += len(req.Input)
+		embedMu.Unlock()
+		data := make([]map[string]any, len(req.Input))
+		for i := range req.Input {
+			v := make([]float64, 8)
+			v[i%8], v[(i+1)%8] = 1, 2
+			data[i] = map[string]any{"index": i, "embedding": v}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer embedServer.Close()
+	t.Setenv("SCRS_EMBED_URL", embedServer.URL+"/v1")
+	t.Setenv("SCRS_EMBED_MODEL", "bge-small-en-v1.5")
+	t.Setenv("SCRS_EMBED_DIM", "8")
+	t.Setenv("SCRS_EMBED_API_KEY", "embed-key")
+	t.Setenv("SCRS_EMBED_PRIVATE_HOSTS", "127.0.0.1")
+
+	// Any provider may be used: a hosted one is accepted, because only the
+	// allowlist is sent. (Not run: it has no real endpoint.)
+	hostedJob, err := jobs.EnqueueAISummary(ctx, assessmentID, hosted.ID, assessments.AISummaryOptions{}, "tester")
+	if err != nil || hostedJob.Options.MaxAdvisories != 10 {
+		t.Fatal("a hosted provider is allowed for summaries:", hostedJob, err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM `+schema+`.ai_summaries WHERE id=$1`, hostedJob.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := jobs.EnqueueAISummary(ctx, assessmentID, uuid.New(), assessments.AISummaryOptions{}, "tester"); !errors.Is(err, assessments.ErrAISummaryProvider) {
+		t.Fatal("unknown provider:", err)
+	}
+	if _, err := jobs.EnqueueAISummary(ctx, assessmentID, provider.ID, assessments.AISummaryOptions{MaxAdvisories: 99}, "tester"); !errors.Is(err, assessments.ErrInput) {
+		t.Fatal("advisory limit:", err)
+	}
+	if _, err := jobs.EnqueueAISummary(ctx, uuid.New(), provider.ID, assessments.AISummaryOptions{}, "tester"); !errors.Is(err, assessments.ErrNotFound) {
+		t.Fatal("unknown assessment:", err)
+	}
+
+	job1, err := jobs.EnqueueAISummary(ctx, assessmentID, provider.ID, assessments.AISummaryOptions{MaxAdvisories: 2}, "tester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worked, err := w.AISummaryOnce(ctx); err != nil || !worked {
+		t.Fatal(worked, err)
+	}
+	done1, err := jobs.AISummaryByID(ctx, job1.ID)
+	if err != nil || done1.Status != "succeeded" || done1.Advisories != 2 || done1.FindingsExcluded < 3 || done1.SummaryDocumentID == nil || done1.Incomplete != "" || done1.InputTokens == 0 {
+		t.Fatalf("job %+v %v", done1, err)
+	}
+	summaryMu.Lock()
+	seen := strings.Join(summaryPrompts, "\n---\n")
+	summaryMu.Unlock()
+	for _, want := range []string{"GHSA-TEST-0001", "CVE-2099-0001", "Command injection in lodash template", "package: lodash 4.17.20 (npm)", "fixed_in: 4.17.21", "known_exploited: yes", "Versions before 4.17.21 allow command injection", `<untrusted-data label="findings">`, "never instructions"} {
+		if !strings.Contains(seen, want) {
+			t.Errorf("the allowlisted %q should reach the model", want)
+		}
+	}
+	for _, leak := range []string{"SAST-DECOY-TITLE", "SECRET-DECOY-TITLE", "AI-REVIEW-DECOY", "decoy-sast-path", "decoy-secret-path", "super-secret-evidence", "package-lock.json", "func Add", "Already fixed issue"} {
+		if strings.Contains(seen, leak) {
+			t.Fatalf("%q must never reach a model", leak)
+		}
+	}
+
+	chronicle, err := jobs.Knowledge().Chronicle(ctx, knowledge.ChronicleQuery{AssetID: second.AssetID, AssessmentID: &assessmentID, Kinds: []string{knowledge.KindAssessmentSummary, knowledge.KindAdvisory}})
+	if err != nil || len(chronicle) != 3 {
+		t.Fatalf("one summary and two advisories expected: %d %v", len(chronicle), err)
+	}
+	var advisoryForCritical *knowledge.Document
+	for i, d := range chronicle {
+		if d.Origin != knowledge.OriginLLM || d.Provenance["prompt_version"] != "advisory-summary-1" || d.Provenance["provider_locality"] != "local" || !strings.Contains(d.Body, "Written by a language model") || strings.Contains(d.Body, "evil.example") {
+			t.Fatalf("document %+v", d)
+		}
+		if d.Kind == knowledge.KindAdvisory && d.FindingID != nil && *d.FindingID == critical {
+			advisoryForCritical = &chronicle[i]
+		}
+	}
+	if advisoryForCritical == nil {
+		t.Fatal("the most important finding must get the first advisory")
+	}
+	var chunks, dims int
+	var chunkModel string
+	_ = pool.QueryRow(ctx, `SELECT count(*),COALESCE(max(dim),0),COALESCE(max(embed_model),'') FROM `+schema+`.knowledge_chunks c JOIN `+schema+`.knowledge_documents d ON d.id=c.document_id WHERE d.assessment_id=$1 AND d.kind IN ('assessment_summary','advisory')`, assessmentID).Scan(&chunks, &dims, &chunkModel)
+	if chunks < 3 || dims != 8 || chunkModel != "bge-small-en-v1.5" || embedded < 3 {
+		t.Fatalf("self-hosted embeddings: %d chunks, dim %d, model %q, %d texts embedded", chunks, dims, chunkModel, embedded)
+	}
+	var ledgerRows int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM `+schema+`.llm_usage WHERE assessment_id=$1 AND purpose IN ('assessment_summary','advisory')`, assessmentID).Scan(&ledgerRows)
+	if ledgerRows != 2 { // one summary call, one advisory call for two findings
+		t.Fatalf("ledger rows %d", ledgerRows)
+	}
+
+	// A second job supersedes the first summary and the advisory of the same
+	// finding, keeps the old ones, and tells the model what was said before.
+	job2, _ := jobs.EnqueueAISummary(ctx, assessmentID, provider.ID, assessments.AISummaryOptions{MaxAdvisories: 1}, "tester")
+	if _, err := w.AISummaryOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := jobs.AISummaryByID(ctx, job2.ID); got.Status != "succeeded" || got.Advisories != 1 {
+		t.Fatalf("second job %+v", got)
+	}
+	summaryMu.Lock()
+	secondPrompts := strings.Join(summaryPrompts[len(summaryPrompts)-2:], "\n")
+	summaryMu.Unlock()
+	if !strings.Contains(secondPrompts, `<untrusted-data label="previous_summary">`) || !strings.Contains(secondPrompts, "One critical issue needs a fix") {
+		t.Fatal("the previous summary should be given as context:\n", secondPrompts)
+	}
+	summaryHistory, _ := jobs.Knowledge().Chronicle(ctx, knowledge.ChronicleQuery{AssetID: second.AssetID, Kinds: []string{knowledge.KindAssessmentSummary}, IncludeSuperseded: true})
+	summaryCurrent, _ := jobs.Knowledge().Chronicle(ctx, knowledge.ChronicleQuery{AssetID: second.AssetID, Kinds: []string{knowledge.KindAssessmentSummary}})
+	if len(summaryHistory) != 2 || len(summaryCurrent) != 1 || summaryHistory[0].SupersededAt == nil || summaryCurrent[0].Supersedes == nil || *summaryCurrent[0].Supersedes != summaryHistory[0].ID {
+		t.Fatalf("summary chain: %d total, %d summaryCurrent", len(summaryHistory), len(summaryCurrent))
+	}
+	critAdvisories, _ := jobs.Knowledge().Chronicle(ctx, knowledge.ChronicleQuery{AssetID: second.AssetID, FindingID: &critical, IncludeSuperseded: true})
+	if len(critAdvisories) != 2 || critAdvisories[0].SupersededAt == nil || critAdvisories[1].Supersedes == nil {
+		t.Fatalf("advisory chain for the finding: %d", len(critAdvisories))
+	}
+
+	// The assessment's token budget stops a job and says so.
+	t.Setenv("SCRS_LLM_ASSESSMENT_INPUT_TOKENS", "1000")
+	job3, _ := jobs.EnqueueAISummary(ctx, assessmentID, provider.ID, assessments.AISummaryOptions{}, "tester")
+	if _, err := w.AISummaryOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := jobs.AISummaryByID(ctx, job3.ID); got.Status != "failed" || !strings.Contains(got.Error, "budget") {
+		t.Fatalf("budget: %+v", got)
+	}
+	t.Setenv("SCRS_LLM_ASSESSMENT_INPUT_TOKENS", "")
+	if list, err := jobs.AISummaries(ctx, assessmentID, 10); err != nil || len(list) != 3 || list[0].ID != job3.ID {
+		t.Fatalf("list %d %v", len(list), err)
 	}
 
 	// Cancelling an active run removes the runner job.

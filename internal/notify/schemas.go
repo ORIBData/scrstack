@@ -17,6 +17,9 @@ func object(required []string, properties map[string]any) map[string]any {
 
 func str() map[string]any     { return map[string]any{"type": "string"} }
 func integer() map[string]any { return map[string]any{"type": "integer"} }
+func enum(values ...string) map[string]any {
+	return map[string]any{"type": "string", "enum": values}
+}
 func boolean() map[string]any { return map[string]any{"type": "boolean"} }
 func array(items map[string]any) map[string]any {
 	return map[string]any{"type": "array", "items": items}
@@ -24,7 +27,7 @@ func array(items map[string]any) map[string]any {
 func nullable(t string) map[string]any { return map[string]any{"type": []string{t, "null"}} }
 
 var findingBriefSchema = object([]string{"id", "type", "severity", "advisory_id", "title"}, map[string]any{
-	"id": str(), "type": str(), "severity": str(), "score": integer(), "advisory_id": str(), "title": str(), "change": str(), "component": map[string]any{"type": "object"}, "link": str(),
+	"id": str(), "type": str(), "severity": str(), "score": integer(), "advisory_id": str(), "title": str(), "change": str(), "component": map[string]any{"type": "object"}, "link": str(), "introduced_by": map[string]any{"type": "object"},
 })
 
 var assessmentData = object([]string{"assessment", "links"}, map[string]any{
@@ -73,9 +76,19 @@ var eventData = map[string]map[string]any{
 		"connection_id": str(), "name": str(), "provider": str(), "check": str(), "state": str(), "problems": array(str()), "link": str(),
 	}),
 	"maintenance.completed": object([]string{"trigger", "report"}, map[string]any{"trigger": str(), "report": map[string]any{"type": "object"}}),
-	"qa.completed":          qaData,
-	"qa.failed":             qaData,
-	"ping":                  object(nil, map[string]any{}),
+	"dependency_track.upload_failed": object([]string{"upload_id", "project", "version", "stage", "error"}, map[string]any{
+		"upload_id": str(), "assessment_id": str(), "asset_id": str(), "project": str(), "version": str(), "stage": enum("upload", "processing"), "error": str(),
+	}),
+	"system.degraded": object([]string{"status", "previous_status", "components", "since"}, map[string]any{
+		"status": enum("degraded", "down"), "previous_status": enum("ok", "degraded", "down"), "since": map[string]any{"type": "string", "format": "date-time"},
+		"components": array(object([]string{"name", "status"}, map[string]any{"name": str(), "status": enum("degraded", "down"), "detail": str()})),
+	}),
+	"system.recovered": object([]string{"status", "previous_status", "since", "duration_seconds"}, map[string]any{
+		"status": enum("ok"), "previous_status": enum("degraded", "down"), "since": map[string]any{"type": "string", "format": "date-time"}, "duration_seconds": integer(),
+	}),
+	"qa.completed": qaData,
+	"qa.failed":    qaData,
+	"ping":         object(nil, map[string]any{}),
 }
 
 // EventSchema returns the JSON Schema of an event type at a version.

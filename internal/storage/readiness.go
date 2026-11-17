@@ -9,16 +9,18 @@ import (
 )
 
 // NewReadiness reuses bounded client pools across probes. Its close function
-// must be called after HTTP shutdown, not after each health request.
-func NewReadiness(ctx context.Context, c Config) (func(context.Context) error, func(), error) {
+// must be called after HTTP shutdown, not after each health request. The
+// second function probes each dependency separately for GET /system/status
+// and returns nil for a healthy one, keyed postgres, redis and s3.
+func NewReadiness(ctx context.Context, c Config) (func(context.Context) error, func(context.Context) map[string]error, func(), error) {
 	options, err := pgxpool.ParseConfig(c.DatabaseURL)
 	if err != nil {
-		return nil, nil, errors.New("invalid readiness database configuration")
+		return nil, nil, nil, errors.New("invalid readiness database configuration")
 	}
 	options.MaxConns = 2
 	pool, err := pgxpool.NewWithConfig(ctx, options)
 	if err != nil {
-		return nil, nil, errors.New("readiness pool unavailable")
+		return nil, nil, nil, errors.New("readiness pool unavailable")
 	}
 	var clients []*redis.Client
 	closeAll := func() {
@@ -35,7 +37,7 @@ func NewReadiness(ctx context.Context, c Config) (func(context.Context) error, f
 		opts, err := redis.ParseURL(url)
 		if err != nil {
 			closeAll()
-			return nil, nil, errors.New("invalid readiness Redis configuration")
+			return nil, nil, nil, errors.New("invalid readiness Redis configuration")
 		}
 		opts.PoolSize = 2
 		clients = append(clients, redis.NewClient(opts))
@@ -43,22 +45,39 @@ func NewReadiness(ctx context.Context, c Config) (func(context.Context) error, f
 	object, err := s3Client(c)
 	if err != nil {
 		closeAll()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	check := func(ctx context.Context) error {
+	probePostgres := func(ctx context.Context) error {
 		if err := pool.Ping(ctx); err != nil {
 			return errors.New("PostgreSQL unavailable")
 		}
+		return nil
+	}
+	probeRedis := func(ctx context.Context) error {
 		for _, client := range clients {
 			if err := client.Ping(ctx).Err(); err != nil {
 				return errors.New("Redis unavailable")
 			}
 		}
+		return nil
+	}
+	probeS3 := func(ctx context.Context) error {
 		exists, err := object.BucketExists(ctx, c.S3Bucket)
 		if err != nil || !exists {
 			return errors.New("S3 bucket unavailable")
 		}
 		return nil
 	}
-	return check, closeAll, nil
+	check := func(ctx context.Context) error {
+		for _, probe := range []func(context.Context) error{probePostgres, probeRedis, probeS3} {
+			if err := probe(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	detail := func(ctx context.Context) map[string]error {
+		return map[string]error{"postgres": probePostgres(ctx), "redis": probeRedis(ctx), "s3": probeS3(ctx)}
+	}
+	return check, detail, closeAll, nil
 }

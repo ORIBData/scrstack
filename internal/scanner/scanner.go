@@ -29,10 +29,14 @@ import (
 type Engine struct {
 	Indicators *IndicatorBundle
 	// Rules is the YARA-X rule pack sent with this scan; YARABinary runs it.
-	Rules                       *RulePack
-	YARABinary                  string
-	Binary, WorkRoot, Database  string
-	RemediationEnabled          bool
+	Rules                      *RulePack
+	YARABinary                 string
+	Binary, WorkRoot, Database string
+	RemediationEnabled         bool
+	// Role narrows what this process serves: "" or "all" everything,
+	// "scan" no remediation, "remediation" only /remediate (the sandbox
+	// profile, REM-002: a separate container with its own token).
+	Role                        string
 	RemediationProxy            string
 	ClamdAddress, IndicatorFile string
 	// MaxImageBytes caps a streamed image archive (SCRS_MAX_IMAGE_BYTES).
@@ -279,11 +283,39 @@ func reportsProblem(stderr string) bool {
 	return false
 }
 
+// Roles of a scanner process (SCRS_SCANNER_ROLE).
+const (
+	RoleAll         = "all"
+	RoleScan        = "scan"
+	RoleRemediation = "remediation"
+)
+
+// ValidRole reports whether a SCRS_SCANNER_ROLE value is known; empty means all.
+func ValidRole(role string) bool {
+	return role == "" || role == RoleAll || role == RoleScan || role == RoleRemediation
+}
+
+// serves reports whether this process answers a path at all. /healthz is
+// answered by every role, so a sandbox container can be health-checked.
+func (e Engine) serves(path string) bool {
+	switch e.Role {
+	case RoleScan:
+		return path != "/remediate"
+	case RoleRemediation:
+		return path == "/remediate" || path == "/healthz"
+	}
+	return true
+}
+
 func (e Engine) Handler(token string) http.Handler {
 	expected := sha256.Sum256([]byte(token))
 	slots := make(chan struct{}, 1)
 	images := e.imageHandler(expected, slots)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !e.serves(r.URL.Path) {
+			http.NotFound(w, r)
+			return
+		}
 		if r.Method == "POST" && r.URL.Path == "/scan-image" {
 			if len(token) < 32 {
 				http.Error(w, "unauthorized", 401)

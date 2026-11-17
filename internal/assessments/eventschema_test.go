@@ -113,19 +113,22 @@ func TestEventPayloadsMatchSchemas(t *testing.T) {
 	}
 	run := QARun{ID: uuid.New(), AssetID: a.AssetID, Kind: "functional", Status: "passed", Trigger: "assessment", CreatedAt: now}
 	samples := map[string]any{
-		"assessment.completed":          Summary(a),
-		"assessment.failed":             Summary(a),
-		"finding.created":               with(map[string]any{"findings": []any{brief}}),
-		"finding.rescored":              with(map[string]any{"findings": []any{rescored}}),
-		"malicious_dependency.reported": with(map[string]any{"findings": []any{brief}}),
-		"finding.status_changed":        map[string]any{"finding_id": f.ID, "asset_id": a.AssetID, "previous_status": "open", "status": "triaged", "waiver_until": nil, "actor_id": uuid.New(), "link": "x"},
-		"integrity.alert":               map[string]any{"source": "event", "kind": "force_push", "severity": "high", "title": "t", "repository": "org/api", "ref": "main"},
-		"feed.stale":                    map[string]any{"feed": "osv", "detail": "stale"},
-		"connection.degraded":           map[string]any{"connection_id": uuid.New(), "name": "gh", "provider": "github", "check": "test"},
-		"maintenance.completed":         map[string]any{"trigger": "scheduled", "report": MaintenanceReport{}},
-		"qa.completed":                  QASummary(run),
-		"qa.failed":                     QASummary(run),
-		"ping":                          map[string]any{},
+		"assessment.completed":           Summary(a),
+		"assessment.failed":              Summary(a),
+		"finding.created":                with(map[string]any{"findings": []any{brief}}),
+		"finding.rescored":               with(map[string]any{"findings": []any{rescored}}),
+		"malicious_dependency.reported":  with(map[string]any{"findings": []any{brief}}),
+		"finding.status_changed":         map[string]any{"finding_id": f.ID, "asset_id": a.AssetID, "previous_status": "open", "status": "triaged", "waiver_until": nil, "actor_id": uuid.New(), "link": "x"},
+		"integrity.alert":                map[string]any{"source": "event", "kind": "force_push", "severity": "high", "title": "t", "repository": "org/api", "ref": "main"},
+		"feed.stale":                     map[string]any{"feed": "osv", "detail": "stale"},
+		"connection.degraded":            map[string]any{"connection_id": uuid.New(), "name": "gh", "provider": "github", "check": "test"},
+		"maintenance.completed":          map[string]any{"trigger": "scheduled", "report": MaintenanceReport{}},
+		"qa.completed":                   QASummary(run),
+		"qa.failed":                      QASummary(run),
+		"dependency_track.upload_failed": map[string]any{"upload_id": uuid.New(), "assessment_id": uuid.New(), "project": "org/app", "version": "main", "stage": "upload", "error": "dependency-track rejected the request: HTTP 403"},
+		"system.degraded":                map[string]any{"status": "down", "previous_status": "ok", "since": now, "components": []any{map[string]any{"name": "redis", "status": "down", "detail": "unavailable"}}},
+		"system.recovered":               map[string]any{"status": "ok", "previous_status": "down", "since": now, "duration_seconds": 90},
+		"ping":                           map[string]any{},
 	}
 	for event := range notify.Events {
 		raw, ok := notify.EventSchema(event, notify.SchemaVersion)

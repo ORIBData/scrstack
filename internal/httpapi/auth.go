@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/actionscheck"
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/notify"
@@ -29,6 +30,10 @@ type TokenStore interface {
 }
 type principalKey struct{}
 type Security struct {
+	// Embedder embeds text for chronicle search and backfill; nil answers 503.
+	Embedder Embedder
+	// ActionsAPI reads GitHub Actions inventories; nil uses GitHub itself (tests only).
+	ActionsAPI          actionscheck.API
 	GitHubWebhookSecret string
 	RemediationEnabled  bool
 	RelayEnabled        bool
@@ -63,6 +68,9 @@ type Security struct {
 	QAReports       QAReportReader
 	QARunner        *qa.Runner
 	LLMPrivateHosts map[string]bool
+	// LLMAllowSource is the platform switch that lets an acknowledged hosted
+	// provider receive source code (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED).
+	LLMAllowSource bool
 	// SAST is the scrs-sast service client (M9); SASTDefaults are the
 	// deployment defaults for SAST and reachability.
 	SAST         *sast.Client
@@ -70,6 +78,8 @@ type Security struct {
 	// Live fans committed events out to GET /events streams (OUT-004);
 	// nil answers 503.
 	Live *notify.Hub
+	// Status serves GET /system/status; nil leaves the route unregistered.
+	Status *PlatformStatus
 	// DTrackPrivateHosts may be internal Dependency-Track servers
 	// (SCRS_DTRACK_PRIVATE_HOSTS); DTrackHTTP overrides the guarded client
 	// (tests only).
@@ -87,7 +97,7 @@ redis.call('PEXPIRE',KEYS[1],60000)
 return 1`)
 
 func HandlerWithSecurity(check func(context.Context) error, store ConnectionStore, security Security) http.Handler {
-	mux := http.NewServeMux()
+	mux := routeMux{http.NewServeMux()}
 	mux.HandleFunc("GET "+BasePath+"/system/healthz", health)
 	mux.Handle("GET "+BasePath+"/system/readyz", readiness(check))
 	// Reuse the embedded docs-only mux; protect all its assets consistently.
@@ -104,6 +114,9 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 	mux.Handle(BasePath+"/connections", security.protect("admin", handler))
 	mux.Handle(BasePath+"/connections/", security.protect("admin", handler))
 	mux.Handle("GET "+BasePath+"/assets", security.protect("read", handler))
+	if security.Status != nil {
+		mux.Handle("GET "+BasePath+"/system/status", security.protect("read|write", security.Status.Handler()))
+	}
 	m := newMetrics(security.Assessments, security.Notify)
 	mux.Handle("GET "+BasePath+"/system/metrics", security.protect("read", m.handler()))
 	if checker, ok := store.(hookChecker); ok {
@@ -115,13 +128,34 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/system/github-webhooks", security.protect("read", hooks))
 		mux.Handle("POST "+BasePath+"/system/github-webhooks:check", security.protect("admin", hooks))
 	}
+	if cs, ok := store.(*connections.Store); ok && security.Assessments != nil {
+		var api actionscheck.API = security.ActionsAPI
+		if api == nil {
+			api = connections.NewNativeAdapters()
+		}
+		actions := actionsHandler{checker: actionscheck.Checker{Connections: cs, Store: security.Assessments, API: api}, slots: make(chan struct{}, 4)}
+		mux.Handle("GET "+BasePath+"/assets/{id}/actions", security.protect("read|write", actions))
+		mux.Handle("POST "+BasePath+"/assets/{id}/actions:check", security.protect("write", actions))
+	}
+	if uploads, ok := store.(uploadAssets); ok && security.Assessments != nil {
+		handler := uploadHandler{assets: uploads, store: security.Assessments, artifacts: security.Artifacts}
+		mux.Handle("POST "+BasePath+"/uploads", security.protect("write", handler))
+		mux.Handle("GET "+BasePath+"/assets/{id}/uploads", security.protect("read|write", handler))
+		mux.Handle("DELETE "+BasePath+"/assets/{id}/uploads/{upload}", security.protect("admin", handler))
+	}
 	if admin, ok := store.(assetAdmin); ok {
-		assetsHandler := assetHandler{admin}
+		assetsHandler := assetHandler{store: admin}
+		if security.Assessments != nil {
+			assetsHandler.uploads = security.Assessments
+		}
 		mux.Handle("GET "+BasePath+"/owners", security.protect("read|write", assetsHandler))
 		mux.Handle("POST "+BasePath+"/owners", security.protect("write", assetsHandler))
 		mux.Handle("PATCH "+BasePath+"/owners/{id}", security.protect("write", assetsHandler))
 		mux.Handle("GET "+BasePath+"/assets/{id}", security.protect("read|write", assetsHandler))
 		mux.Handle("PATCH "+BasePath+"/assets/{id}", security.protect("write", assetsHandler))
+		mux.Handle("DELETE "+BasePath+"/assets/{id}", security.protect("admin", assetsHandler))
+		mux.Handle("POST "+BasePath+"/assets", security.protect("write", assetsHandler))
+		mux.Handle("POST "+BasePath+"/assets:import", security.protect("write", assetsHandler))
 	}
 	mux.Handle(BasePath+"/tokens", security.protect("admin", http.HandlerFunc(security.tokens)))
 	mux.Handle(BasePath+"/tokens/", security.protect("admin", http.HandlerFunc(security.tokens)))
@@ -173,6 +207,8 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("POST "+BasePath+"/integrations/dependency-track:test", dtrackAPI)
 		mux.Handle("GET "+BasePath+"/integrations/dependency-track/uploads", dtrackAPI)
 		mux.Handle("POST "+BasePath+"/integrations/dependency-track/uploads/{id}/retry", dtrackAPI)
+		mux.Handle("GET "+BasePath+"/integrations/dependency-track/findings", dtrackAPI)
+		mux.Handle("POST "+BasePath+"/integrations/dependency-track:sync", dtrackAPI)
 		sources := security.protect("read|write", sourceHandler{store: security.Assessments, validate: validate, compiles: compiles, secrets: secrets, taxiiHosts: security.TAXIIPrivateHosts})
 		mux.Handle(BasePath+"/intel/indicator-sources", sources)
 		mux.Handle(BasePath+"/intel/indicator-sources/", sources)
@@ -180,6 +216,9 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		for _, path := range []string{"/intel/vulnerability-sources", "/intel/vulnerability-sources/", "/intel/vulnerabilities/", "/intel/vex-documents", "/intel/vex-documents/", "/intel/vex-statements"} {
 			mux.Handle(BasePath+path, vulns)
 		}
+		advisories := security.protect("read|write", advisoryHandler{security.Assessments})
+		mux.Handle(BasePath+"/advisories", advisories)
+		mux.Handle(BasePath+"/advisories/", advisories)
 		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}", security.protect("ingest:relay", registryIngest{store: security.Assessments, relayEnabled: security.RelayEnabled}))
 		// A registry connection's own receiver, authenticated by its webhook secret.
 		mux.Handle("POST "+BasePath+"/ingest/registry/{provider}/{connection}", registryIngest{store: security.Assessments, hooks: hooks})
@@ -266,10 +305,29 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("POST "+BasePath+"/assessments:batch", security.protect("write|trigger", h))
 		mux.Handle("POST "+BasePath+"/assessments:import", security.protect("write|trigger", h))
 		mux.Handle("GET "+BasePath+"/assets/{id}/last-known-good", security.protect("read|write", h))
+		mux.Handle("GET "+BasePath+"/assets/{id}/revisions", security.protect("read|write", h))
+		mux.Handle("GET "+BasePath+"/assets/{id}/sbom-diff", security.protect("read|write", h))
 		mux.Handle("GET "+BasePath+"/assessments", security.protect("read|write|trigger", h))
 		mux.Handle(BasePath+"/assessments/", security.protect("read|write|trigger", h))
 		mux.Handle("GET "+BasePath+"/remediation/capabilities", security.protect("read|write", h))
 		mux.Handle("POST "+BasePath+"/assets/{id}/remediations", security.protect("write", h))
+		dependencies := dependencyPolicyHandler{store: security.Assessments}
+		mux.Handle("GET "+BasePath+"/policies/dependencies", security.protect("read|write", dependencies))
+		mux.Handle("PUT "+BasePath+"/policies/dependencies", security.protect("admin", dependencies))
+		integrity := integrityPolicyHandler{store: security.Assessments}
+		mux.Handle("GET "+BasePath+"/policies/integrity", security.protect("read|write", integrity))
+		mux.Handle("PUT "+BasePath+"/policies/integrity", security.protect("admin", integrity))
+		incidents := incidentHandler{store: security.Assessments}
+		mux.Handle("POST "+BasePath+"/incidents", security.protect("admin", incidents))
+		mux.Handle("GET "+BasePath+"/incidents", security.protect("read|write", incidents))
+		mux.Handle("GET "+BasePath+"/incidents/{id}", security.protect("read|write", incidents))
+		links := assetLinkHandler{store: security.Assessments}
+		mux.Handle("GET "+BasePath+"/assets/{id}/links", security.protect("read|write", links))
+		mux.Handle("POST "+BasePath+"/assets/{id}/links", security.protect("write", links))
+		mux.Handle("DELETE "+BasePath+"/assets/{id}/links/{to}", security.protect("write", links))
+		jobs := jobHandler{store: security.Assessments}
+		mux.Handle("GET "+BasePath+"/jobs", security.protect("read|write", jobs))
+		mux.Handle(BasePath+"/jobs/", security.protect("read|write", jobs)) // cancel is checked as admin in the handler
 		mirrors := mirrorHandler{store: security.Assessments, bundles: security.Mirrors}
 		mux.Handle("POST "+BasePath+"/assets/{id}/mirrors", security.protect("write", mirrors))
 		mux.Handle("GET "+BasePath+"/assets/{id}/mirrors", security.protect("read|write", mirrors))
@@ -277,7 +335,7 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle(BasePath+"/register", security.protect("read|write", h))
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
 		// E2E QA (Karate) and the LLM providers that draft tests.
-		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner}
+		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner, llmHosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/profile", security.protect("read|write", qaH))
 		mux.Handle("PUT "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
 		mux.Handle("DELETE "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
@@ -286,10 +344,22 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/coverage", security.protect("read|write", qaH))
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/generations", security.protect("read|write", qaH))
 		mux.Handle("POST "+BasePath+"/assets/{id}/qa/generations", security.protect("write", qaH))
+		aiReviews := aiReviewHandler{store: security.Assessments, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
+		mux.Handle("POST "+BasePath+"/assets/{id}/ai-reviews", security.protect("write|trigger", aiReviews))
+		mux.Handle("GET "+BasePath+"/assets/{id}/ai-reviews", security.protect("read|write", aiReviews))
+		mux.Handle("GET "+BasePath+"/ai-reviews/{id}", security.protect("read|write", aiReviews))
+		aiSummaries := aiSummaryHandler{store: security.Assessments}
+		mux.Handle("POST "+BasePath+"/assessments/{id}/summaries", security.protect("write|trigger", aiSummaries))
+		mux.Handle("GET "+BasePath+"/assessments/{id}/summaries", security.protect("read|write", aiSummaries))
+		mux.Handle("GET "+BasePath+"/summary-jobs/{id}", security.protect("read|write", aiSummaries))
+		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle", security.protect("read|write", aiSummaries))
+		knowledgeAPI := &knowledgeHandler{store: security.Assessments, embedder: security.Embedder}
+		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle/search", security.protect("read|write", http.HandlerFunc(knowledgeAPI.search)))
+		mux.Handle("POST "+BasePath+"/knowledge:backfill", security.protect("admin", http.HandlerFunc(knowledgeAPI.backfill)))
 		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write", qaH))
 		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger", qaH))
 		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger", qaH))
-		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts})
+		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource})
 		mux.Handle(BasePath+"/llm/", models)
 	}
 	return security.observe(m, security.cors(mux))

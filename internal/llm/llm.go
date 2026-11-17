@@ -14,11 +14,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/llm/guard"
 	"github.com/ORIBData/scrstack/internal/netguard"
 )
 
@@ -121,6 +123,17 @@ type Request struct {
 	Prompt string
 	// MaxTokens overrides the provider's limit when lower and positive.
 	MaxTokens int
+	// Schema asks for output that matches a JSON Schema (response_format
+	// json_schema, strict) from OpenAI and Azure OpenAI. Other providers
+	// ignore it, so callers still validate what comes back.
+	Schema     json.RawMessage
+	SchemaName string
+}
+
+// Redactions counts what the guard replaced, by kind. Values are never kept.
+type Redactions struct {
+	Input  map[string]int `json:"input,omitempty"`
+	Output map[string]int `json:"output,omitempty"`
 }
 
 // Response is the model's text and token usage.
@@ -131,6 +144,8 @@ type Response struct {
 	OutputTokens int    `json:"output_tokens"`
 	// Truncated reports that the output stopped at the token limit.
 	Truncated bool `json:"truncated"`
+	// Redactions is what the guard removed from the prompt and the answer.
+	Redactions Redactions `json:"redactions"`
 }
 
 // Client calls one provider.
@@ -141,6 +156,8 @@ type Client struct {
 	http     *http.Client
 	// retryWait is the pause before a retry when the server names none.
 	retryWait time.Duration
+	// guard screens every prompt and answer; it cannot be switched off.
+	guard *guard.Guard
 }
 
 // NewClient builds a client whose connections pass netguard; hosts in
@@ -149,17 +166,32 @@ func NewClient(p Provider, s Secret, private map[string]bool) (*Client, error) {
 	if err := Validate(p, s, private); err != nil {
 		return nil, err
 	}
+	timeout := RequestTimeout()
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           netguard.DialContext(private),
 		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Minute,
+		ResponseHeaderTimeout: timeout - 30*time.Second,
 		MaxIdleConns:          2,
 		IdleConnTimeout:       30 * time.Second,
 	}
 	// Redirects could carry the key elsewhere; they are refused.
-	client := &http.Client{Transport: transport, Timeout: 6 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return &Client{provider: p.Resolve(), preset: Presets[p.Kind], secret: s, http: client, retryWait: 2 * time.Second}, nil
+	client := &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	// The guard knows this process's own secrets (master key, database and
+	// API tokens from the environment) and the provider key being used.
+	g := guard.New(append(guard.KnownFromEnv(os.Environ()), s.APIKey)...)
+	return &Client{provider: p.Resolve(), preset: Presets[p.Kind], secret: s, http: client, retryWait: 2 * time.Second, guard: g}, nil
+}
+
+// RequestTimeout is how long one model call may take, from SCRS_LLM_TIMEOUT_SECONDS
+// (default 360, allowed 60 to 3600). A hosted provider answers in seconds; a
+// model on CPU can need many minutes for a long file, so raise it for those.
+func RequestTimeout() time.Duration {
+	n, err := strconv.Atoi(os.Getenv("SCRS_LLM_TIMEOUT_SECONDS"))
+	if err != nil || n < 60 || n > 3600 {
+		n = 360
+	}
+	return time.Duration(n) * time.Second
 }
 
 // MaxResponseBytes bounds a provider response body.
@@ -168,6 +200,29 @@ const MaxResponseBytes = 8 << 20
 // Complete sends one request. Rate limits and server errors are retried
 // twice; other failures return at once with the provider's reason.
 func (c *Client) Complete(ctx context.Context, r Request) (Response, error) {
+	var in map[string]int
+	r.System, in = c.guard.Screen(r.System)
+	var prompt map[string]int
+	r.Prompt, prompt = c.guard.Screen(r.Prompt)
+	in = guard.Merge(in, prompt)
+	resp, err := c.complete(ctx, r)
+	if err != nil {
+		return resp, err
+	}
+	var out map[string]int
+	resp.Text, out = c.guard.ScreenOutput(resp.Text)
+	resp.Redactions = Redactions{Input: nilIfEmpty(in), Output: nilIfEmpty(out)}
+	return resp, nil
+}
+
+func nilIfEmpty(m map[string]int) map[string]int {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+func (c *Client) complete(ctx context.Context, r Request) (Response, error) {
 	limit := c.provider.MaxTokens
 	if r.MaxTokens > 0 && r.MaxTokens < limit {
 		limit = r.MaxTokens
@@ -230,6 +285,13 @@ func (c *Client) encode(r Request, limit int) (string, []byte) {
 		body := map[string]any{"model": c.provider.Model, "messages": messages, c.preset.TokenField: limit}
 		if c.provider.Temperature != nil {
 			body["temperature"] = *c.provider.Temperature
+		}
+		if len(r.Schema) > 0 && (c.provider.Kind == "openai" || c.provider.Kind == "azure_openai") {
+			name := r.SchemaName
+			if name == "" {
+				name = "result"
+			}
+			body["response_format"] = map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": name, "strict": true, "schema": r.Schema}}
 		}
 		payload = body
 	}

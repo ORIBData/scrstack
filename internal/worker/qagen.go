@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/ORIBData/scrstack/internal/assessments"
+	"github.com/ORIBData/scrstack/internal/knowledge"
 	"github.com/ORIBData/scrstack/internal/llm"
+	"github.com/ORIBData/scrstack/internal/llm/guard"
 	"github.com/ORIBData/scrstack/internal/qa"
 )
 
@@ -72,7 +74,22 @@ func (w Worker) generate(ctx context.Context, g assessments.QAGeneration) (bool,
 	if err := w.unseal(sealed, assessments.LLMAAD(provider.ID), &secret); err != nil {
 		return false, err
 	}
-	client, err := llm.NewClient(llm.Provider{Kind: provider.Kind, BaseURL: provider.BaseURL, Model: provider.Model, MaxTokens: provider.MaxTokens, Temperature: provider.Temperature}, secret, w.LLMPrivateHosts)
+	settings := llm.Provider{Kind: provider.Kind, BaseURL: provider.BaseURL, Model: provider.Model, MaxTokens: provider.MaxTokens, Temperature: provider.Temperature}
+	if g.Kind == "unit" {
+		if _, ok := w.sourcePolicy().Check(settings, provider.SourceAckAt != nil); !ok {
+			return false, assessments.ErrQASource
+		}
+	}
+	// A hosted provider is billed per token: stop when its monthly cap is
+	// used up. The cap is checked once per generation, and what the
+	// generation uses is added to the ledger so the next one sees it.
+	if err := w.Store.Knowledge().ReserveMonth(ctx, w.budgetFor(provider, settings), 0, int64(provider.MaxTokens)); err != nil {
+		if errors.Is(err, knowledge.ErrBudget) {
+			return false, errors.New(budgetMessage(err))
+		}
+		return true, err
+	}
+	client, err := llm.NewClient(settings, secret, w.LLMPrivateHosts)
 	if err != nil {
 		return false, errors.New("LLM provider settings invalid: " + err.Error())
 	}
@@ -146,6 +163,7 @@ func (w Worker) generateAPI(ctx context.Context, g assessments.QAGeneration, pro
 		if len(files) == 0 {
 			suites = append(suites, assessments.QASuite{Path: "unparsed-output.txt", Source: source, Content: clipText(resp.Text, qa.MaxGeneratedBytes), Problems: []string{qa.ErrNoFiles.Error()}})
 		}
+		w.recordQAUsage(ctx, g, "qa_api", resp)
 		if err := w.Store.AddQASuites(ctx, g, suites, resp.InputTokens, resp.OutputTokens); err != nil {
 			return true, err
 		}
@@ -278,6 +296,7 @@ func (w Worker) generateUnit(ctx context.Context, g assessments.QAGeneration, cl
 		if resp.Truncated {
 			suite.Problems = append(suite.Problems, "model output stopped at max_tokens; this file may be incomplete")
 		}
+		w.recordQAUsage(ctx, g, "qa_unit", resp)
 		if err := w.Store.AddQASuites(ctx, g, []assessments.QASuite{suite}, resp.InputTokens, resp.OutputTokens); err != nil {
 			return true, err
 		}
@@ -290,4 +309,10 @@ func clipText(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// recordQAUsage adds a generation's model call to the usage ledger, which the
+// monthly provider cap reads.
+func (w Worker) recordQAUsage(ctx context.Context, g assessments.QAGeneration, purpose string, resp llm.Response) {
+	_ = w.Store.Knowledge().RecordUsage(context.WithoutCancel(ctx), knowledge.Usage{Purpose: purpose, AssetID: &g.AssetID, Provider: g.ProviderName, Model: g.Model, InputTokens: int64(resp.InputTokens), OutputTokens: int64(resp.OutputTokens), Truncated: resp.Truncated, Redactions: guard.Merge(resp.Redactions.Input, resp.Redactions.Output), Status: "ok"})
 }

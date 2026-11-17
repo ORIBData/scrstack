@@ -17,7 +17,9 @@ import (
 
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
+	"github.com/ORIBData/scrstack/internal/embed"
 	"github.com/ORIBData/scrstack/internal/httpapi"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/storage"
@@ -119,6 +121,7 @@ func main() {
 		os.Exit(1)
 	}
 	assessmentStore.UseObjects(artifacts)
+	bootstrapLLMProviders(context.Background(), assessmentStore, store, netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	events, err := notify.Open(context.Background(), cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "notification store unavailable")
@@ -170,7 +173,7 @@ func main() {
 			trustedProxies = append(trustedProxies, prefix)
 		}
 	}
-	readinessCheck, closeReadiness, err := storage.NewReadiness(context.Background(), cfg)
+	readinessCheck, dependencyProbe, closeReadiness, err := storage.NewReadiness(context.Background(), cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "readiness initialization failed")
 		os.Exit(1)
@@ -195,9 +198,25 @@ func main() {
 	if n, err := strconv.Atoi(os.Getenv("SCRS_EVENTS_STREAMS_PER_TOKEN")); err == nil && n > 0 && n <= 100 {
 		live.PerToken = n
 	}
+	// Chronicle search and vector backfill need the self-hosted embedding
+	// server; without one those two endpoints answer 503.
+	var embedder httpapi.Embedder
+	if cfg, on, err := embed.ConfigFromEnv(); on {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "embedding is configured incorrectly: "+err.Error())
+			os.Exit(2)
+		}
+		client, err := embed.New(cfg, netguard.Hosts(os.Getenv("SCRS_EMBED_PRIVATE_HOSTS")))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "embedding is configured incorrectly: "+err.Error())
+			os.Exit(2)
+		}
+		embedder = client
+	}
+	platformStatus := httpapi.NewPlatformStatus(dependencyProbe, assessmentStore, sastClient, qaRunner).WithDependencyTrack(netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS")))
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
+		Handler:           httpapi.HandlerWithSecurity(readinessCheck, store, httpapi.Security{Embedder: embedder, GitHubWebhookSecret: os.Getenv("SCRS_GITHUB_WEBHOOK_SECRET"), RemediationEnabled: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", RelayEnabled: os.Getenv("SCRS_RELAY_ENABLED") == "true", Notify: events, Logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)), Assessments: assessmentStore, Artifacts: artifacts, Mirrors: artifacts, Store: store, Redis: rateClient, TAXIIPrivateHosts: netguard.Hosts(os.Getenv("SCRS_TAXII_PRIVATE_HOSTS")), QAReports: artifacts, QARunner: qaRunner, LLMPrivateHosts: netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS")), LLMAllowSource: llm.AllowSourceToHosted(), DocsPublic: docsPublic, DocsDisabled: !docsEnabled, Origins: origins, TrustedProxies: trustedProxies, SAST: sastClient, SASTDefaults: sastDefaults, Live: live, Status: platformStatus, DTrackPrivateHosts: netguard.Hosts(os.Getenv("SCRS_DTRACK_PRIVATE_HOSTS"))}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      190 * time.Second,
@@ -209,6 +228,9 @@ func main() {
 	// Streams never finish on their own: end them when shutdown starts.
 	server.RegisterOnShutdown(live.Close)
 	go events.Listen(ctx, live)
+	// system.degraded and system.recovered: checked every 30 s, announced
+	// after three agreeing checks, the first after a two-minute grace.
+	go platformStatus.Monitor(ctx, events, 30*time.Second, 2*time.Minute, 3, logger)
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

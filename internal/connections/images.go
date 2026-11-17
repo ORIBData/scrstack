@@ -80,26 +80,48 @@ func (a NativeAdapters) registryAuth(ctx context.Context, c Connection, secret j
 // a hint: the assessment belongs to the digest (TRG-003). Images whose
 // compressed layers exceed limit are rejected before any layer is fetched.
 func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret json.RawMessage, locator, tag, digest, platform string, limit int64, w io.Writer) (string, error) {
+	info, err := a.ImageArchiveInfo(ctx, c, secret, locator, tag, digest, platform, limit, w)
+	return info.Digest, err
+}
+
+// ImageInfo is what resolving an image taught besides its bytes.
+type ImageInfo struct {
+	// Digest is the manifest digest of the platform image scanned.
+	Digest string
+	// SourceLabel is the image's `org.opencontainers.image.source` label, the
+	// publisher's claim of where the image was built from; empty when absent.
+	// It is a claim, not proof.
+	SourceLabel string
+}
+
+// ImageArchiveInfo is ImageArchive that also returns the image's source
+// label (CON-012).
+func (a NativeAdapters) ImageArchiveInfo(ctx context.Context, c Connection, secret json.RawMessage, locator, tag, digest, platform string, limit int64, w io.Writer) (ImageInfo, error) {
+	d, label, err := a.imageArchive(ctx, c, secret, locator, tag, digest, platform, limit, w)
+	return ImageInfo{Digest: d, SourceLabel: label}, err
+}
+
+func (a NativeAdapters) imageArchive(ctx context.Context, c Connection, secret json.RawMessage, locator, tag, digest, platform string, limit int64, w io.Writer) (string, string, error) {
 	if !c.Enabled || !c.Scope.matchesResource(Resource{Type: "container_image", Locator: locator}) {
-		return "", errors.New("image is outside connection scope")
+		return "", "", errors.New("image is outside connection scope")
 	}
 	host, _, _ := strings.Cut(locator, "/")
 	switch {
 	case a.RegistryHost != "":
 		if host != a.RegistryHost {
-			return "", errors.New("image registry does not match connection")
+			return "", "", errors.New("image registry does not match connection")
 		}
 	case c.Provider == "dockerhub" && host != "docker.io",
 		c.Provider == "gar" && !strings.HasSuffix(host, "-docker.pkg.dev"),
 		c.Provider == "harbor" && host != a.harborHost(c, secret),
 		c.Provider == "oci" && host != a.ociHost(c, secret),
 		!knownImageProvider(c.Provider):
-		return "", errors.New("image registry does not match connection")
+		return "", "", errors.New("image registry does not match connection")
 	}
 	reference := locator + ":" + tag
 	if digest != "" {
 		if !imageDigest.MatchString(digest) {
-			return "", errors.New("invalid image digest")
+			return "", "", errors.New("invalid image digest")
 		}
 		reference = locator + "@" + digest
 	}
@@ -109,18 +131,18 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 	}
 	ref, err := name.ParseReference(reference, options...)
 	if err != nil {
-		return "", errors.New("invalid image reference")
+		return "", "", errors.New("invalid image reference")
 	}
 	auth, err := a.registryAuth(ctx, c, secret)
 	if err != nil && a.RegistryHost == "" {
-		return "", err
+		return "", "", err
 	}
 	if auth == nil {
 		auth = authn.Anonymous
 	}
 	plat, err := v1.ParsePlatform(platform)
 	if err != nil {
-		return "", errors.New("invalid platform")
+		return "", "", errors.New("invalid platform")
 	}
 	remoteOptions := []remote.Option{remote.WithContext(ctx), remote.WithAuth(auth), remote.WithPlatform(*plat)}
 	if a.Client != nil && a.Client.Transport != nil {
@@ -128,39 +150,46 @@ func (a NativeAdapters) ImageArchive(ctx context.Context, c Connection, secret j
 	}
 	image, err := remote.Image(ref, remoteOptions...)
 	if err != nil {
-		return "", errors.New("image resolution failed; check reference, platform and registry credential")
+		return "", "", errors.New("image resolution failed; check reference, platform and registry credential")
 	}
 	resolved, err := image.Digest()
 	if err != nil {
-		return "", errors.New("image digest unavailable")
+		return "", "", errors.New("image digest unavailable")
 	}
 	// A digest naming a multi-platform index resolves to the selected
 	// platform's image; the assessment records the digest actually scanned.
 	layers, err := image.Layers()
 	if err != nil {
-		return "", errors.New("image layers unavailable")
+		return "", "", errors.New("image layers unavailable")
 	}
 	var total int64
 	for _, layer := range layers {
 		size, err := layer.Size()
 		if err != nil {
-			return "", errors.New("image layer size unavailable")
+			return "", "", errors.New("image layer size unavailable")
 		}
 		total += size
 	}
 	if total > limit {
-		return "", fmt.Errorf("%w: image exceeds SCRS_MAX_IMAGE_BYTES", ErrTooLarge)
+		return "", "", fmt.Errorf("%w: image exceeds SCRS_MAX_IMAGE_BYTES", ErrTooLarge)
 	}
 	tagged, err := name.NewTag(locator+":scrs", options...)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// The archive carries the layer blobs as stored plus small manifests; the
 	// scanner applies the same SCRS_MAX_IMAGE_BYTES cap to what it receives.
 	if err := tarball.Write(tagged, image, &limitedWriter{w: w, limit: limit + 1<<20}); err != nil {
-		return "", errors.New("image archive stream failed")
+		return "", "", errors.New("image archive stream failed")
 	}
-	return resolved.String(), nil
+	label := ""
+	if cfg, err := image.ConfigFile(); err == nil && cfg != nil {
+		label = cfg.Config.Labels["org.opencontainers.image.source"]
+		if len(label) > 500 {
+			label = ""
+		}
+	}
+	return resolved.String(), label, nil
 }
 
 func knownImageProvider(p string) bool {

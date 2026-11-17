@@ -87,26 +87,59 @@ are not yet delivered. Provider network calls are bounded but synchronous; a dur
 assessment queue now exists in PostgreSQL; complete provider capability/backoff/event contracts remain absent. Provider payload and
 response/error OpenAPI schemas also need fuller typing and contract acceptance.
 
-## Product requirements still blocking full sign-off
+## Product milestone status (reconciled 2026-11-16)
 
-| PRD milestone | Current status |
+Earlier versions of this table lagged the code. It now follows the delivery records in
+[PRODUCTION_READINESS_AUDIT.md](PRODUCTION_READINESS_AUDIT.md) and the contract.
+
+| PRD milestone | Status |
 | --- | --- |
-| M0 Foundations/spikes | Partial; required spike/ADR acceptance is incomplete. |
-| M1 Platform core | Authentication/lifecycle substantially extended; owners, observability and broader migration/acceptance work remain. |
-| M2 Repository scan MVP | Partial: immutable GitHub archive acquisition, authenticated assessment API, durable jobs, recursive upstream inventory, CycloneDX, offline OSV and finding register delivered. Direct/relay ingestion, full advisory mirror, integrity and provider acceptance remain. |
-| M3 Malware/malicious dependencies | Legacy ClamAV verified separately; YARA/ClamAV orchestration, IOC and full malicious-response gates remain. OSV MAL records are matched through configured offline feeds. |
-| M4 Threat feeds | Not implemented. |
-| M5 Retention/maintenance/outbound | Not implemented. Developer image cleanup is not product retention. |
-| M6 Images/registries | Docker Hub/GAR discovery only; digest pull/assessment/layer attribution and remaining adapters absent. |
-| M7 Remediation/hardening | Opt-in npm in-place advice adapter, job persistence, artifact retrieval and isolated egress implemented; actual fix/provider acceptance, Maven, VEX and resilience gates remain. |
-| M8 Licences/compliance | Implemented 2026-11-14: see [LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md). STIG and PDF reports were added in P2. |
-| M9 SAST/reachability | Implemented 2026-11-15: see [SAST.md](SAST.md). Reachability beyond Go remains P2. |
-| P2 | Implemented 2026-11-15: Dependency-Track export (ADR-033), live events OUT-004 (ADR-030), ASD STIG import CMP-004 (ADR-031, answers Q23), PDF reports (ADR-032), outbound licence compatibility LIC-005. CPE matching VUL-007 deferred to spike S14. |
+| M0 Foundations/spikes | Delivered: ADR-001 to ADR-033 ([ADR.md](ADR.md)) and spikes S1 to S13 ([SPIKES.md](SPIKES.md)). Measurements left: OSV and ClamAV throughput, mobile sample repositories, NVD volumes. |
+| M1 Platform core | Delivered: auth and bootstrap token, scoped tokens, owners, audit log, health, readiness, `/system/status`, metrics, request ids. |
+| M2 Repository scan MVP | Delivered for GitHub and GitLab: archive acquisition, durable jobs, recursive inventory, CycloneDX SBOM and MBOM, offline OSV, register, direct and relay ingest, integrity events. Needs acceptance with real accounts. |
+| M3 Malware/malicious dependencies | Delivered: ClamAV, starter YARA, IOC matching, OSV `MAL-` records. YARA is limited to ClamAV's subset (no modules). |
+| M4 Threat feeds | Delivered: indicator sources, STIX, CSV and TAXII, vulnerability-source registry, NVD and CVE Program, KEV and EPSS, vendor VEX. Needs live NVD and TAXII acceptance. |
+| M5 Retention/maintenance/outbound | Delivered: retention classes, maintenance, signed webhooks and schemas, mirrors, last known good, agent payloads. |
+| M6 Images/registries | Delivered: Docker Hub, GAR, Harbor and OCI adapters, layer-level scanning, registry push events, Trivy parity run ([TRIVY_PARITY.md](TRIVY_PARITY.md)). |
+| M7 Remediation/hardening | Delivered as advice-only plans for npm (`package-lock.json`) and Maven (`pom.xml`) with isolated egress; no repository writes. Provider acceptance remains. |
+| M8 Licences/compliance | Delivered 2026-11-14 ([LICENSES_AND_COMPLIANCE.md](LICENSES_AND_COMPLIANCE.md)); STIG and PDF reports added in P2. |
+| M9 SAST/reachability | Delivered 2026-11-15 ([SAST.md](SAST.md)). Import-level reachability for npm and PyPI delivered 2026-11-17; call graphs beyond Go remain P2. |
+| E2E QA (Karate) and LLM test generation | Delivered ([QA_TESTING.md](QA_TESTING.md)). Scope decision 2026-11-16: the runner is a QA, performance and load service with an operator route for standalone jobs, separate from supply-chain risk. A lint job kind is not implemented. |
+| P2 | Delivered 2026-11-15: Dependency-Track export (ADR-033), live events (ADR-030), ASD STIG import (ADR-031), PDF reports (ADR-032), outbound licence compatibility. CPE matching (VUL-007) deferred to spike S14. |
+| AI advisories, summaries and chronicle | Delivered 2026-11-16: allowlisted findings-and-advisory-text prompts, summary and per-finding advisories with provenance and supersession, self-hosted embeddings, compose services for `scrs-embed` and the model host ([MODEL_HOST.md](MODEL_HOST.md)). Delivered later the same day: summaries in JSON, Markdown and PDF reports (`params.include_ai_summaries`), `GET /assets/{id}/chronicle/search` and `POST /knowledge:backfill`. Linters are not built. |
+| AI code review | Delivered 2026-11-16 on a self-hosted model: guarded model calls, `ai_review` entries, per-assessment token budget and ledger ([LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md)). Real linters in the QA runner are not built. |
+| Dependency-Track link | Delivered 2026-11-16: processing checks, permission-aware `:test`, `dependency_track` status and `dependency_track.upload_failed`, findings read-back as one entry per vulnerability, shared triage, provider-qualified project names ([DEPENDENCY_TRACK_AUDIT.md](DEPENDENCY_TRACK_AUDIT.md)). |
+| Platform status | Delivered 2026-11-16: `GET /system/status`, `system.degraded` and `system.recovered` events, a deeper QA runner `/healthz`, scopes on every operation checked against the router, and [STACK.md](STACK.md) with the generated [API_REFERENCE.md](API_REFERENCE.md). |
 
-These are engineering deliverables, not items that can be closed through deployment
-configuration or documentation. The repository is not a complete supply-chain scanner.
+## Open PRD requirements (audited 2026-11-16)
+
+Rows say what is delivered and what is not. Earlier rows described gaps; the audit searched the
+contract, routes and source for each; it does not prove absence of every partial behaviour.
+None blocks the delivered modules above, and the PRD marks most as P1 or P2.
+
+| Area | Requirement | Gap |
+| --- | --- | --- |
+| Assets | AST-001, ING-006 | Delivered (phase 1): `POST /assets`, `POST /assets:import` (up to 500, per-item results), `DELETE /assets/{id}` (manual assets with no history only) and `GET /assets/{id}/revisions`. Manual assets live under an existing connection and are never marked inaccessible by discovery. Delivered (phase 1b): the `uploaded` asset type and `POST /uploads` (multipart `.tar.gz`, 64 MiB at most). An upload belongs to a built-in `scrs-uploads` connection (provider `upload`, hidden from `GET /connections` and not editable); the archive is kept under `uploads/` in object storage, its SHA-256 prefix is the revision, and the worker scans it like a repository snapshot. Uploads are deleted with `DELETE /assets/{id}/uploads/{upload}` (admin), an uploaded asset with `DELETE /assets/{id}` while it has no history, and the `uploaded_archives` retention class removes archives a newer upload with the same label replaced. Not built: QA runs and remediation for uploads. |
+| Register | RR-008, RR-010, RR-012, RR-014 | Delivered (RR-008): `PUT /register/{id}/assignee` (free-text identifier, no user model), `GET` and `POST /register/{id}/comments`, `DELETE /register/{id}/comments/{comment}` (admin), `assignee` and `unassigned` filters on the list and every aggregate, an `assignee` column in the CSV export, and `assigned` and `comment.*` entries in the history. Not built: outbound `finding.assigned` events, comment editing, user accounts or notifications. Delivered earlier: `GET /register` filters (asset, status, severity, type), `/register/summary`, `/register/timeseries`, `/register/top-assets`, `/register/export` (CSV or JSON, 50000 rows at most) and `/register/vex` (one OpenVEX document for the filtered register). Triage and waivers go through `PATCH /register/{id}`. |
+| SBOM | SBM-005 | Component changes are recorded per assessment (`change` on findings and components); delivered (phase 2): `GET /assets/{id}/sbom-diff?from=&to=` compares two revisions (added, removed, version-changed and licence-changed packages). |
+| Advisories | OSV-008 | Delivered: `POST /advisories` (local `x_SCRS-<year>-<n>` OSV records with exact versions, semantic-version `ranges` for npm, Go, crates.io, NuGet, Hex and Pub, or `all_versions`), `GET /advisories` search, `GET /advisories/{id}`, `POST /advisories/{id}:withdraw` and `GET /advisories/{id}/affected`. A local advisory opens register entries from the stored inventories at creation and at every later assessment (`malicious: true` raises `malicious_dependency` entries that fail the gate), and withdrawing it closes them. Limits: ranges for PyPI, Maven, Debian, RubyGems and other ecosystems are refused (list their versions); matching is by ecosystem, name and version, with no CPE. |
+| Malicious dependencies | MAL-004, MAL-005, MAL-006 | Delivered: `introduced_by` on entries about a dependency that is new since the previous scan of the ref (the trigger's claimed actor, the commit and the assessment; kept for the entry's life and in `malicious_dependency.reported`), and `GET`/`PUT /policies/dependencies` with `min_release_age_days` (publish dates from deps.dev, cached) and `typosquat` (a curated npm and PyPI list, one edit or separator away). Both are off by default, produce `suspicious_dependency` entries of severity medium that never change a verdict, and report a partial `dependency_policy` stage when they could not cover every package. Limits: the popular-package list is a seed of about 260 names, not a ranking; `introduced_by` names the claimed pusher, not a verified commit author (a git archive carries no author); neither check looks at image layers beyond the ecosystems deps.dev covers. |
+| Integrity | INT-003, INT-012, INT-014, INT-015, INT-018 | Delivered: `GET`/`PUT /policies/integrity` (all off by default) with new-author, off-hours and pusher-differs signals from push webhooks, and large-new-file and CI-file-growth entries from scans; `GET /assets/{id}/actions` and `POST /assets/{id}/actions:check` (Actions inventory, `actions_unused`, workflow-list changes and run-number gaps; scheduled with `SCRS_ACTIONS_SWEEP_INTERVAL_HOURS`); `POST /incidents`, `GET /incidents` and `GET /incidents/{id}`. Not built: signed-to-unsigned commit detection (INT-003, a push payload carries no signature data), a binary-versus-text test for the large-file check (the inventory has sizes only), and the optional GitHub sweep of events older than retention (INT-013). Author identity and actors are claims from the event. Force-push, branch-churn, mass-deletion, visibility and membership rules existed already. |
+| Connections | CON-012 | Delivered: `GET`/`POST /assets/{id}/links` and `DELETE /assets/{id}/links/{to}` (kind `built_from`; image to GitHub, GitLab or uploaded source), plus automatic links from the image's `org.opencontainers.image.source` label at each image assessment, and `source_repository` on an image's register entries. A label link is dropped when the label stops naming the repository; a manual link never is. Limits: only `built_from` (no `deployed_from`); the label is the publisher's claim; a label links only when it names exactly one known repository, and a self-hosted GitLab is recognised only by a host name starting with `gitlab`. |
+| Remediation | REM-002 | Delivered: guided remediation runs in a separate sandbox container (`scrs-remediator`, the scanner image in the `remediation` role) with its own token, no SCRS secrets, a private network shared only with the worker and the egress proxy, a disposable `noexec` tmpfs, CPU, memory, process and time limits, and no package-manager scripts. Still advice only. Not verified on a real host: the limits are Compose settings, and `osv-scanner fix` runs as the container user (it can read that container's own environment, which holds only the sandbox token). |
+| Operations | | Delivered: `GET /jobs`, `GET /jobs/{id}` and `POST /jobs/{id}:cancel`, one normalised view over assessments, QA runs and generation, AI summaries and reviews, reports, mirrors and Dependency-Track uploads (each keeps its own table and endpoints). Only assessments and QA runs can be cancelled. Not built: long operations answering `202` with a `job_id` of their own, progress percentages, and scheduled maintenance jobs in the list (they stay in `GET /maintenance/schedule`). |
+| Vulnerability matching | VUL-007 | Not built (spike S14). CPE matching is for software with no package URL (binaries in images), and the pipeline has no such components: the scanner reads package managers' databases and lockfiles, which all carry purls, and nothing detects loose binaries. CPE matching needs that detection first, or a CycloneDX import that carries `cpe` for components, plus a CPE dictionary and NVD applicability matching. |
+| Reachability | REA-005, REA-012 | Delivered (REA-005): import-level reachability for npm and PyPI (`imported_only`, method `import_graph`, up to five places), `unknown` otherwise and never `not_reachable`; `GET /reachability/capabilities` lists it. Not built: call-graph analysis beyond Go (REA-012 spike S12 for Java/Kotlin, Python and C#) and taint traces across a library boundary (REA-010). A dynamic or computed import is missed, and a PyPI distribution whose module name differs is matched only by a short table. |
+
+## Before declaring the PRD complete
+
+1. Decide for each open row whether it is in version 1 or is formally descoped in an ADR; the PRD still lists
+   them. Nothing here changes the stack's connections or scopes.
+2. Complete the external acceptance list below.
 
 ## External release acceptance still required
+
+The ordered procedure, with `make deployment-acceptance`, `make pipeline-acceptance` and an evidence table, is in [STAGING_ACCEPTANCE.md](STAGING_ACCEPTANCE.md).
 
 1. Configure a real domain/DNS and Dokploy's existing ACME resolver; deploy the exact
    published image digest; verify public TLS/redirects, `/scrs/v1/docs`, readiness,

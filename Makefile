@@ -12,7 +12,12 @@ SCRS_IMAGE ?=
 SCRS_SAST_IMAGE ?=
 SCRS_QA_RUNNER_IMAGE ?=
 IMAGE_NAME ?= scrs
-PLATFORMS ?= linux/amd64,linux/arm64
+# Release platforms: the staging VPS is amd64. Add arm64 with
+# PLATFORMS=linux/amd64,linux/arm64 for a multi-architecture image.
+PLATFORMS ?= linux/amd64
+# Docker Build Cloud builder (ORG/BUILDER) for releases; empty reads
+# SCRS_BUILD_CLOUD from .env, and empty there builds locally.
+SCRS_BUILD_CLOUD ?=
 DOCKERHUB_REPO ?=
 SCRS_REPO_TAG_PREFIX ?= scrs_
 
@@ -101,7 +106,7 @@ storage-integration:
 	  $$compose run --rm --no-deps storage-bootstrap
 
 release:
-	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_IMAGE)" PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py bash scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE="$(SCRS_IMAGE)" PLATFORMS="$(PLATFORMS)" SCRS_BUILD_CLOUD="$(SCRS_BUILD_CLOUD)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py bash scripts/release.sh
 
 .PHONY: image-reference sast-image-reference qa-runner-image-reference
 image-reference:
@@ -116,6 +121,9 @@ qa-runner-image-reference:
 .PHONY: image-audit qa
 image-audit:
 	@DOCKER="$(DOCKER)" SCRS_IMAGE="$(SCRS_IMAGE)" VERSION="$(VERSION)" DOCKERHUB_REPO="$(DOCKERHUB_REPO)" python3 scripts/image_reference.py python3 scripts/audit_image.py
+
+api-reference:
+	UPDATE_API_REFERENCE=1 $(GO) test ./api -run TestAPIReferenceIsCurrent -count=1
 
 qa: test lint contract-check
 	$(GO) test -race . -run 'TestLegacySecurity|TestMalformedMultipart'
@@ -135,11 +143,11 @@ qa-runner-image:
 # SCRS_QA_RUNNER_IMAGE (from .env, or on the command line) is a template like
 # registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}.
 release-qa-runner:
-	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_QA_RUNNER_IMAGE SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_QA_RUNNER_IMAGE SCRS_IMAGE="$(SCRS_QA_RUNNER_IMAGE)" SCRS_DOCKERFILE=deploy/karate-runner/Dockerfile PLATFORMS="$(PLATFORMS)" SCRS_BUILD_CLOUD="$(SCRS_BUILD_CLOUD)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
 
 # SCRS_SAST_IMAGE comes from .env, or the command line, like SCRS_IMAGE.
 release-sast:
-	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_SAST_IMAGE SCRS_IMAGE="$(SCRS_SAST_IMAGE)" SCRS_DOCKERFILE=deploy/Dockerfile.sast PLATFORMS="$(PLATFORMS)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
+	@DOCKER="$(DOCKER)" VERSION="$(VERSION)" SCRS_IMAGE_KEY=SCRS_SAST_IMAGE SCRS_IMAGE="$(SCRS_SAST_IMAGE)" SCRS_DOCKERFILE=deploy/Dockerfile.sast PLATFORMS="$(PLATFORMS)" SCRS_BUILD_CLOUD="$(SCRS_BUILD_CLOUD)" DOCKERHUB_REPO= python3 scripts/image_reference.py bash scripts/release.sh
 
 qa-runner-test:
 	@mkdir -p bin
@@ -182,6 +190,10 @@ scanner-test:
 .PHONY: deployment-acceptance
 deployment-acceptance:
 	@python3 scripts/run_with_env.py python3 scripts/deployment_acceptance.py
+
+.PHONY: pipeline-acceptance
+pipeline-acceptance:
+	@python3 scripts/run_with_env.py python3 scripts/pipeline_acceptance.py
 
 .PHONY: malware-test
 malware-test:

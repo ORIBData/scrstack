@@ -21,6 +21,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/sast"
 	"github.com/ORIBData/scrstack/internal/scanner"
+	"github.com/google/uuid"
 )
 
 // errScannerBusy is the scanner's 429: its single slot serves another worker.
@@ -39,20 +40,34 @@ type ImageSource interface {
 	ImageArchive(context.Context, connections.Connection, json.RawMessage, string, string, string, string, int64, io.Writer) (string, error)
 }
 
+// imageInfoSource is an ImageSource that also reports the image's source
+// label; the native registry adapters do.
+type imageInfoSource interface {
+	ImageArchiveInfo(context.Context, connections.Connection, json.RawMessage, string, string, string, string, int64, io.Writer) (connections.ImageInfo, error)
+}
+
 type Snapshotter interface {
 	Snapshot(context.Context, connections.Connection, json.RawMessage, string, string, string) ([]byte, string, bool, error)
 }
 type Worker struct {
-	Source                   Snapshotter
-	Images                   ImageSource
-	MaxImageBytes            int64
-	Store                    *assessments.Store
-	Connections              *connections.Store
-	Artifacts                Artifacts
-	ScannerURL, ScannerToken string
-	Logger                   *slog.Logger
-	AutoRemediation          bool
-	Notify                   *notify.Store
+	Source Snapshotter
+	// RemediationURL and RemediationToken address a separate remediation
+	// sandbox (REM-002); empty, remediation uses the scanner and its token.
+	RemediationURL, RemediationToken string
+	Images                           ImageSource
+	MaxImageBytes                    int64
+	Store                            *assessments.Store
+	Connections                      *connections.Store
+	Artifacts                        Artifacts
+	ScannerURL, ScannerToken         string
+	Logger                           *slog.Logger
+	AutoRemediation                  bool
+	Notify                           *notify.Store
+	// Uploads reads the source archives behind `uploaded` assets; nil makes
+	// assessments of uploaded assets fail instead of fetching anything.
+	Uploads interface {
+		GetUpload(context.Context, string) ([]byte, error)
+	}
 	// Snapshots stores each fetched source archive for restore (INT-006).
 	Snapshots interface {
 		PutSnapshot(context.Context, []byte) (string, error)
@@ -80,6 +95,9 @@ type Worker struct {
 	QAReports   QAReports
 	// LLMPrivateHosts may resolve to internal addresses (SCRS_LLM_PRIVATE_HOSTS).
 	LLMPrivateHosts map[string]bool
+	// LLMAllowSource is the platform switch that lets an acknowledged hosted
+	// provider receive source code (SCRS_LLM_ALLOW_SOURCE_TO_HOSTED).
+	LLMAllowSource bool
 	// NVDAPIKey raises the NVD rate limit; NVDURL and CVEURL override the
 	// sources' API URLs (tests, mirrors); AdvisoryPace overrides pacing.
 	NVDAPIKey, NVDURL, CVEURL string
@@ -349,7 +367,14 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if err != nil {
 		return assessments.ErrScope
 	}
-	archive, commit, moved, err := source.Snapshot(ctx, c, secret, asset.Locator, ref, revision)
+	var archive []byte
+	var commit string
+	var moved bool
+	if a.Request.Target.Type == "upload" {
+		archive, commit, err = w.uploadArchive(ctx, asset.ID, a.Request.Target.Commit)
+	} else {
+		archive, commit, moved, err = source.Snapshot(ctx, c, secret, asset.Locator, ref, revision)
+	}
 	if err != nil {
 		return err
 	}
@@ -366,8 +391,9 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 			return err
 		}
 	}
-	endpoint := w.ScannerURL
+	endpoint, bearer := w.ScannerURL, w.ScannerToken
 	if a.Request.Remediation != nil {
+		endpoint, bearer = w.remediationTarget()
 		target, _ := url.Parse(endpoint)
 		target.Path = "/remediate"
 		query := url.Values{}
@@ -409,7 +435,7 @@ func (w Worker) run(ctx context.Context, a *assessments.Assessment) error {
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+w.ScannerToken)
+	request.Header.Set("Authorization", "Bearer "+bearer)
 	request.Header.Set("Content-Type", contentType)
 	client := &http.Client{Timeout: 4 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	response, err := client.Do(request)
@@ -584,23 +610,34 @@ func (w Worker) runImage(ctx context.Context, a *assessments.Assessment, c conne
 	m := multipart.NewWriter(writer)
 	type resolved struct {
 		digest string
-		err    error
+		// label is the image's source label (CON-012); labelKnown is false when
+		// the image source does not report labels.
+		label      string
+		labelKnown bool
+		err        error
 	}
 	done := make(chan resolved, 1)
 	go func() {
-		var d string
+		var d, label string
+		var labelKnown bool
 		err := writeContext(m, intel)
 		if err == nil {
 			var part io.Writer
 			if part, err = m.CreateFormFile("image", "image.tar"); err == nil {
-				d, err = images.ImageArchive(ctx, c, secret, a.Request.Target.Repository, a.Request.Target.Ref, digest, a.Request.Target.Platform, limit, part)
+				if withInfo, ok := images.(imageInfoSource); ok {
+					var info connections.ImageInfo
+					info, err = withInfo.ImageArchiveInfo(ctx, c, secret, a.Request.Target.Repository, a.Request.Target.Ref, digest, a.Request.Target.Platform, limit, part)
+					d, label, labelKnown = info.Digest, info.SourceLabel, true
+				} else {
+					d, err = images.ImageArchive(ctx, c, secret, a.Request.Target.Repository, a.Request.Target.Ref, digest, a.Request.Target.Platform, limit, part)
+				}
 			}
 		}
 		if err == nil {
 			err = m.Close()
 		}
 		writer.CloseWithError(err)
-		done <- resolved{d, err}
+		done <- resolved{d, label, labelKnown, err}
 	}()
 	request, err := http.NewRequestWithContext(ctx, "POST", endpoint.String(), reader)
 	if err != nil {
@@ -644,6 +681,13 @@ func (w Worker) runImage(ctx context.Context, a *assessments.Assessment, c conne
 		return err
 	}
 	a.Commit = result.digest
+	if result.labelKnown {
+		// CON-012: the image's source label links it to the repository it
+		// names. It never fails an assessment.
+		if _, err := w.Store.LinkImageToLabel(ctx, a.AssetID, result.label); err != nil && w.Logger != nil {
+			w.Logger.Warn("linking an image to its source label failed", "error", err)
+		}
+	}
 	stages := append([]assessments.Stage{{Name: "resolve", Status: "ok", Detail: "Tag resolved to platform manifest digest"}, {Name: "fetch", Status: "ok"}}, output.Stages...)
 	extra, key, sbomDigest, err := w.enrich(ctx, *a, &output, result.digest)
 	if err != nil {
@@ -651,4 +695,33 @@ func (w Worker) runImage(ctx context.Context, a *assessments.Assessment, c conne
 	}
 	stages = append(stages, extra...)
 	return w.Store.Complete(ctx, *a, assessments.Result{Files: output.Files, Commit: result.digest, Stages: stages, Components: output.Components, Findings: output.Findings, SBOMKey: key, SBOMSHA256: sbomDigest, Complete: true})
+}
+
+// remediationTarget is where a remediation job is sent and the token that
+// authorizes it: the separate sandbox (REM-002) when one is configured, the
+// scanner otherwise. A sandbox with no token of its own is refused, so the
+// scanner's token never goes to a different service.
+func (w Worker) remediationTarget() (endpoint, bearer string) {
+	if w.RemediationURL == "" {
+		return w.ScannerURL, w.ScannerToken
+	}
+	return w.RemediationURL, w.RemediationToken
+}
+
+// uploadArchive reads the archive an upload target names. The archive is
+// verified against its SHA-256 when read, so the commit it returns is the one
+// that was requested.
+func (w Worker) uploadArchive(ctx context.Context, asset uuid.UUID, commit string) ([]byte, string, error) {
+	if w.Uploads == nil {
+		return nil, "", errors.New("uploaded archives are not available on this worker")
+	}
+	key, err := w.Store.UploadObjectKey(ctx, asset, commit)
+	if err != nil {
+		return nil, "", assessments.ErrScope
+	}
+	data, err := w.Uploads.GetUpload(ctx, key)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, commit, nil
 }

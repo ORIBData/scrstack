@@ -12,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/actionscheck"
 	"github.com/ORIBData/scrstack/internal/assessments"
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/depsdev"
+	"github.com/ORIBData/scrstack/internal/llm"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
@@ -179,6 +181,11 @@ func pipelineCommand() error {
 		} else {
 			engine.MaxImageBytes = 400 << 20
 		}
+		if role := os.Getenv("SCRS_SCANNER_ROLE"); !scanner.ValidRole(role) {
+			return errors.New("SCRS_SCANNER_ROLE must be all, scan or remediation")
+		} else {
+			engine.Role = role
+		}
 		if _, err := os.Stat(engine.Binary); err != nil {
 			return errors.New("pinned OSV-Scanner binary unavailable")
 		}
@@ -223,8 +230,15 @@ func pipelineCommand() error {
 		if limit, err := strconv.ParseInt(os.Getenv("SCRS_MAX_IMAGE_BYTES"), 10, 64); err == nil && limit > 0 {
 			w.MaxImageBytes = limit
 		}
+		w.Uploads = artifacts
 		if os.Getenv("SCRS_SNAPSHOT_ARCHIVES") == "true" {
 			w.Snapshots = artifacts
+		}
+		// REM-002: guided remediation can run in its own sandbox container with
+		// its own token; unset, it uses the scanner.
+		w.RemediationURL, w.RemediationToken = os.Getenv("SCRS_REMEDIATION_URL"), os.Getenv("SCRS_REMEDIATION_API_TOKEN")
+		if w.RemediationURL != "" && len(w.RemediationToken) < 32 {
+			return errors.New("set a random SCRS_REMEDIATION_API_TOKEN of at least 32 characters, separate from the scanner token, when SCRS_REMEDIATION_URL is set")
 		}
 		dispatcher := &notify.Dispatcher{Store: events, Logger: logger, Document: store.ProfileDocument}
 		go dispatcher.Run(ctx)
@@ -279,6 +293,7 @@ func pipelineCommand() error {
 			return err
 		}
 		w.LLMPrivateHosts = netguard.Hosts(os.Getenv("SCRS_LLM_PRIVATE_HOSTS"))
+		w.LLMAllowSource = llm.AllowSourceToHosted()
 		if runner != nil {
 			w.QARunner, w.QAReports = runner, artifacts
 			w.QAMaxActive = 4
@@ -289,6 +304,8 @@ func pipelineCommand() error {
 		}
 		if os.Getenv("SCRS_QA_GENERATION_ENABLED") != "false" {
 			go w.RunGenerations(ctx)
+			go w.RunAIReviews(ctx)
+			go w.RunAISummaries(ctx)
 		}
 		// Dependency-Track export (P2): configured through the API; this loop
 		// only pushes uploads while it is enabled there.
@@ -316,6 +333,22 @@ func pipelineCommand() error {
 			if limit, err := strconv.Atoi(os.Getenv("SCRS_DEPSDEV_MAX_LOOKUPS")); err == nil && limit > 0 && limit <= 20000 {
 				w.DepsDevMaxLookups = limit
 			}
+		}
+		// GitHub Actions inventory and run-number gaps (INT-014, INT-015). Off
+		// unless an interval is set: it calls GitHub's API for every in-scope
+		// repository and needs the read-only Actions permission.
+		if hours, err := strconv.Atoi(os.Getenv("SCRS_ACTIONS_SWEEP_INTERVAL_HOURS")); err == nil && hours > 0 && hours <= 24*30 {
+			checker := actionscheck.Checker{Connections: providers, Store: store, API: connections.NewNativeAdapters()}
+			go func() {
+				for {
+					checker.Sweep(ctx, time.Duration(hours)*time.Hour, 25, 2*time.Second, logger)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(15 * time.Minute):
+					}
+				}
+			}()
 		}
 		// Compliance evidence reports (CMP-006).
 		reportPoll := 30 * time.Second

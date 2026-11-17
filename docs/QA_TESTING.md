@@ -34,7 +34,7 @@ scenarios, API coverage, qa_* findings, qa.completed / qa.failed events
 - **In the SCRS Dokploy stack** (`deploy/compose.dokploy.yaml`, service `scrs-qa-runner`).
   - The runner is built from its own image (`make release-qa-runner`).
   - SCRS reaches it privately at `http://scrs-qa-runner:8090` on the internal `qa` network.
-  - Traefik also publishes it at `https://${SCRS_QA_DOMAIN}`, behind an IP allowlist and the token.
+  - Traefik also publishes it at `https://${SCRS_QA_DOMAIN}`, behind an IP allowlist and the token, so operators can run standalone jobs (see [Standalone operator use](#standalone-operator-use)).
   - This is simplest to run, but the runner shares the host's kernel with SCRS. See
     [DOKPLOY.md](DOKPLOY.md#e2e-qa-karate-additions) for what it can reach and how to check.
 - **On a separate VM** (`deploy/compose.qa-runner.yaml`). This gives the strongest isolation;
@@ -81,6 +81,17 @@ SCRS_QA_RUNNER_TOKEN=<the same token>
 | `SCRS_QA_RUNNER_TLS_CERT` / `_KEY` | unset | Serve HTTPS directly |
 | `SCRS_QA_RUNNER_PASS_ENV` | unset | Extra runner variables tests inherit (comma-separated names), such as `HTTPS_PROXY` |
 | `SCRS_QA_RUNNER_KARATE`, `_JAVA`, `_PERF_CLASSPATH` | image values | Commands; an empty Gatling classpath disables performance jobs |
+
+### Standalone operator use
+
+The runner is a QA, performance and load service. It is separate from supply-chain scanning and never sees SBOMs, MBOMs, vulnerabilities, malware or integrity results. Operators can use it without SCRS storing anything:
+
+- **Address.** `https://${SCRS_QA_DOMAIN}`, reachable only from `SCRS_QA_RUNNER_ALLOWED_CIDRS`.
+- **Credential.** `SCRS_QA_RUNNER_TOKEN` as a bearer token. It is the same token Core and the worker use, not an SCRS API token, so keep it to people who may run test code.
+- **Jobs.** The Runner API below, with `kind` `functional` (Karate API, integration and UI) or `performance` (Gatling). Pick a new lower-case UUID for `id`.
+- **Results.** Fetch the report from `GET /v1/jobs/{id}/report` and check `X-Content-SHA256`. SCRS creates no run, finding, event or S3 archive for these jobs.
+- **Capacity.** Direct jobs share the runner's slots and queue with runs started by SCRS; a full queue answers `429`.
+- **Lint.** The runner has no lint job kind. Linting is not part of this service today.
 
 ### Runner API (SCRS ↔ runner)
 
@@ -255,7 +266,7 @@ The full contract, with schemas and examples, is in `api/openapi.yaml` (tags *E2
 | `SCRS_QA_RUNNER_ALLOW_HTTP` | API, worker | Allow `http://` for a runner on a private network |
 | `SCRS_QA_RUNNER_CA_FILE` | API, worker | PEM trusted for a privately issued runner certificate |
 | `SCRS_QA_MAX_ACTIVE` | worker | Runs on the runner at once (default 4) |
-| `SCRS_QA_GENERATION_ENABLED` | worker | `false` stops test generation |
+| `SCRS_QA_GENERATION_ENABLED` | worker | `false` stops test generation and AI code review |
 | `SCRS_LLM_PRIVATE_HOSTS` | API, worker | Self-hosted model hosts allowed private addresses and http |
 
 ## Verification

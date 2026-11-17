@@ -757,7 +757,7 @@ Reset data, rebuild derived state, and keep the platform and its sensors up to d
 
 | ID | Requirement | Pri |
 |---|---|---|
-| OUT-001 | Webhook subscriptions: URL, secret, event filter. Events: `finding.created`, `finding.status_changed`, `finding.rescored`, `malicious_dependency.reported`, `connection.degraded`, `assessment.completed`, `assessment.failed`, `scan.completed`, `scan.failed`, `integrity.alert`, `feed.stale`, `maintenance.completed`. | P1 |
+| OUT-001 | Webhook subscriptions: URL, secret, event filter. Events: `finding.created`, `finding.status_changed`, `finding.rescored`, `malicious_dependency.reported`, `connection.degraded`, `assessment.completed`, `assessment.failed`, `scan.completed`, `scan.failed`, `integrity.alert`, `feed.stale`, `maintenance.completed`, `qa.completed`, `qa.failed`, `dependency_track.upload_failed`, `system.degraded`, `system.recovered`. | P1 |
 | OUT-002 | Signed delivery (`X-SCRS-Signature: sha256=<HMAC of the body>`), idempotency key header, retries with exponential backoff through a Redis stream, dead-letter stream, and a delivery log. | P1 |
 | OUT-003 | n8n compatibility: payloads are flat enough for the Webhook node; an example workflow is part of the docs. | P1 |
 | OUT-004 | Live updates for the frontend via server-sent events backed by Redis Pub/Sub (`GET /api/v1/events`). | P2 |

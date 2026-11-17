@@ -250,7 +250,7 @@ func (s *Store) ListPage(ctx context.Context, after string, limit int) ([]Connec
 	return s.listConnections(ctx, after, limit)
 }
 func (s *Store) listConnections(ctx context.Context, after string, limit int) ([]Connection, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status, enabled, webhook_secret_ciphertext IS NOT NULL, webhook_url, webhook_rotated_at FROM `+s.schema+`.connections WHERE name>$1 ORDER BY name LIMIT $2`, after, limit)
+	rows, err := s.pool.Query(ctx, `SELECT id, provider, name, config, scope, status, enabled, webhook_secret_ciphertext IS NOT NULL, webhook_url, webhook_rotated_at FROM `+s.schema+`.connections WHERE name>$1 AND provider<>'upload' ORDER BY name LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, errors.New("connection list failed")
 	}
@@ -438,7 +438,7 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 	batch := &pgx.Batch{}
 	// A complete successful inventory must withdraw eligibility from resources
 	// that disappeared or became inaccessible. Preserve their history.
-	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.assets SET flags=flags || '{"in_scope":false,"accessible":false}'::jsonb WHERE connection_id=$1`, c.ID); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.assets SET flags=flags || '{"in_scope":false,"accessible":false}'::jsonb WHERE connection_id=$1 AND COALESCE(flags->>'manual','')<>'true'`, c.ID); err != nil {
 		return DiscoveryResult{}, errors.New("asset reconciliation failed")
 	}
 	for _, resource := range resources {
@@ -462,6 +462,31 @@ func (s *Store) Discover(ctx context.Context, name string, adapter Adapter) (Dis
 	}
 	if err := tx.SendBatch(ctx, batch).Close(); err != nil {
 		return DiscoveryResult{}, errors.New("asset discovery batch failed")
+	}
+	// Assets registered by hand were not reset above; follow the current scope.
+	manual, err := tx.Query(ctx, `SELECT id,type,locator FROM `+s.schema+`.assets WHERE connection_id=$1 AND flags->>'manual'='true'`, c.ID)
+	if err != nil {
+		return DiscoveryResult{}, errors.New("asset reconciliation failed")
+	}
+	type manualAsset struct {
+		id uuid.UUID
+		in bool
+	}
+	var manualAssets []manualAsset
+	for manual.Next() {
+		var id uuid.UUID
+		var r Resource
+		if err := manual.Scan(&id, &r.Type, &r.Locator); err != nil {
+			manual.Close()
+			return DiscoveryResult{}, errors.New("asset reconciliation failed")
+		}
+		manualAssets = append(manualAssets, manualAsset{id, c.Scope.matchesResource(r)})
+	}
+	manual.Close()
+	for _, m := range manualAssets {
+		if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.assets SET flags=flags || jsonb_build_object('in_scope',$2::boolean) WHERE id=$1`, m.id, m.in); err != nil {
+			return DiscoveryResult{}, errors.New("asset reconciliation failed")
+		}
 	}
 	details, _ := json.Marshal(result)
 	status, _ := json.Marshal(map[string]any{"state": "ok", "checked_at": time.Now().UTC(), "resource_count": result.Discovered, "in_scope_count": result.InScope})

@@ -152,6 +152,12 @@ func (h connectionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 404, "connection not found")
 		return
 	}
+	if action != "" || r.Method != http.MethodGet {
+		if c, err := h.store.PublicByID(ctx, id); err == nil && c.Provider == connections.UploadProvider {
+			writeError(w, http.StatusConflict, "this built-in connection serves uploaded archives and cannot be changed")
+			return
+		}
+	}
 	if action == "" && r.Method == http.MethodGet {
 		c, err := h.store.PublicByID(ctx, id)
 		if err != nil {

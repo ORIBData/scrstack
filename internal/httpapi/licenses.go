@@ -50,6 +50,7 @@ var gatePolicy = map[string]any{
 		"A new critical or high integrity entry fails; a new medium or an existing serious one warns.",
 		"A new critical vulnerability fails; a new high, or an existing critical, warns.",
 		"Licence entries follow the licence policy: report-only, a deny warns; enforcing, deny fails and review warns.",
+		"Suspicious-dependency entries (a name that resembles a popular package, a very new release) are medium and never change the verdict; they are off until the dependency policy enables them.",
 		"Hunt-mode indicators and rules, E2E QA findings and vendor statements never gate.",
 		"Partial coverage makes the verdict incomplete unless something already fails.",
 	},

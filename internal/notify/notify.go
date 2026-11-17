@@ -30,19 +30,22 @@ const SchemaVersion = 1
 
 // Events lists every event type a subscription may select.
 var Events = map[string]bool{
-	"assessment.completed":          true,
-	"assessment.failed":             true,
-	"finding.created":               true,
-	"finding.status_changed":        true,
-	"finding.rescored":              true,
-	"malicious_dependency.reported": true,
-	"integrity.alert":               true,
-	"feed.stale":                    true,
-	"connection.degraded":           true,
-	"maintenance.completed":         true,
-	"qa.completed":                  true,
-	"qa.failed":                     true,
-	"ping":                          true,
+	"assessment.completed":           true,
+	"assessment.failed":              true,
+	"finding.created":                true,
+	"finding.status_changed":         true,
+	"finding.rescored":               true,
+	"malicious_dependency.reported":  true,
+	"integrity.alert":                true,
+	"feed.stale":                     true,
+	"connection.degraded":            true,
+	"maintenance.completed":          true,
+	"qa.completed":                   true,
+	"qa.failed":                      true,
+	"dependency_track.upload_failed": true,
+	"system.degraded":                true,
+	"system.recovered":               true,
+	"ping":                           true,
 }
 
 var (
@@ -62,6 +65,9 @@ func Schema(s string) []string {
 		// Connection scope: a subscription with connection IDs receives only
 		// events about those connections (and connection-less platform events).
 		`ALTER TABLE ` + s + `.webhook_subscriptions ADD COLUMN IF NOT EXISTS connections jsonb NOT NULL DEFAULT '[]'`,
+		// One row: the platform status last announced, so that several API
+		// instances announce each change once.
+		`CREATE TABLE IF NOT EXISTS ` + s + `.platform_state(id boolean PRIMARY KEY DEFAULT true CHECK(id),status text NOT NULL DEFAULT 'ok' CHECK(status IN ('ok','degraded','down')),changed_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 	}
 }
 
@@ -502,6 +508,49 @@ func (s *Store) EmitNow(ctx context.Context, eventType string, data any) error {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// PlatformTransition records that the platform status became status and, only
+// when that differs from the status last recorded, emits system.degraded
+// (degraded or down) or system.recovered (ok) in the same transaction. It
+// returns whether it emitted. The row lock makes concurrent API instances agree:
+// the first records and emits, the others see no change. components lists
+// the components that are not ok, each with name, status and detail.
+func (s *Store) PlatformTransition(ctx context.Context, status string, components []map[string]any) (bool, error) {
+	if status != "ok" && status != "degraded" && status != "down" {
+		return false, ErrInput
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.platform_state(id) VALUES(true) ON CONFLICT DO NOTHING`); err != nil {
+		return false, err
+	}
+	var previous string
+	var since time.Time
+	if err := tx.QueryRow(ctx, `SELECT status,changed_at FROM `+s.schema+`.platform_state WHERE id FOR UPDATE`).Scan(&previous, &since); err != nil {
+		return false, err
+	}
+	if previous == status {
+		return false, nil
+	}
+	var changedAt time.Time
+	if err := tx.QueryRow(ctx, `UPDATE `+s.schema+`.platform_state SET status=$1,changed_at=clock_timestamp() WHERE id RETURNING changed_at`, status).Scan(&changedAt); err != nil {
+		return false, err
+	}
+	if components == nil {
+		components = []map[string]any{}
+	}
+	event, data := "system.degraded", map[string]any{"status": status, "previous_status": previous, "components": components, "since": since.UTC()}
+	if status == "ok" {
+		event, data = "system.recovered", map[string]any{"status": status, "previous_status": previous, "since": since.UTC(), "duration_seconds": int64(changedAt.Sub(since).Seconds())}
+	}
+	if _, err := Emit(ctx, tx, s.schema, event, data, nil); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }
 
 func (s *Store) Deliveries(ctx context.Context, subscription uuid.UUID, status string, after uuid.UUID) ([]Delivery, error) {

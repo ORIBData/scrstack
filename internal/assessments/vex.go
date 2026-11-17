@@ -35,40 +35,7 @@ func (s *Store) VEX(ctx context.Context, id uuid.UUID) (json.RawMessage, error) 
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, err
 		}
-		var guidance struct {
-			Fixed   []string `json:"fixed_versions"`
-			Aliases []string `json:"aliases"`
-		}
-		_ = json.Unmarshal(f.Guidance, &guidance)
-		if guidance.Aliases == nil {
-			guidance.Aliases = []string{}
-		}
-		statement := map[string]any{
-			"vulnerability": map[string]any{"name": f.AdvisoryID, "aliases": guidance.Aliases},
-			"products":      []map[string]any{{"@id": f.Component.PURL}},
-		}
-		reason = clean(reason, 512)
-		switch status {
-		case "false_positive":
-			statement["status"] = "not_affected"
-			statement["impact_statement"] = "Marked false positive in the SCRS risk register: " + reason
-		case "fixed":
-			statement["status"] = "fixed"
-		case "accepted":
-			statement["status"] = "affected"
-			statement["action_statement"] = "Risk accepted until " + until.UTC().Format(time.RFC3339) + ": " + reason
-		case "suppressed":
-			statement["status"] = "affected"
-			statement["action_statement"] = "Suppressed by policy in the SCRS risk register: " + reason
-		default:
-			statement["status"] = "affected"
-			action := "Upgrade to a fixed version and rerun the assessment."
-			if len(guidance.Fixed) > 0 {
-				action = "Upgrade to " + strings.Join(guidance.Fixed, " or ") + " and rerun the assessment."
-			}
-			statement["action_statement"] = action
-		}
-		statements = append(statements, statement)
+		statements = append(statements, vexStatement(f.AdvisoryID, f.Component.PURL, f.Guidance, status, reason, until))
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -86,4 +53,42 @@ func (s *Store) VEX(ctx context.Context, id uuid.UUID) (json.RawMessage, error) 
 		"tooling":    "SCRS register export",
 		"statements": statements,
 	})
+}
+
+// vexStatement maps a register state to an OpenVEX statement.
+func vexStatement(advisory, purl string, guidanceRaw json.RawMessage, status, reason string, until *time.Time) map[string]any {
+	var guidance struct {
+		Fixed   []string `json:"fixed_versions"`
+		Aliases []string `json:"aliases"`
+	}
+	_ = json.Unmarshal(guidanceRaw, &guidance)
+	if guidance.Aliases == nil {
+		guidance.Aliases = []string{}
+	}
+	statement := map[string]any{
+		"vulnerability": map[string]any{"name": advisory, "aliases": guidance.Aliases},
+		"products":      []map[string]any{{"@id": purl}},
+	}
+	reason = clean(reason, 512)
+	switch status {
+	case "false_positive":
+		statement["status"] = "not_affected"
+		statement["impact_statement"] = "Marked false positive in the SCRS risk register: " + reason
+	case "fixed":
+		statement["status"] = "fixed"
+	case "accepted":
+		statement["status"] = "affected"
+		statement["action_statement"] = "Risk accepted until " + until.UTC().Format(time.RFC3339) + ": " + reason
+	case "suppressed":
+		statement["status"] = "affected"
+		statement["action_statement"] = "Suppressed by policy in the SCRS risk register: " + reason
+	default:
+		statement["status"] = "affected"
+		action := "Upgrade to a fixed version and rerun the assessment."
+		if len(guidance.Fixed) > 0 {
+			action = "Upgrade to " + strings.Join(guidance.Fixed, " or ") + " and rerun the assessment."
+		}
+		statement["action_statement"] = action
+	}
+	return statement
 }

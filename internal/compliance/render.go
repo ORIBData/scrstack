@@ -190,7 +190,23 @@ func renderMarkdown(r Report) []byte {
 		}
 		b.WriteString("\n")
 	}
+	if r.AISummaryNotice != "" {
+		fmt.Fprintf(&b, "## AI-written summaries (unverified)\n\n> %s\n\n", r.AISummaryNotice)
+		if len(r.AISummaries) == 0 {
+			b.WriteString("No asset in scope has an AI summary yet.\n\n")
+		}
+		for _, a := range r.AISummaries {
+			fmt.Fprintf(&b, "### %s\n\n*%s, %s%s*\n\n%s\n\n", escape(a.Locator), a.CreatedAt.UTC().Format(time.RFC3339), firstNonEmpty(a.Model, "unknown model"), refSuffix(a.Ref), a.Text)
+		}
+	}
 	return []byte(b.String())
+}
+
+func refSuffix(ref string) string {
+	if ref == "" {
+		return ""
+	}
+	return ", ref " + ref
 }
 
 func firstNonEmpty(values ...string) string {
@@ -289,6 +305,22 @@ func renderPDF(r Report) []byte {
 		}
 		if len(rows) > 0 {
 			d.table([]string{"Metric", "Value"}, []float64{0.25, 0.75}, rows)
+		}
+	}
+	if r.AISummaryNotice != "" {
+		d.heading("AI-written summaries (unverified)", 12)
+		d.paragraph(r.AISummaryNotice, 9, false)
+		if len(r.AISummaries) == 0 {
+			d.paragraph("No asset in scope has an AI summary yet.", 9, false)
+		}
+		for _, a := range r.AISummaries {
+			d.heading(a.Locator, 10)
+			d.paragraph(a.CreatedAt.UTC().Format(time.RFC3339)+", "+firstNonEmpty(a.Model, "unknown model")+refSuffix(a.Ref), 8, false)
+			for _, line := range strings.Split(a.Text, "\n") {
+				if strings.TrimSpace(line) != "" {
+					d.paragraph(line, 9, false)
+				}
+			}
 		}
 	}
 	return d.bytes()

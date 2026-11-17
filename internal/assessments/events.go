@@ -2,6 +2,7 @@ package assessments
 
 import (
 	"context"
+	"encoding/json"
 
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/google/uuid"
@@ -32,10 +33,18 @@ func Summary(a Assessment) map[string]any {
 }
 
 func findingBrief(f Finding) map[string]any {
-	return map[string]any{
+	brief := map[string]any{
 		"id": f.ID, "type": f.Type, "severity": f.Severity, "score": f.Score, "advisory_id": f.AdvisoryID,
 		"title": f.Title, "change": f.Change, "component": f.Component, "link": notify.Link("/register/" + f.ID.String() + "/events"),
 	}
+	// MAL-008: who brought a new dependency in, when that is known.
+	var evidence struct {
+		IntroducedBy json.RawMessage `json:"introduced_by"`
+	}
+	if json.Unmarshal(f.Evidence, &evidence) == nil && len(evidence.IntroducedBy) > 0 {
+		brief["introduced_by"] = evidence.IntroducedBy
+	}
+	return brief
 }
 
 // emitCompletion publishes assessment.completed plus, for new register
