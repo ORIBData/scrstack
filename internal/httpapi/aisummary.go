@@ -65,7 +65,7 @@ func (h aiSummaryHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Location", BasePath+"/summary-jobs/"+job.ID.String())
-		writeJSON(w, 202, job)
+		writeJob(w, 202, job.ID, job)
 	case r.Method == http.MethodGet && path == BasePath+"/assessments/"+id.String()+"/summaries":
 		items, err := h.store.AISummaries(ctx, id, 50)
 		if err != nil {

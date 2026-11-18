@@ -99,8 +99,12 @@ type RemediationRequest struct {
 }
 
 type Request struct {
-	AutoRemediation bool                `json:"auto_remediation,omitempty"`
-	Remediation     *RemediationRequest `json:"remediation,omitempty"`
+	AutoRemediation bool `json:"auto_remediation,omitempty"`
+	// SkipQA exempts this assessment from the QA runs the asset's profile
+	// queues after an assessment. QA is otherwise part of every assessment
+	// of an asset with an enabled, auto-run profile.
+	SkipQA      bool                `json:"skip_qa,omitempty"`
+	Remediation *RemediationRequest `json:"remediation,omitempty"`
 	// Import is set by Store.Import; API callers cannot supply it.
 	Import     *ImportSource `json:"import,omitempty"`
 	Target     Target        `json:"target"`

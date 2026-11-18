@@ -74,7 +74,8 @@ func Reference() ([]byte, error) {
 	out.WriteString("# API reference by module\n\n")
 	out.WriteString("<!-- Generated from api/openapi.yaml by `make api-reference`. Do not edit by hand. -->\n\n")
 	out.WriteString("Every path is relative to `/scrs/v1`. A token needs **any one** of the scopes in the Access column, and `admin` satisfies every scope. ")
-	out.WriteString("See [STACK.md](STACK.md) for how the modules connect, and the contract (`GET /scrs/v1/docs`) for request and response schemas.\n\n")
+	out.WriteString("The contract (`GET /scrs/v1/docs`) opens with the conventions, the states to show and worked call sequences, and describes every request, response and field; this page is only the index by module. ")
+	out.WriteString("See [STACK.md](STACK.md) for how the modules connect, [FRONTEND_GUIDE.md](FRONTEND_GUIDE.md) for the order to call things when building screens and [integrations/N8N.md](integrations/N8N.md) for automation.\n\n")
 	for _, tag := range contract.Tags {
 		rows := byTag[tag.Name]
 		if len(rows) == 0 {

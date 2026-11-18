@@ -172,7 +172,7 @@ func (h maintenanceHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			w.Header().Set("Location", BasePath+"/assessments/"+a.ID.String())
-			writeJSON(w, 202, a)
+			writeJob(w, 202, a.ID, a)
 		default:
 			writeError(w, 405, "method not allowed")
 		}

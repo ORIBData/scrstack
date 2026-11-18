@@ -336,13 +336,13 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		mux.Handle(BasePath+"/register/", security.protect("read|write", h))
 		// E2E QA (Karate) and the LLM providers that draft tests.
 		qaH := qaHandler{store: security.Assessments, secrets: secrets, reports: security.QAReports, runner: security.QARunner, llmHosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
-		mux.Handle("GET "+BasePath+"/assets/{id}/qa/profile", security.protect("read|write", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/profile", security.protect("read|write|qa", qaH))
 		mux.Handle("PUT "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
 		mux.Handle("DELETE "+BasePath+"/assets/{id}/qa/profile", security.protect("admin", qaH))
-		mux.Handle("GET "+BasePath+"/assets/{id}/qa/runs", security.protect("read|write", qaH))
-		mux.Handle("POST "+BasePath+"/assets/{id}/qa/runs", security.protect("write|trigger", qaH))
-		mux.Handle("GET "+BasePath+"/assets/{id}/qa/coverage", security.protect("read|write", qaH))
-		mux.Handle("GET "+BasePath+"/assets/{id}/qa/generations", security.protect("read|write", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/runs", security.protect("read|write|qa", qaH))
+		mux.Handle("POST "+BasePath+"/assets/{id}/qa/runs", security.protect("write|trigger|qa", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/coverage", security.protect("read|write|qa", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/generations", security.protect("read|write|qa", qaH))
 		mux.Handle("POST "+BasePath+"/assets/{id}/qa/generations", security.protect("write", qaH))
 		aiReviews := aiReviewHandler{store: security.Assessments, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource}
 		mux.Handle("POST "+BasePath+"/assets/{id}/ai-reviews", security.protect("write|trigger", aiReviews))
@@ -356,9 +356,9 @@ func HandlerWithSecurity(check func(context.Context) error, store ConnectionStor
 		knowledgeAPI := &knowledgeHandler{store: security.Assessments, embedder: security.Embedder}
 		mux.Handle("GET "+BasePath+"/assets/{id}/chronicle/search", security.protect("read|write", http.HandlerFunc(knowledgeAPI.search)))
 		mux.Handle("POST "+BasePath+"/knowledge:backfill", security.protect("admin", http.HandlerFunc(knowledgeAPI.backfill)))
-		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write", qaH))
-		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger", qaH))
-		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger", qaH))
+		mux.Handle("GET "+BasePath+"/assets/{id}/qa/suites", security.protect("read|write|qa", qaH))
+		mux.Handle("GET "+BasePath+"/assessments/{id}/qa", security.protect("read|write|trigger|qa", qaH))
+		mux.Handle(BasePath+"/qa/", security.protect("read|write|trigger|qa", qaH))
 		models := security.protect("read|write", llmHandler{store: security.Assessments, secrets: secrets, hosts: security.LLMPrivateHosts, allowSource: security.LLMAllowSource})
 		mux.Handle(BasePath+"/llm/", models)
 	}

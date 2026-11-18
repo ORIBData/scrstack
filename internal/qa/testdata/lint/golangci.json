@@ -1,0 +1,21 @@
+{
+ "Issues": [
+  {
+   "FromLinter": "errcheck",
+   "Text": "Error return value is not checked",
+   "Severity": "",
+   "SourceLines": [
+    "\trisky()"
+   ],
+   "Pos": {
+    "Filename": "main.go",
+    "Offset": 94,
+    "Line": 11,
+    "Column": 7
+   },
+   "ExpectNoLint": false,
+   "ExpectedNoLintLinter": ""
+  }
+ ],
+ "Report": {}
+}

@@ -37,7 +37,8 @@ help:
 	@echo 'database-test   Exercise concurrency, tokens, lifecycle and PostgreSQL restore'
 	@echo 'legacy-integration  Test the internal legacy scanner with ClamAV fixtures'
 	@echo 'qa              Run local tests, lint, contracts and tooling checks'
-	@echo 'qa-runner-image Build the Karate runner image (E2E QA)'
+	@echo 'qa-runner-image Build the slim Karate runner image (E2E QA, ruff only)'
+	@echo 'qa-runner-lint-image  Build the full runner with every linter (the image release-qa-runner publishes)'
 	@echo 'qa-runner-test  Test the runner with the pinned Karate jar (needs Java 21)'
 	@echo 'qa-runner-image-test  Test API, UI and load runs in a hardened runner container'
 	@echo 'release-qa-runner  Push SCRS_QA_RUNNER_IMAGE (Karate runner, from .env) for the Dokploy stack'
@@ -135,11 +136,17 @@ QA_RUNNER_IMAGE ?= scrs-qa-runner:local
 KARATE_JAR_URL := https://github.com/karatelabs/karate/releases/download/v2.1.4/karate-2.1.4.jar
 KARATE_JAR_SHA256 := 1f743f4acc56526b39bd88c84bfe4491c46d5e94f4ab5a38c437c9400dbc2488
 
-.PHONY: qa-runner-image qa-runner-test qa-runner-image-test release-qa-runner
+.PHONY: qa-runner-image qa-runner-lint-image qa-runner-test qa-runner-image-test release-qa-runner
 qa-runner-image:
-	$(DOCKER) build -f deploy/karate-runner/Dockerfile -t $(QA_RUNNER_IMAGE) .
+	$(DOCKER) build -f deploy/karate-runner/Dockerfile --target base -t $(QA_RUNNER_IMAGE) .
 
-# Publishes the runner image the Dokploy stack deploys as scrs-qa-runner.
+# The runner with every linter (ruff, mypy, bandit, pylint, PHPStan, phpcs, clang-tidy, golangci-lint with Go, ESLint with Node,
+# ktlint, SwiftLint, dart analyze): the default build of the Dockerfile, which
+# is also what release-qa-runner publishes.
+qa-runner-lint-image:
+	$(DOCKER) build -f deploy/karate-runner/Dockerfile -t $(QA_RUNNER_IMAGE)-lint .
+
+# Publishes the full runner image (every linter) the Dokploy stack deploys as scrs-qa-runner.
 # SCRS_QA_RUNNER_IMAGE (from .env, or on the command line) is a template like
 # registry/namespace/scrs-qa-runner:scrs_YYYY_MM_DD_v{shortSHA256}.
 release-qa-runner:

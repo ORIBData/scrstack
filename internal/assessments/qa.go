@@ -29,8 +29,22 @@ var (
 	ErrQANoAssessment = errors.New("asset has no successful assessment to test; run one first")
 	// ErrQABlocked means the commit failed its security gate.
 	ErrQABlocked = errors.New("the assessment's verdict is fail; QA does not run code that failed its security gate")
+	// ErrQATriageUnassessed means AI triage was asked for a run that tested
+	// no assessed commit; triage texts are filed under an assessment.
+	ErrQATriageUnassessed = errors.New("AI triage needs a run of an assessed commit; this run had no assessment")
 	// ErrQAState means the run or suite is not in a state that allows the action.
 	ErrQAState = errors.New("not allowed in the current state")
+)
+
+// QA gate settings: whether a manual run needs an assessment of the commit.
+const (
+	// QAGateAssessment (the default) tests only a commit that passed a
+	// security assessment; a failed verdict blocks the run.
+	QAGateAssessment = "assessment"
+	// QAGateNone lets a run test the head of a ref without any assessment.
+	// The repository's tests and linter configuration then run on the QA
+	// runner without the security gate having looked at them.
+	QAGateNone = "none"
 )
 
 func qaSchema(s string) []string {
@@ -38,6 +52,13 @@ func qaSchema(s string) []string {
 		`CREATE TABLE IF NOT EXISTS ` + s + `.llm_providers(id uuid PRIMARY KEY,name text NOT NULL UNIQUE,kind text NOT NULL,base_url text NOT NULL DEFAULT '',model text NOT NULL,max_tokens integer NOT NULL CHECK(max_tokens BETWEEN 256 AND 131072),temperature double precision,enabled boolean NOT NULL DEFAULT true,credential bytea,revision bigint NOT NULL DEFAULT 1,created_at timestamptz NOT NULL DEFAULT clock_timestamp(),updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),last_test_at timestamptz,last_test_error text NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.qa_profiles(asset_id uuid PRIMARY KEY REFERENCES ` + s + `.assets(id),enabled boolean NOT NULL DEFAULT true,auto_run boolean NOT NULL DEFAULT true,refs jsonb NOT NULL DEFAULT '[]',base_url text NOT NULL,environment text NOT NULL DEFAULT '',tags jsonb NOT NULL DEFAULT '[]',threads integer NOT NULL DEFAULT 1 CHECK(threads BETWEEN 1 AND 16),timeout_seconds integer NOT NULL DEFAULT 900 CHECK(timeout_seconds BETWEEN 60 AND 7200),test_path text NOT NULL DEFAULT 'karate',openapi_path text NOT NULL DEFAULT '',auth jsonb NOT NULL DEFAULT '{}',variable_names jsonb NOT NULL DEFAULT '[]',variables bytea,perf jsonb,llm_provider_id uuid REFERENCES ` + s + `.llm_providers(id) ON DELETE SET NULL,allow_source_upload boolean NOT NULL DEFAULT false,revision bigint NOT NULL DEFAULT 1,updated_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
 		`CREATE TABLE IF NOT EXISTS ` + s + `.qa_runs(id uuid PRIMARY KEY,asset_id uuid NOT NULL REFERENCES ` + s + `.assets(id),assessment_id uuid REFERENCES ` + s + `.assessments(id),kind text NOT NULL CHECK(kind IN ('functional','performance')),trigger text NOT NULL,requested_by text NOT NULL,ref text NOT NULL DEFAULT '',commit text NOT NULL DEFAULT '',include_drafts boolean NOT NULL DEFAULT false,status text NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','submitted','running','passed','failed','error','cancelled','skipped')),cleanup boolean NOT NULL DEFAULT false,attempts integer NOT NULL DEFAULT 0,run_after timestamptz NOT NULL DEFAULT clock_timestamp(),lease uuid,lease_until timestamptz,submitted_at timestamptz,started_at timestamptz,completed_at timestamptz,base_url text NOT NULL DEFAULT '',operations jsonb NOT NULL DEFAULT '[]',base_paths jsonb NOT NULL DEFAULT '[]',summary jsonb NOT NULL DEFAULT '{}',coverage jsonb,perf jsonb,report_key text NOT NULL DEFAULT '',report_sha256 text NOT NULL DEFAULT '',error text NOT NULL DEFAULT '',created_at timestamptz NOT NULL DEFAULT clock_timestamp())`,
+		// Lint runs, and the profile's lint settings.
+		`ALTER TABLE ` + s + `.qa_runs DROP CONSTRAINT IF EXISTS qa_runs_kind_check`,
+		`ALTER TABLE ` + s + `.qa_runs ADD CONSTRAINT qa_runs_kind_check CHECK(kind IN ('functional','performance','lint'))`,
+		`ALTER TABLE ` + s + `.qa_profiles ADD COLUMN IF NOT EXISTS lint jsonb`,
+		`ALTER TABLE ` + s + `.qa_profiles ADD COLUMN IF NOT EXISTS ai_triage boolean NOT NULL DEFAULT false`,
+		`ALTER TABLE ` + s + `.qa_profiles ADD COLUMN IF NOT EXISTS functional boolean NOT NULL DEFAULT true`,
+		`ALTER TABLE ` + s + `.qa_profiles ADD COLUMN IF NOT EXISTS gate text NOT NULL DEFAULT 'assessment'`,
 		`CREATE INDEX IF NOT EXISTS qa_runs_queue_idx ON ` + s + `.qa_runs(run_after) WHERE status IN ('queued','submitted','running') OR cleanup`,
 		`CREATE INDEX IF NOT EXISTS qa_runs_asset_idx ON ` + s + `.qa_runs(asset_id,created_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS qa_runs_assessment_idx ON ` + s + `.qa_runs(assessment_id)`,
@@ -87,16 +108,29 @@ type QAProfile struct {
 	Perf              *QAPerf    `json:"perf"`
 	LLMProviderID     *uuid.UUID `json:"llm_provider_id"`
 	AllowSourceUpload bool       `json:"allow_source_upload"`
-	Revision          int64      `json:"revision"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	// Lint turns on linting of the assessed commit's source with the named
+	// linters; AutoRun applies to it as to functional runs.
+	Lint *qa.Lint `json:"lint"`
+	// AITriage sends each finished run's failures, load breaches and lint
+	// entries to the profile's LLM provider for a summary and advisories.
+	// It needs llm_provider_id, and the provider must be allowed to receive
+	// source code (self-hosted, or hosted and acknowledged).
+	AITriage bool `json:"ai_triage"`
+	// Functional queues a Karate run after each assessment (with AutoRun).
+	// A profile that only lints sets it false and needs no base_url.
+	Functional bool `json:"functional"`
+	// Gate is assessment (default) or none; see QAGateNone.
+	Gate      string    `json:"gate"`
+	Revision  int64     `json:"revision"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
-const profileColumns = `asset_id,enabled,auto_run,refs,base_url,environment,tags,threads,timeout_seconds,test_path,openapi_path,auth,variable_names,perf,llm_provider_id,allow_source_upload,revision,updated_at`
+const profileColumns = `asset_id,enabled,auto_run,refs,base_url,environment,tags,threads,timeout_seconds,test_path,openapi_path,auth,variable_names,perf,llm_provider_id,allow_source_upload,revision,updated_at,lint,ai_triage,functional,gate`
 
 func scanProfile(row pgx.Row, extra ...any) (QAProfile, error) {
 	var p QAProfile
-	var refs, tags, auth, names, perf []byte
-	targets := append([]any{&p.AssetID, &p.Enabled, &p.AutoRun, &refs, &p.BaseURL, &p.Environment, &tags, &p.Threads, &p.TimeoutSeconds, &p.TestPath, &p.OpenAPIPath, &auth, &names, &perf, &p.LLMProviderID, &p.AllowSourceUpload, &p.Revision, &p.UpdatedAt}, extra...)
+	var refs, tags, auth, names, perf, lint []byte
+	targets := append([]any{&p.AssetID, &p.Enabled, &p.AutoRun, &refs, &p.BaseURL, &p.Environment, &tags, &p.Threads, &p.TimeoutSeconds, &p.TestPath, &p.OpenAPIPath, &auth, &names, &perf, &p.LLMProviderID, &p.AllowSourceUpload, &p.Revision, &p.UpdatedAt, &lint, &p.AITriage, &p.Functional, &p.Gate}, extra...)
 	if err := row.Scan(targets...); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return p, ErrNotFound
@@ -105,6 +139,12 @@ func scanProfile(row pgx.Row, extra ...any) (QAProfile, error) {
 	}
 	if json.Unmarshal(refs, &p.Refs) != nil || json.Unmarshal(tags, &p.Tags) != nil || json.Unmarshal(auth, &p.Auth) != nil || json.Unmarshal(names, &p.VariableNames) != nil {
 		return p, errors.New("invalid QA profile data")
+	}
+	if len(lint) > 0 && string(lint) != "null" {
+		p.Lint = &qa.Lint{}
+		if json.Unmarshal(lint, p.Lint) != nil {
+			return p, errors.New("invalid QA profile data")
+		}
 	}
 	if len(perf) > 0 && string(perf) != "null" {
 		p.Perf = &QAPerf{}
@@ -125,8 +165,15 @@ func ValidQAPath(p string, file bool) bool {
 
 // Validate checks a profile; the QA package checks the shared parts.
 func (p QAProfile) Validate() error {
-	if err := qa.ValidBaseURL(p.BaseURL); err != nil {
-		return err
+	lintOnly := !p.Functional && p.Perf == nil
+	if lintOnly && p.Lint == nil {
+		return errors.New("a profile that does not run Karate tests (functional false, no perf) needs lint settings")
+	}
+	// A lint-only profile needs no deployed target; everything else does.
+	if p.BaseURL != "" || !lintOnly {
+		if err := qa.ValidBaseURL(p.BaseURL); err != nil {
+			return err
+		}
 	}
 	switch {
 	case p.Environment != "" && !envPattern.MatchString(p.Environment):
@@ -164,6 +211,17 @@ func (p QAProfile) Validate() error {
 		if err := p.Perf.Validate(); err != nil {
 			return err
 		}
+	}
+	if p.Lint != nil {
+		if err := p.Lint.Validate(); err != nil {
+			return err
+		}
+	}
+	if p.AITriage && p.LLMProviderID == nil {
+		return errors.New("ai_triage needs llm_provider_id")
+	}
+	if p.Gate != "" && p.Gate != QAGateAssessment && p.Gate != QAGateNone {
+		return errors.New("gate must be assessment or none")
 	}
 	return nil
 }
@@ -234,7 +292,19 @@ func (s *Store) PutQAProfile(ctx context.Context, p QAProfile, expected int64, s
 	if err != nil {
 		return p, err
 	}
-	details, _ := json.Marshal(map[string]any{"actor_id": actor, "base_url": saved.BaseURL, "enabled": saved.Enabled, "auto_run": saved.AutoRun, "variables_changed": sealed != nil, "llm_provider_id": saved.LLMProviderID, "allow_source_upload": saved.AllowSourceUpload})
+	var lint []byte
+	if p.Lint != nil {
+		lint, _ = json.Marshal(p.Lint)
+	}
+	gate := p.Gate
+	if gate == "" {
+		gate = QAGateAssessment
+	}
+	if _, err := tx.Exec(ctx, `UPDATE `+s.schema+`.qa_profiles SET lint=$2,ai_triage=$3,functional=$4,gate=$5 WHERE asset_id=$1`, p.AssetID, lint, p.AITriage, p.Functional, gate); err != nil {
+		return p, err
+	}
+	saved.Lint, saved.AITriage, saved.Functional, saved.Gate = p.Lint, p.AITriage, p.Functional, gate
+	details, _ := json.Marshal(map[string]any{"actor_id": actor, "lint": p.Lint, "ai_triage": p.AITriage, "gate": gate, "base_url": saved.BaseURL, "enabled": saved.Enabled, "auto_run": saved.AutoRun, "variables_changed": sealed != nil, "llm_provider_id": saved.LLMProviderID, "allow_source_upload": saved.AllowSourceUpload})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.audit_log(action,target_id,details) VALUES('qa_profile.saved',$1,$2)`, p.AssetID, details); err != nil {
 		return p, err
 	}
@@ -364,7 +434,7 @@ func scanQARun(row pgx.Row) (QARun, error) {
 // run automatically and covers the ref. A commit whose verdict is fail is
 // recorded as skipped, so its code never reaches the runner.
 func (s *Store) queueQA(ctx context.Context, tx pgx.Tx, a Assessment, verdict string) error {
-	if a.Request.Target.Type != "git" || a.Request.Import != nil || a.Request.Remediation != nil {
+	if a.Request.Target.Type != "git" || a.Request.Import != nil || a.Request.Remediation != nil || a.Request.SkipQA {
 		return nil
 	}
 	p, err := scanProfile(tx.QueryRow(ctx, `SELECT `+profileColumns+` FROM `+s.schema+`.qa_profiles WHERE asset_id=$1`, a.AssetID))
@@ -381,11 +451,35 @@ func (s *Store) queueQA(ctx context.Context, tx pgx.Tx, a Assessment, verdict st
 	if verdict == "fail" {
 		status, failure = "skipped", ErrQABlocked.Error()
 	}
+	if !p.Functional {
+		return s.queueLint(ctx, tx, a, p, status, failure)
+	}
 	run, err := scanQARun(tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.qa_runs(id,asset_id,assessment_id,kind,trigger,requested_by,ref,commit,status,error,completed_at) VALUES($1,$2,$3,'functional','assessment',$4,$5,$6,$7,$8,CASE WHEN $7='skipped' THEN clock_timestamp() END) RETURNING `+qaRunColumns, uuid.New(), a.AssetID, a.ID, "scrs", a.Request.Target.Ref, a.Commit, status, failure))
+	if err != nil {
+		return err
+	}
+	if status == "skipped" {
+		if err := s.emitQA(ctx, tx, run, nil); err != nil {
+			return err
+		}
+	}
+	if p.Lint == nil {
+		return nil
+	}
+	return s.queueLint(ctx, tx, a, p, status, failure)
+}
+
+// queueLint queues the profile's lint run for an assessment; a failed gate
+// records it as skipped, like a functional run.
+func (s *Store) queueLint(ctx context.Context, tx pgx.Tx, a Assessment, p QAProfile, status, failure string) error {
+	if p.Lint == nil {
+		return nil
+	}
+	lintRun, err := scanQARun(tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.qa_runs(id,asset_id,assessment_id,kind,trigger,requested_by,ref,commit,status,error,completed_at) VALUES($1,$2,$3,'lint','assessment',$4,$5,$6,$7,$8,CASE WHEN $7='skipped' THEN clock_timestamp() END) RETURNING `+qaRunColumns, uuid.New(), a.AssetID, a.ID, "scrs", a.Request.Target.Ref, a.Commit, status, failure))
 	if err != nil || status != "skipped" {
 		return err
 	}
-	return s.emitQA(ctx, tx, run, nil)
+	return s.emitQA(ctx, tx, lintRun, nil)
 }
 
 // unconfiguredQA returns a qa_unconfigured finding when a complete scan
@@ -410,30 +504,125 @@ func (s *Store) unconfiguredQA(ctx context.Context, tx pgx.Tx, a Assessment, r R
 	return &Finding{Type: "qa_unconfigured", AdvisoryID: "SCRS-QA-UNCONFIGURED", Title: "API has an OpenAPI document but no QA profile", Severity: "low", Score: severityScore["low"], Component: Component{Name: "qa-profile", Path: spec}, Evidence: evidence, Guidance: json.RawMessage(`{"summary":"Add a QA profile (PUT /assets/{id}/qa/profile) with the deployed base URL, then commit Karate features or generate drafts from the OpenAPI document.","automatic_changes":false}`)}, nil
 }
 
+// QAKindFull asks for every run the profile configures: functional (with a
+// base_url), performance when it does not follow a functional pass, and lint.
+const QAKindFull = "full"
+
+// QAEnqueue is a request for manual QA runs.
+type QAEnqueue struct {
+	Asset uuid.UUID
+	// Assessment names the assessment whose commit is tested. Without one, a
+	// profile with the assessment gate tests the latest successful git
+	// assessment; a profile with gate none tests the head of Ref.
+	Assessment    *uuid.UUID
+	Kind          string
+	IncludeDrafts bool
+	// Ref is a branch or tag for a run without an assessment; empty is the
+	// repository's default branch. It must match the profile's refs.
+	Ref string
+	By  string
+}
+
 // EnqueueQARun queues a run of an asset's latest successful git assessment,
 // or of the given one. Performance runs need the profile's perf settings.
 func (s *Store) EnqueueQARun(ctx context.Context, asset uuid.UUID, assessment *uuid.UUID, kind string, includeDrafts bool, by string) (QARun, error) {
-	if kind != qa.KindFunctional && kind != qa.KindPerformance {
-		return QARun{}, ErrInput
+	runs, err := s.EnqueueQA(ctx, QAEnqueue{Asset: asset, Assessment: assessment, Kind: kind, IncludeDrafts: includeDrafts, By: by})
+	if err != nil {
+		return QARun{}, err
 	}
-	p, err := s.QAProfileFor(ctx, asset)
+	return runs[0], nil
+}
+
+// EnqueueQA queues one run, or with kind full every run the profile
+// configures, in one transaction. A run tests an assessed commit unless the
+// profile's gate is none and no assessment is named; then the worker tests
+// the head of the ref and records the commit it resolved.
+func (s *Store) EnqueueQA(ctx context.Context, in QAEnqueue) ([]QARun, error) {
+	p, err := s.QAProfileFor(ctx, in.Asset)
 	if errors.Is(err, ErrNotFound) || (err == nil && !p.Enabled) {
-		return QARun{}, ErrQAProfile
+		return nil, ErrQAProfile
 	}
 	if err != nil {
-		return QARun{}, err
+		return nil, err
 	}
-	if kind == qa.KindPerformance && p.Perf == nil {
-		return QARun{}, errors.Join(ErrInput, errors.New("the QA profile has no perf settings"))
+	var kinds []string
+	switch in.Kind {
+	case qa.KindFunctional, qa.KindPerformance, qa.KindLint:
+		kinds = []string{in.Kind}
+	case QAKindFull:
+		functional := p.Functional && p.BaseURL != ""
+		if functional {
+			kinds = append(kinds, qa.KindFunctional)
+		}
+		if p.Perf != nil && (!p.Perf.AutoRun || !functional) {
+			kinds = append(kinds, qa.KindPerformance)
+		}
+		if p.Lint != nil {
+			kinds = append(kinds, qa.KindLint)
+		}
+		if len(kinds) == 0 {
+			return nil, errors.Join(ErrInput, errors.New("the QA profile configures nothing to run: set base_url for functional tests, perf, or lint"))
+		}
+	default:
+		return nil, ErrInput
 	}
-	a, err := s.qaAssessment(ctx, asset, assessment)
+	for _, kind := range kinds {
+		if (kind == qa.KindFunctional || kind == qa.KindPerformance) && p.BaseURL == "" {
+			return nil, errors.Join(ErrInput, errors.New("the QA profile has no base_url; functional and performance runs need a deployed target"))
+		}
+		if kind == qa.KindLint && p.Lint == nil {
+			return nil, errors.Join(ErrInput, errors.New("the QA profile has no lint settings"))
+		}
+		if kind == qa.KindPerformance && p.Perf == nil {
+			return nil, errors.Join(ErrInput, errors.New("the QA profile has no perf settings"))
+		}
+	}
+	var assessmentID *uuid.UUID
+	ref, commit := in.Ref, ""
+	if in.Assessment == nil && p.Gate == QAGateNone {
+		if ref != "" && (len(ref) > 255 || strings.ContainsAny(ref, "\x00\r\n") || !refMatches(p.Refs, ref)) {
+			return nil, errors.Join(ErrInput, errors.New("ref is not covered by the profile's refs"))
+		}
+	} else {
+		if in.Ref != "" {
+			return nil, errors.Join(ErrInput, errors.New("ref applies only to a profile with gate none and no assessment_id; an assessed run tests the assessment's commit"))
+		}
+		a, err := s.qaAssessment(ctx, in.Asset, in.Assessment)
+		if err != nil {
+			return nil, err
+		}
+		if a.Verdict == "fail" {
+			return nil, ErrQABlocked
+		}
+		assessmentID, ref, commit = &a.ID, a.Request.Target.Ref, a.Commit
+	}
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return QARun{}, err
+		return nil, err
 	}
-	if a.Verdict == "fail" {
-		return QARun{}, ErrQABlocked
+	defer tx.Rollback(ctx)
+	runs := make([]QARun, 0, len(kinds))
+	for _, kind := range kinds {
+		run, err := scanQARun(tx.QueryRow(ctx, `INSERT INTO `+s.schema+`.qa_runs(id,asset_id,assessment_id,kind,trigger,requested_by,ref,commit,include_drafts) VALUES($1,$2,$3,$4,'manual',$5,$6,$7,$8) RETURNING `+qaRunColumns, uuid.New(), in.Asset, assessmentID, kind, clip(in.By, 100), ref, commit, in.IncludeDrafts))
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
 	}
-	return scanQARun(s.pool.QueryRow(ctx, `INSERT INTO `+s.schema+`.qa_runs(id,asset_id,assessment_id,kind,trigger,requested_by,ref,commit,include_drafts) VALUES($1,$2,$3,$4,'manual',$5,$6,$7,$8) RETURNING `+qaRunColumns, uuid.New(), asset, a.ID, kind, clip(by, 100), a.Request.Target.Ref, a.Commit, includeDrafts))
+	return runs, tx.Commit(ctx)
+}
+
+// SetQARunCommit records the commit the worker resolved for a run that was
+// queued without an assessment. Only the lease holder may set it, once.
+func (s *Store) SetQARunCommit(ctx context.Context, r QARun, commit string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE `+s.schema+`.qa_runs SET commit=$3 WHERE id=$1 AND lease=$2 AND commit=''`, r.ID, r.Lease, commit)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrQAState
+	}
+	return nil
 }
 
 // qaAssessment returns the named assessment of the asset, or its latest
@@ -805,19 +994,12 @@ func (s *Store) QACoverageHistory(ctx context.Context, asset uuid.UUID, ref stri
 	return out, rows.Err()
 }
 
-// QAContext returns what the worker needs to prepare a run: the assessment
-// and the profile with its sealed variables.
-func (s *Store) QAContext(ctx context.Context, r QARun) (Assessment, QAProfile, []byte, error) {
-	if r.AssessmentID == nil {
-		return Assessment{}, QAProfile{}, nil, ErrQANoAssessment
-	}
-	a, err := s.Get(ctx, *r.AssessmentID)
-	if err != nil {
-		return a, QAProfile{}, nil, err
-	}
+// QAContext returns what the worker needs to prepare a run: the profile
+// with its sealed variables. A run may have no assessment (gate none).
+func (s *Store) QAContext(ctx context.Context, r QARun) (QAProfile, []byte, error) {
 	p, sealed, err := s.QAProfileSecret(ctx, r.AssetID)
 	if errors.Is(err, ErrNotFound) {
-		return a, p, nil, ErrQAProfile
+		return p, nil, ErrQAProfile
 	}
-	return a, p, sealed, err
+	return p, sealed, err
 }

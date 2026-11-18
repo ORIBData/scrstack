@@ -9,6 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"github.com/ORIBData/scrstack/internal/notify"
 )
 
 // Comment is one note on a register entry. Author is the API token that
@@ -55,7 +57,8 @@ func (s *Store) Assign(ctx context.Context, id, actor uuid.UUID, by, assignee, o
 	}
 	defer tx.Rollback(ctx)
 	var previous string
-	err = tx.QueryRow(ctx, `SELECT assignee FROM `+s.schema+`.findings WHERE id=$1 FOR UPDATE`, id).Scan(&previous)
+	var asset uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT assignee,asset_id FROM `+s.schema+`.findings WHERE id=$1 FOR UPDATE`, id).Scan(&previous, &asset)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -70,6 +73,9 @@ func (s *Store) Assign(ctx context.Context, id, actor uuid.UUID, by, assignee, o
 	}
 	details, _ := json.Marshal(map[string]any{"assignee": assignee, "previous": previous, "by": by, "on_behalf_of": onBehalfOf})
 	if _, err := tx.Exec(ctx, `INSERT INTO `+s.schema+`.finding_events(finding_id,actor_id,action,details) VALUES($1,$2,'assigned',$3)`, id, nullUUID(actor), details); err != nil {
+		return err
+	}
+	if _, err := notify.EmitScoped(ctx, tx, s.schema, "finding.assigned", map[string]any{"finding_id": id, "asset_id": asset, "assignee": assignee, "previous_assignee": previous, "by": by, "actor_id": actor, "link": notify.Link("/register/" + id.String() + "/events")}, nil, notify.Scope{Asset: asset}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

@@ -262,6 +262,34 @@ func notesFromFindings(findings []assessments.Finding) map[string][]review.ToolN
 	rank := map[string]int{"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 	out := map[string][]review.ToolNote{}
 	for _, f := range findings {
+		if f.Type == "qa_lint" {
+			// A linter's report on a file, from a lint run of this assessment.
+			var e struct {
+				Tool, Rule, Path string
+				Locations        []struct {
+					Line    int    `json:"line"`
+					Message string `json:"message"`
+				} `json:"locations"`
+			}
+			var raw map[string]json.RawMessage
+			if json.Unmarshal(f.Evidence, &raw) != nil {
+				continue
+			}
+			_ = json.Unmarshal(raw["tool"], &e.Tool)
+			_ = json.Unmarshal(raw["rule"], &e.Rule)
+			_ = json.Unmarshal(raw["path"], &e.Path)
+			_ = json.Unmarshal(raw["locations"], &e.Locations)
+			if e.Path == "" {
+				continue
+			}
+			for i, l := range e.Locations {
+				if i >= 5 {
+					break
+				}
+				out[e.Path] = append(out[e.Path], review.ToolNote{Tool: e.Tool, Rule: e.Rule, Line: l.Line, Severity: f.Severity, Title: l.Message})
+			}
+			continue
+		}
 		if f.Type != "sast" {
 			continue
 		}

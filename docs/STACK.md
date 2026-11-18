@@ -66,7 +66,7 @@ The runner has two entry paths, and only the first touches SCRS data:
 | Through Core | Worker, after a successful assessment that did not `fail` (or `POST /assets/{id}/qa/runs`) | Run, scenarios, coverage and `qa_*` findings stored; `qa.completed` and `qa.failed` events; report archived in S3 |
 | Direct | An operator or CI tool with the runner token and an allow-listed address | Functional (Karate API, UI) or performance (Gatling) job on the runner; the report is fetched from the runner. Nothing is recorded in SCRS, and the runner shares its slots with the first path |
 
-The runner never handles SBOMs, MBOMs, vulnerabilities, malware or integrity data. It has no lint job kind; a lint workflow would need a new kind or a Karate feature that drives a linter you provide.
+The runner never handles SBOMs, MBOMs, vulnerabilities, malware or integrity data. Besides Karate and load jobs it runs lint jobs over a source tree (ruff in the image; mypy, bandit, pylint, PHPStan, phpcs, clang-tidy and the Go, TypeScript, Kotlin, Swift and Dart linters in the lint image), and sees that source only for those jobs.
 
 ## Which settings join which parts
 

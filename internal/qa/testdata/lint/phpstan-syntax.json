@@ -1,0 +1,1 @@
+{"totals":{"errors":0,"file_errors":1},"files":{"/work/j/bundle/src/php/broken.php":{"errors":1,"messages":[{"message":"Syntax error, unexpected '{', expecting T_VARIABLE on line 2","line":2,"ignorable":false,"identifier":"phpstan.parse"}]}},"errors":[]}

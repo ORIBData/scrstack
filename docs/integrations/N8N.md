@@ -167,7 +167,45 @@ for a PR comment. For an AI triage agent, create the subscription with
 bounded context document, with `instructions_notice` and `untrusted_paths`
 listing every string that came from outside SCRS.
 
-## 5. Reconcile after outages
+## 5. Run QA from a workflow
+
+QA (functional, load and lint) can run on its own, with or without a security
+assessment. Give n8n a token that can do only that:
+
+```bash
+curl -sX POST "$BASE/tokens" -H "Authorization: Bearer $ADMIN" -H 'Content-Type: application/json' \
+  -d '{"name":"n8n-qa","scopes":["qa"],"ip_allow_list":["203.0.113.10/32"]}'
+```
+
+A `qa` token can read QA profiles, runs, reports and coverage and start or
+cancel runs. It cannot start or read assessments, list assets, or change
+settings, so a leaked QA key exposes no security results.
+
+- **Set-up, once per repository (admin).** `PUT /scrs/v1/assets/{id}/qa/profile`
+  with the deployed `base_url` and, for lint, `lint.tools`. Keep the default
+  `"gate": "assessment"` to test only commits that passed an assessment (a `fail`
+  verdict blocks the run), or set `"gate": "none"` to test the head of a branch
+  with no assessment at all. Use `none` only for repositories you control: their
+  tests and linter configuration run on the QA runner without the security scan
+  having looked at them.
+- **Start.** `POST /scrs/v1/assets/{asset_id}/qa/runs` with
+  `{"kind":"full","ref":"main"}`. `full` queues every run the profile
+  configures. The answer is `202` with `runs[]` and the first run's `job_id`.
+  `ref` applies only with `gate: none`; otherwise the run tests the latest
+  assessed commit, or the one named in `assessment_id`.
+- **Know when it is done.** Subscribe to `qa.completed` and `qa.failed`
+  (`POST /webhooks`), or poll `GET /scrs/v1/qa/runs/{id}` until `status` is
+  `passed`, `failed`, `error`, `cancelled` or `skipped`.
+- **Read the result.** `GET /qa/runs/{id}/scenarios?status=failed` for failing
+  tests, `/qa/runs/{id}/report` for the full archive, and
+  `GET /register?type=qa_lint` for lint entries (needs a `read` token; the
+  `qa` token itself does not read the register).
+- **Retries.** QA starts are not deduplicated by `Idempotency-Key`. Before a
+  retry, check `GET /assets/{id}/qa/runs?status=queued` so a flaky network does
+  not queue the same run twice.
+- **Keep QA out of an assessment** with `"skip_qa": true` on `POST /assessments`.
+
+## 6. Reconcile after outages
 
 GitHub and registries do not guarantee delivery. The nightly workflow calls
 `POST /scrs/v1/maintenance/rescan` (admin token), which queues the default

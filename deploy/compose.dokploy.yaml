@@ -442,6 +442,10 @@ services:
     environment:
       SCRS_QA_RUNNER_TOKEN: ${SCRS_QA_RUNNER_TOKEN:?Set SCRS_QA_RUNNER_TOKEN}
       SCRS_QA_RUNNER_SLOTS: ${SCRS_QA_RUNNER_SLOTS:-1}
+      # Lint jobs install a project's locked dependencies (Go, npm, Dart, Composer;
+      # no scripts or plugins) only when "true"; it needs outbound access to the
+      # package hosts. See docs/QA_TESTING.md#lint.
+      SCRS_QA_RUNNER_LINT_DEPS: ${SCRS_QA_RUNNER_LINT_DEPS:-false}
       SCRS_QA_RUNNER_MAX_QUEUED: ${SCRS_QA_RUNNER_MAX_QUEUED:-20}
       SCRS_QA_RUNNER_RETENTION_HOURS: ${SCRS_QA_RUNNER_RETENTION_HOURS:-24}
       # Tests run as this user: they cannot read the runner's token.

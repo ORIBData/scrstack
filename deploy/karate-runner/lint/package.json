@@ -1,0 +1,12 @@
+{
+  "name": "scrs-lint-eslint",
+  "private": true,
+  "description": "ESLint for the SCRS QA runner's lint jobs, with the configuration used for repositories that have none. The lockfile pins every package by integrity hash.",
+  "dependencies": {
+    "@eslint/js": "9.39.5",
+    "eslint": "9.39.5",
+    "globals": "17.14.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.73.0"
+  }
+}

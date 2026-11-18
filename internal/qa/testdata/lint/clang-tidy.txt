@@ -1,0 +1,21 @@
+/work/j/bundle/src/c/main.c:7:12: warning: Potential leak of memory pointed to by 'p' [clang-analyzer-unix.Malloc]
+    7 |     return twice(*p);
+      |            ^
+/work/j/bundle/src/c/main.c:5:14: note: Memory is allocated
+    5 |     int *p = malloc(sizeof(int));
+      |              ^~~~~~~~~~~~~~~~~~~
+/work/j/bundle/src/c/main.c:7:12: note: Potential leak of memory pointed to by 'p'
+    7 |     return twice(*p);
+      |            ^
+/work/j/bundle/src/c/main.c:12:12: warning: Dereference of null pointer (loaded from variable 'r') [clang-analyzer-core.NullDereference]
+   12 |     return *r + *q;
+      |            ^~
+/work/j/bundle/src/c/main.c:11:5: note: 'r' initialized to a null pointer value
+   11 |     int *r = NULL;
+      |     ^~~~~~
+/work/j/bundle/src/c/main.c:12:12: note: Dereference of null pointer (loaded from variable 'r')
+   12 |     return *r + *q;
+      |            ^~
+/work/j/bundle/src/c/third.cpp:1:10: error: 'boost/thing.hpp' file not found [clang-diagnostic-error]
+    1 | #include <boost/thing.hpp>
+      |          ^~~~~~~~~~~~~~~~~

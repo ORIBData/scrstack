@@ -34,6 +34,9 @@ type AISummaryOptions struct {
 	// MaxAdvisories is how many findings get an advisory, most important
 	// first (default 10, at most 30).
 	MaxAdvisories int `json:"max_advisories,omitempty"`
+	// QARunID makes the job a triage of one finished QA run: a summary and
+	// advisories for that run's failures, load breaches and lint entries.
+	QARunID *uuid.UUID `json:"qa_run_id,omitempty"`
 }
 
 // AISummary is one summary job.
@@ -210,6 +213,64 @@ func (s *Store) AdvisoryTexts(ctx context.Context, ids []string) (map[string]str
 		if _, seen := out[id]; !seen && text != "" {
 			out[id] = clip(text, 1500)
 		}
+	}
+	return out, rows.Err()
+}
+
+// EnqueueQATriage queues an AI triage of a finished QA run. The entries it
+// describes carry paths, test names and failure text, so source answers
+// whether the provider may receive that (the same rule as code review).
+// Two triages of one run never run at once.
+func (s *Store) EnqueueQATriage(ctx context.Context, run, provider uuid.UUID, by string, source func(LLMProvider) bool) (AISummary, error) {
+	r, err := s.QARunByID(ctx, run)
+	if err != nil {
+		return AISummary{}, err
+	}
+	if r.AssessmentID == nil {
+		return AISummary{}, ErrQATriageUnassessed
+	}
+	if r.Status != "passed" && r.Status != "failed" {
+		return AISummary{}, ErrQAState
+	}
+	p, err := s.LLMProviderByID(ctx, provider)
+	if err != nil || !p.Enabled {
+		return AISummary{}, ErrAISummaryProvider
+	}
+	if !source(p) {
+		return AISummary{}, ErrQASource
+	}
+	var active bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.ai_summaries WHERE options->>'qa_run_id'=$1 AND status IN ('queued','running'))`, run.String()).Scan(&active); err != nil {
+		return AISummary{}, err
+	}
+	if active {
+		return AISummary{}, ErrConflict
+	}
+	return s.EnqueueAISummary(ctx, *r.AssessmentID, provider, AISummaryOptions{MaxAdvisories: 15, QARunID: &run}, by)
+}
+
+// QATriageExists reports whether a triage of the run is queued, running or
+// done, so an automatic one is not queued twice.
+func (s *Store) QATriageExists(ctx context.Context, run uuid.UUID) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM `+s.schema+`.ai_summaries WHERE options->>'qa_run_id'=$1 AND status IN ('queued','running','succeeded'))`, run.String()).Scan(&exists)
+	return exists, err
+}
+
+// QATriages lists the triage jobs of a QA run, newest first.
+func (s *Store) QATriages(ctx context.Context, run uuid.UUID) ([]AISummary, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+aiSummaryColumns+` FROM `+s.schema+`.ai_summaries WHERE options->>'qa_run_id'=$1 ORDER BY created_at DESC,id DESC LIMIT 50`, run.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AISummary{}
+	for rows.Next() {
+		r, err := scanAISummary(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

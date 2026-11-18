@@ -94,7 +94,7 @@ func (s *Store) SyncBootstrap(ctx context.Context, supplied string) (string, err
 
 func (s *Store) CreateToken(ctx context.Context, input Token, actor uuid.UUID) (Token, string, error) {
 	input.Name = strings.TrimSpace(input.Name)
-	if len(input.Name) < 1 || len(input.Name) > 100 || input.Name == "bootstrap" || len(input.Scopes) == 0 || len(input.Scopes) > 5 || len(input.Networks) > 32 {
+	if len(input.Name) < 1 || len(input.Name) > 100 || input.Name == "bootstrap" || len(input.Scopes) == 0 || len(input.Scopes) > 6 || len(input.Networks) > 32 {
 		return Token{}, "", ErrTokenInput
 	}
 	seen := map[string]bool{}
@@ -104,7 +104,7 @@ func (s *Store) CreateToken(ctx context.Context, input Token, actor uuid.UUID) (
 		}
 		seen[scope] = true
 		switch scope {
-		case "admin", "read", "write", "trigger", "ingest:relay":
+		case "admin", "read", "write", "trigger", "qa", "ingest:relay":
 		default:
 			return Token{}, "", ErrTokenInput
 		}

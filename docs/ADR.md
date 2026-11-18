@@ -43,6 +43,8 @@ These records cover the PRD's ADR list (section 8.9) and the decisions taken whi
 | ADR-032 | PDF reports from a built-in, deterministic writer | Accepted |
 | ADR-033 | Dependency-Track export through a transactional upload queue | Accepted |
 | ADR-034 | Guarded model calls, self-hosted embeddings and a portable knowledge store | Accepted |
+| ADR-035 | Version 1 scope: what the open PRD rows deliver and what is descoped | Proposed |
+| ADR-036 | QA runs without a security assessment, behind a per-asset gate and a QA-only token scope | Accepted |
 
 ## ADR-001 Go module
 
@@ -386,3 +388,49 @@ Finding types without a CWE (vulnerable and malicious dependencies, integrity, s
 
 **Consequences (original):** source code was sent only to a self-hosted model; Amendment 3 makes a hosted provider possible by opt-in. A provider is `local` when its host is in `SCRS_LLM_PRIVATE_HOSTS`, checked when a code review or unit-test generation is requested and again when the worker runs it. AI code review stores report-only `ai_review` entries marked unverified, never part of a verdict. See [LLM_KNOWLEDGE.md](LLM_KNOWLEDGE.md#decision-where-source-code-may-go-amended-2026-11-16).
 
+
+## ADR-035 Version 1 scope
+
+**Status:** Proposed 2026-11-17, awaiting the product owner. It answers step 1 of "Before declaring the PRD complete" in [PRD_PROGRESS_AND_AUDIT.md](PRD_PROGRESS_AND_AUDIT.md). Nothing here changes the stack's connections or scopes.
+
+**Decision:** every open PRD row is either in version 1 as delivered, or descoped with the revisit condition below. A descoped row is not a defect and keeps its requirement ID.
+
+**In version 1 as delivered** (the remaining limits are documented in the audit and are not release blockers):
+- Assets (AST-001, ING-006), except QA runs and remediation for uploaded sources.
+- Register (RR-008, RR-010, RR-012, RR-014), including the `finding.assigned` event.
+- The QA runner's lint job kind (ruff, mypy, bandit, pylint, PHPStan, phpcs, clang-tidy, golangci-lint, ESLint, ktlint, SwiftLint and dart analyze) and AI triage of QA results, delivered 2026-11-17 after this ADR was drafted.
+- SBOM diff (SBM-005), local advisories (OSV-008), malicious-dependency signals (MAL-004 to MAL-006), integrity rules (INT-003, INT-012, INT-014, INT-015, INT-018) without signed-to-unsigned detection, asset links (CON-012) as `built_from`, guided remediation (REM-002), operations and `202` with `job_id`, and import-level reachability for npm and PyPI plus govulncheck for Go (REA-005).
+
+**Descoped from version 1:**
+
+| Requirement | Why | Revisit when |
+| --- | --- | --- |
+| VUL-007 CPE matching | The pipeline has no component without a package URL, so matching would have nothing to run on (spike S14). | Spike S14 shows a binary cataloger plus an NVD CPE cache with an acceptable false-positive rate on real images, or customers import CycloneDX with `cpe`. |
+| REA-012 call graphs beyond Go (Java/Kotlin, Python, C#) | Each language needs its own analyzer and a false-positive measurement on real repositories (spike S12). Import-level results already cover npm and PyPI, and `unknown` is reported otherwise, never `not_reachable`. | A customer needs reachability for one of these languages; start with Python. |
+| REA-010 taint traces across a library boundary | Depends on REA-012 call graphs. | After REA-012 for the language in question. |
+| INT-003 signed-to-unsigned commit detection | A push payload carries no signature data, and a git archive carries no author. | A source that supplies signature data is connected. |
+| INT-013 sweep of events older than retention | Optional in the PRD. | A customer asks for an initial history sweep. |
+| `deployed_from` asset links | There is no deployment inventory to read it from. | Kubernetes or registry-pull inventory exists. |
+| Progress percentages, scheduled maintenance in `GET /jobs` | Jobs already report state, attempts and errors; maintenance stays in `GET /maintenance/schedule`. | A frontend needs a single progress view. |
+| Comment editing, user accounts, in-app notifications | SCRS has no user model by design; assignees are free text and events go out through webhooks. | A user model is introduced. |
+
+**Not a scope decision, still required before release:** the external acceptance list in [STAGING_ACCEPTANCE.md](STAGING_ACCEPTANCE.md), and the real-world checks that need outside systems (OpenCTI, MISP or AIS feeds, hosted LLM keys, the owner's VM, staging). They gate the release, not the requirement list.
+
+**Consequences:** the PRD's open rows can be closed as delivered or as descoped here, and the audit's step 1 is complete once this is Accepted. Descoped rows must be removed from release notes' promises, and a customer-visible mention of any of them points to this ADR.
+
+## ADR-036 QA without a security assessment
+
+**Status:** Accepted 2026-11-18.
+
+**Context:** QA runs tested only a commit that had passed a security assessment. A team that wants functional, performance or lint QA on its own schedule, or an assessment with no QA, could do neither, and an automation key that could start QA could also start assessments.
+
+**Decision:**
+- SCRS (API and worker) stays the one orchestrator. QA and security assessments share the register, the events, the runner and the token system; nothing is split into a second service or key store.
+- Each QA profile has a `gate`: `assessment` (default, the previous behaviour) or `none`. With `none`, `POST /assets/{id}/qa/runs` needs no assessment: the worker resolves the requested ref to a commit when the run starts and records it. `kind: full` queues every run the profile configures.
+- An assessment can opt out of QA with `skip_qa`. Without it, QA stays part of the assessment as before.
+- A new `qa` token scope reads QA data and starts or cancels runs and reaches nothing else. Only `admin` can change a profile, so the gate cannot be switched by the key that uses it.
+
+**Consequences:**
+- With `gate: none`, repository tests and linter configuration run on the runner without the security gate having seen that commit. The runner is already isolated, and the gate is off by default; the choice is per repository and admin-only.
+- Runs without an assessment have `assessment_id: null`. Their register entries are not linked to an assessment, and the verdict never changes either way.
+- No new environment variable or image change; the `gate` column is added at start-up.

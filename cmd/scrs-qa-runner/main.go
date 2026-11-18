@@ -9,12 +9,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/qa"
 	"github.com/ORIBData/scrstack/internal/qarunner"
 )
 
@@ -60,20 +62,37 @@ func run(logger *slog.Logger) error {
 			pass = append(pass, name)
 		}
 	}
+	// A linter is available when its executable is found. The default
+	// command is the tool's name; SCRS_QA_RUNNER_LINT_<TOOL> overrides it
+	// (RUFF, GOLANGCI_LINT, ESLINT).
+	lint := map[string]string{}
+	for tool := range qa.LintTools {
+		key := "SCRS_QA_RUNNER_LINT_" + strings.ToUpper(strings.ReplaceAll(tool, "-", "_"))
+		if path, err := exec.LookPath(setting(key, qa.LintExecutable(tool))); err == nil {
+			lint[tool] = path
+		}
+	}
+	eslintFallback := setting("SCRS_QA_RUNNER_ESLINT_FALLBACK", "/opt/eslint/eslint.config.mjs")
+	if _, err := os.Stat(eslintFallback); err != nil {
+		eslintFallback = ""
+	}
 	server, err := qarunner.New(qarunner.Config{
-		Token:         token,
-		WorkDir:       setting("SCRS_QA_RUNNER_WORKDIR", "/work"),
-		Slots:         number("SCRS_QA_RUNNER_SLOTS", 1, 1, 16),
-		MaxQueued:     number("SCRS_QA_RUNNER_MAX_QUEUED", 20, 1, 500),
-		Karate:        strings.Fields(setting("SCRS_QA_RUNNER_KARATE", "karate")),
-		Java:          setting("SCRS_QA_RUNNER_JAVA", "java"),
-		PerfClasspath: os.Getenv("SCRS_QA_RUNNER_PERF_CLASSPATH"),
-		KarateVersion: os.Getenv("SCRS_QA_RUNNER_KARATE_VERSION"),
-		JobUID:        number("SCRS_QA_RUNNER_JOB_UID", 0, 0, 1<<30),
-		JobGID:        number("SCRS_QA_RUNNER_JOB_GID", 0, 0, 1<<30),
-		Retention:     time.Duration(number("SCRS_QA_RUNNER_RETENTION_HOURS", 24, 1, 720)) * time.Hour,
-		PassEnv:       pass,
-		Logger:        logger,
+		Lint:           lint,
+		LintDeps:       os.Getenv("SCRS_QA_RUNNER_LINT_DEPS") == "true",
+		ESLintFallback: eslintFallback,
+		Token:          token,
+		WorkDir:        setting("SCRS_QA_RUNNER_WORKDIR", "/work"),
+		Slots:          number("SCRS_QA_RUNNER_SLOTS", 1, 1, 16),
+		MaxQueued:      number("SCRS_QA_RUNNER_MAX_QUEUED", 20, 1, 500),
+		Karate:         strings.Fields(setting("SCRS_QA_RUNNER_KARATE", "karate")),
+		Java:           setting("SCRS_QA_RUNNER_JAVA", "java"),
+		PerfClasspath:  os.Getenv("SCRS_QA_RUNNER_PERF_CLASSPATH"),
+		KarateVersion:  os.Getenv("SCRS_QA_RUNNER_KARATE_VERSION"),
+		JobUID:         number("SCRS_QA_RUNNER_JOB_UID", 0, 0, 1<<30),
+		JobGID:         number("SCRS_QA_RUNNER_JOB_GID", 0, 0, 1<<30),
+		Retention:      time.Duration(number("SCRS_QA_RUNNER_RETENTION_HOURS", 24, 1, 720)) * time.Hour,
+		PassEnv:        pass,
+		Logger:         logger,
 	})
 	if err != nil {
 		return err

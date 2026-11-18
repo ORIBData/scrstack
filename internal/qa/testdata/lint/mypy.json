@@ -1,0 +1,2 @@
+{"file": "app/main.py", "line": 18, "column": 11, "end_line": 18, "end_column": 22, "message": "Incompatible return value type (got \"int\", expected \"str\")", "hint": null, "code": "return-value", "severity": "error"}
+{"file": "app/main.py", "line": 18, "column": 15, "end_line": 18, "end_column": 18, "message": "Argument 1 to \"add\" has incompatible type \"str\"; expected \"int\"", "hint": null, "code": "arg-type", "severity": "error"}

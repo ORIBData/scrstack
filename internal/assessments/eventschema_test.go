@@ -118,6 +118,7 @@ func TestEventPayloadsMatchSchemas(t *testing.T) {
 		"finding.created":                with(map[string]any{"findings": []any{brief}}),
 		"finding.rescored":               with(map[string]any{"findings": []any{rescored}}),
 		"malicious_dependency.reported":  with(map[string]any{"findings": []any{brief}}),
+		"finding.assigned":               map[string]any{"finding_id": f.ID, "asset_id": a.AssetID, "assignee": "sec-team", "previous_assignee": "", "by": "x", "actor_id": uuid.New(), "link": "x"},
 		"finding.status_changed":         map[string]any{"finding_id": f.ID, "asset_id": a.AssetID, "previous_status": "open", "status": "triaged", "waiver_until": nil, "actor_id": uuid.New(), "link": "x"},
 		"integrity.alert":                map[string]any{"source": "event", "kind": "force_push", "severity": "high", "title": "t", "repository": "org/api", "ref": "main"},
 		"feed.stale":                     map[string]any{"feed": "osv", "detail": "stale"},

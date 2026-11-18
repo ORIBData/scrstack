@@ -109,7 +109,7 @@ A pay-per-token bill needs a ceiling. Besides the per-assessment budget, every *
 
 **Summaries in reports.** A report requested with `params.include_ai_summaries: true` adds each asset's newest assessment summary to the json, Markdown and PDF output under an "AI-written summaries (unverified)" heading with a notice; it changes no count, mapping or gap, and csv is unchanged.
 
-Not yet built: running real linters in the QA runner and merging their output into the AI review (the review still reads the static-analysis findings, not a linter's), and automatic backfill on a schedule. QA test generation gets the guard automatically because it uses the client.
+Real linters run in the QA runner as a lint job kind ([QA_TESTING.md](QA_TESTING.md#lint)), and the review shows the model a file's lint findings next to its static-analysis findings. Not yet built: automatic backfill on a schedule. QA test generation gets the guard automatically because it uses the client.
 
 ## Next
 
@@ -117,7 +117,7 @@ Not yet built: running real linters in the QA runner and merging their output in
 2. **Advisory enrichment and report text:** per-finding advisories and per-assessment and per-asset summaries stored first, then rendered into the PDF so reports stay deterministic.
 3. **API:** read the chronicle and search per asset; trigger or regenerate; scopes and OpenAPI as for the rest of the contract.
 4. **Session memory:** conversation state for an analyst asking questions about an asset, stored in PostgreSQL with the same screening and retention, and retrieval from the knowledge store.
-6. **Real linters in the QA runner**, merged with the model's review in one result. Needs a job-kind design (the runner has only functional and performance today).
+6. ~~Real linters in the QA runner~~ Delivered 2026-11-17 (lint job kind with ruff in the image; mypy, bandit, pylint, PHPStan, phpcs, clang-tidy, golangci-lint, ESLint, ktlint, SwiftLint and dart analyze in the lint image), with AI triage of QA results ([QA_TESTING.md](QA_TESTING.md#ai-triage-of-qa-results)).
    - The AI review is already stored as `ai_review` entries; the merge adds linter results beside them under one asset view.
 7. **pgvector backend**, if your server has it.
 

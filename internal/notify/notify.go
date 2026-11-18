@@ -34,6 +34,7 @@ var Events = map[string]bool{
 	"assessment.failed":              true,
 	"finding.created":                true,
 	"finding.status_changed":         true,
+	"finding.assigned":               true,
 	"finding.rescored":               true,
 	"malicious_dependency.reported":  true,
 	"integrity.alert":                true,

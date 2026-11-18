@@ -261,7 +261,7 @@ func TestPostgresQAPipeline(t *testing.T) {
 	}
 	vars, _ := json.Marshal(map[string]string{"API_TOKEN": "qa-secret-value"})
 	sealed, _ := providers.Seal(vars, assessments.QAAAD(first.AssetID))
-	profile := assessments.QAProfile{AssetID: first.AssetID, Enabled: true, AutoRun: true, Refs: []string{"main"}, BaseURL: "https://staging.example.com", Environment: "staging", Threads: 2, TimeoutSeconds: 600, TestPath: "karate", Auth: assessments.QAAuth{Header: "Authorization", Variable: "API_TOKEN", Prefix: "Bearer "}, VariableNames: []string{"API_TOKEN"}, LLMProviderID: &provider.ID, AllowSourceUpload: true}
+	profile := assessments.QAProfile{AssetID: first.AssetID, Enabled: true, AutoRun: true, Functional: true, Refs: []string{"main"}, BaseURL: "https://staging.example.com", Environment: "staging", Threads: 2, TimeoutSeconds: 600, TestPath: "karate", Auth: assessments.QAAuth{Header: "Authorization", Variable: "API_TOKEN", Prefix: "Bearer "}, VariableNames: []string{"API_TOKEN"}, LLMProviderID: &provider.ID, AllowSourceUpload: true}
 	if _, err := jobs.PutQAProfile(ctx, profile, 0, sealed, uuid.Nil); err != nil {
 		t.Fatal(err)
 	}
@@ -779,8 +779,16 @@ func TestPostgresQAPipeline(t *testing.T) {
 	}
 	var cleanup bool
 	_ = pool.QueryRow(ctx, `SELECT cleanup FROM `+schema+`.qa_runs WHERE id=$1`, cancelled.ID).Scan(&cleanup)
-	if _, err := w.QARunner.Status(ctx, cancelled.ID.String()); err != qa.ErrUnknownJob || cleanup {
-		t.Fatal("cancelled job left on the runner", err, cleanup)
+	// A running job removes itself a moment after it stops, so wait for it.
+	var statusErr error
+	for i := 0; i < 100; i++ {
+		if _, statusErr = w.QARunner.Status(ctx, cancelled.ID.String()); statusErr == qa.ErrUnknownJob {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if statusErr != qa.ErrUnknownJob || cleanup {
+		t.Fatal("cancelled job left on the runner", statusErr, cleanup)
 	}
 	if _, err := jobs.CancelQARun(ctx, cancelled.ID, "tester"); err != assessments.ErrQAState {
 		t.Fatal("finished run cancelled again", err)

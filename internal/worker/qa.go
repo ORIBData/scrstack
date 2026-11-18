@@ -122,6 +122,43 @@ func (w Worker) fetchCommit(ctx context.Context, a assessments.Assessment, commi
 	return archive, nil
 }
 
+// fetchSource downloads the source of a QA run: its assessed commit, or the
+// head of its ref when it has no assessment (an empty ref is the default
+// branch). It returns the commit it resolved.
+func (w Worker) fetchSource(ctx context.Context, r assessments.QARun) ([]byte, string, error) {
+	asset, err := w.Connections.Asset(ctx, r.AssetID)
+	if err != nil {
+		return nil, "", assessments.ErrScope
+	}
+	name, err := w.Connections.NameByID(ctx, asset.ConnectionID)
+	if err != nil {
+		return nil, "", assessments.ErrScope
+	}
+	c, secret, err := w.Connections.Get(ctx, name)
+	if err != nil {
+		return nil, "", err
+	}
+	if !c.Enabled {
+		return nil, "", assessments.ErrScope
+	}
+	source := w.Source
+	if source == nil {
+		source = connections.NewNativeAdapters()
+	}
+	ref := ""
+	if r.Commit == "" {
+		ref = r.Ref
+	}
+	archive, resolved, _, err := source.Snapshot(ctx, c, secret, asset.Locator, ref, r.Commit)
+	if err != nil {
+		return nil, "", err
+	}
+	if r.Commit != "" && resolved != r.Commit {
+		return nil, "", errors.New("source host returned another commit")
+	}
+	return archive, resolved, nil
+}
+
 // unseal opens a sealed JSON value bound to aad.
 func (w Worker) unseal(sealed, aad []byte, into any) error {
 	if len(sealed) == 0 {
@@ -161,9 +198,10 @@ const (
 	maxTestBytes = 24 << 20
 )
 
-// submitQA prepares a run's bundle from the assessed commit and submits it.
+// submitQA prepares a run's bundle from the assessed commit, or from the head
+// of the ref for a run without an assessment, and submits it.
 func (w Worker) submitQA(ctx context.Context, r assessments.QARun) error {
-	a, profile, sealed, err := w.Store.QAContext(ctx, r)
+	profile, sealed, err := w.Store.QAContext(ctx, r)
 	if errors.Is(err, assessments.ErrQAProfile) || (err == nil && !profile.Enabled) {
 		return w.failQA(ctx, r, "the asset's QA profile was removed or disabled", nil)
 	}
@@ -174,12 +212,21 @@ func (w Worker) submitQA(ctx context.Context, r assessments.QARun) error {
 	if err := w.unseal(sealed, assessments.QAAAD(r.AssetID), &variables); err != nil {
 		return w.failQA(ctx, r, err.Error(), nil)
 	}
-	archive, err := w.fetchCommit(ctx, a, r.Commit)
+	archive, resolved, err := w.fetchSource(ctx, r)
 	if errors.Is(err, assessments.ErrScope) {
 		return w.failQA(ctx, r, "the asset's connection is disabled or out of scope", nil)
 	}
 	if err != nil {
 		return w.retryQA(ctx, r, err)
+	}
+	if r.Commit == "" {
+		if err := w.Store.SetQARunCommit(ctx, r, resolved); err != nil {
+			return w.retryQA(ctx, r, err)
+		}
+		r.Commit = resolved
+	}
+	if r.Kind == qa.KindLint {
+		return w.submitLint(ctx, r, profile, archive)
 	}
 	testPath := strings.Trim(profile.TestPath, "/")
 	snap, err := qa.ReadSnapshot(archive, func(rel string, size int64) bool {
@@ -369,6 +416,7 @@ func (w Worker) pollQA(ctx context.Context, r assessments.QARun) error {
 	if err := w.Store.FinishQARun(context.WithoutCancel(ctx), r, outcome); err != nil {
 		return err
 	}
+	w.autoTriage(context.WithoutCancel(ctx), r, outcome)
 	if err := w.QARunner.Delete(ctx, r.ID.String()); err != nil {
 		w.Logger.Warn("runner job not removed; it expires with the runner's retention", "qa_run_id", r.ID, "error", err)
 	}
@@ -406,6 +454,17 @@ func qaOutcome(r assessments.QARun, status qa.JobStatus, report qa.Report) asses
 		}
 		data, _ := json.Marshal(base)
 		return data
+	}
+	if r.Kind == qa.KindLint {
+		if r.Coverage != nil {
+			for i, problem := range r.Coverage.Problems {
+				o.Findings = append(o.Findings, lintConfigFinding(r, fmt.Sprintf("setup-%d", i), problem))
+			}
+		}
+		findings, closes := lintOutcome(r, report, ran)
+		o.Findings = append(o.Findings, findings...)
+		o.Closes = closes
+		return o
 	}
 	if r.Coverage != nil {
 		for i, problem := range r.Coverage.Problems {

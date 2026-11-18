@@ -20,6 +20,9 @@ func (s *Server) command(ctx context.Context, j *job, name string, args []string
 	cmd.Dir = dir
 	cmd.Env = s.environment(j)
 	cmd.Stdout, cmd.Stderr = console, console
+	if j.stdout != nil {
+		cmd.Stdout = j.stdout
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if s.cfg.JobUID != 0 {
 		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: uint32(s.cfg.JobUID), Gid: uint32(s.cfg.JobGID), NoSetGroups: true}

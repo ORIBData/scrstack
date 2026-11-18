@@ -33,3 +33,16 @@ func TestNotesFromFindingsGroupsStaticAnalysisByFile(t *testing.T) {
 		t.Fatal("no findings, no notes")
 	}
 }
+
+func TestNotesFromFindingsIncludesLintEntries(t *testing.T) {
+	evidence, _ := json.Marshal(map[string]any{"tool": "ruff", "rule": "F401", "path": "app/main.py", "locations": []map[string]any{{"line": 1, "message": "os imported but unused"}, {"line": 4, "message": "sys imported but unused"}}})
+	notes := notesFromFindings([]assessments.Finding{
+		{Type: "qa_lint", Severity: "low", Evidence: evidence},
+		{Type: "qa_lint", Severity: "low", Evidence: json.RawMessage(`not json`)},
+		{Type: "qa_lint", Severity: "low", Evidence: json.RawMessage(`{"tool":"ruff","rule":"X"}`)}, // no path
+	})
+	got := notes["app/main.py"]
+	if len(notes) != 1 || len(got) != 2 || got[0].Tool != "ruff" || got[0].Rule != "F401" || got[0].Line != 1 || got[1].Line != 4 || got[0].Title != "os imported but unused" {
+		t.Fatalf("%+v", notes)
+	}
+}

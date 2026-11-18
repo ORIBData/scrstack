@@ -29,6 +29,24 @@ scenarios, API coverage, qa_* findings, qa.completed / qa.failed events
   - Runs that outlive their timeout by 30 minutes are ended with an error.
 - **Order of work.** Runs move through `queued → submitted → running → passed | failed | error`; `cancelled` and `skipped` are also possible. At most `SCRS_QA_MAX_ACTIVE` runs are on the runner at once.
 
+## QA with or without a security assessment
+
+QA is part of an assessment by default and can also run on its own. SCRS (API and worker) is the single orchestrator in both cases: the same endpoints, the same runner, the same register entries.
+
+| You want | Do this |
+|---|---|
+| Security assessment **with** QA (default) | `POST /assessments`. When the asset has an enabled, `auto_run` QA profile, its functional and lint runs are queued as the assessment finishes. A `fail` verdict records them as `skipped`. |
+| Security assessment **without** QA | `POST /assessments` with `"skip_qa": true`. |
+| QA **without** a security assessment | Set `"gate": "none"` in the asset's QA profile (admin), then `POST /assets/{id}/qa/runs` with `{"kind": "full", "ref": "main"}`. No assessment is needed. |
+| QA of an assessed commit | `POST /assets/{id}/qa/runs` with `{"kind": "full"}` or `"assessment_id"`, on a profile with the default `"gate": "assessment"`. |
+
+- **Run kinds.** `kind` is `functional`, `performance`, `lint` or `full`. `full` queues every run the profile configures: functional (with a `base_url` and `functional` on), performance (unless it already follows a passing functional run) and lint (with lint settings). The answer lists the runs and uses the first run's ID as `job_id`.
+- **What the gate controls.** With `gate: assessment` (the default) a manual run tests the latest successful git assessment, or the one named, and refuses a `fail` verdict. With `gate: none` and no `assessment_id`, the worker resolves `ref` (the default branch when empty; it must match the profile's `refs`) to a commit when the run starts and records that commit on the run. Runs have `assessment_id: null` then, and their entries appear in the register like any other QA entry.
+- **Trust.** The repository's Karate features and linter configuration run on the QA runner (see *Lint* for the trust notes). With `gate: assessment` the security scan has looked at that commit first; with `gate: none` it has not. Set `gate: none` only for repositories you control, and keep the runner on an isolated network, as the deployment options describe. Only an `admin` token can save a profile, so an automation key cannot switch the gate.
+- **AI triage needs an assessment.** Triage texts, their token budget and the chronicle are filed under an assessment. A run with no assessment keeps its report and register entries, and `POST /qa/runs/{id}/triage` answers `409`; automatic triage skips it.
+- **A key for QA only.** Create a token with the `qa` scope (`POST /tokens`, admin). It can read QA profiles, runs, reports, coverage and generated tests, and start or cancel runs. It cannot start or read assessments, findings or SBOMs, list assets, run AI reviews or generation, or change any setting. The router test checks this for every operation in the contract. Give it an IP allow-list and an expiry. The token's name is stored as the run's `requested_by`.
+- **The runner token is a different secret.** `SCRS_QA_RUNNER_TOKEN` is how SCRS authenticates to the runner. Callers never hold it.
+
 ## Deployment options
 
 - **In the SCRS Dokploy stack** (`deploy/compose.dokploy.yaml`, service `scrs-qa-runner`).
@@ -81,6 +99,9 @@ SCRS_QA_RUNNER_TOKEN=<the same token>
 | `SCRS_QA_RUNNER_TLS_CERT` / `_KEY` | unset | Serve HTTPS directly |
 | `SCRS_QA_RUNNER_PASS_ENV` | unset | Extra runner variables tests inherit (comma-separated names), such as `HTTPS_PROXY` |
 | `SCRS_QA_RUNNER_KARATE`, `_JAVA`, `_PERF_CLASSPATH` | image values | Commands; an empty Gatling classpath disables performance jobs |
+| `SCRS_QA_RUNNER_LINT_<TOOL>` | the tool's name | Executable of each linter ; a linter that is not found is not offered, and a runner with none refuses lint jobs (`422`) |
+| `SCRS_QA_RUNNER_LINT_DEPS` | `false` | Fetch a project's dependencies before linting (needs network access to package hosts) |
+| `SCRS_QA_RUNNER_ESLINT_FALLBACK` | `/opt/eslint/eslint.config.mjs` | ESLint config for repositories that have none |
 
 ### Standalone operator use
 
@@ -88,10 +109,10 @@ The runner is a QA, performance and load service. It is separate from supply-cha
 
 - **Address.** `https://${SCRS_QA_DOMAIN}`, reachable only from `SCRS_QA_RUNNER_ALLOWED_CIDRS`.
 - **Credential.** `SCRS_QA_RUNNER_TOKEN` as a bearer token. It is the same token Core and the worker use, not an SCRS API token, so keep it to people who may run test code.
-- **Jobs.** The Runner API below, with `kind` `functional` (Karate API, integration and UI) or `performance` (Gatling). Pick a new lower-case UUID for `id`.
+- **Jobs.** The Runner API below, with `kind` `functional` (Karate API, integration and UI), `performance` (Gatling) or `lint` (linters over a source tree). Pick a new lower-case UUID for `id`.
 - **Results.** Fetch the report from `GET /v1/jobs/{id}/report` and check `X-Content-SHA256`. SCRS creates no run, finding, event or S3 archive for these jobs.
 - **Capacity.** Direct jobs share the runner's slots and queue with runs started by SCRS; a full queue answers `429`.
-- **Lint.** The runner has no lint job kind. Linting is not part of this service today.
+- **Lint.** `kind` `lint` runs linters over a source tree (see [Lint](#lint)); the bundle holds the source under `src/` and the spec names the tools instead of suites.
 
 ### Runner API (SCRS ↔ runner)
 
@@ -184,6 +205,8 @@ The fields work as follows:
 | `qa_untested` | low | A documented OpenAPI operation got no test traffic | A later run calls it |
 | `qa_performance` | medium | A load threshold is breached | A later load run meets it |
 | `qa_config` | low | Setup problems: no `.feature` files, OpenAPI document missing or unusable | A later run without the problem |
+| `qa_lint` | the worst severity in the group (see [Lint](#lint) for each tool) | A linter reports a rule in a file. One entry covers every occurrence of one rule of one tool in one file, so it does not churn when lines move | A later lint run in which every requested linter ran and that does not report it |
+| `qa_lint_config` | low | A requested linter is not installed on the runner, could not produce a result, the source has no files for the profile's linters, or the run hit a limit | A later run without the problem |
 | `qa_unconfigured` | low | A complete scan finds `openapi.yaml`, `swagger.json` or similar but the repository has no QA profile | A profile exists at the next complete scan |
 
 How coverage is measured:
@@ -193,6 +216,66 @@ How coverage is measured:
 
 Other results:
 - **Events.** `qa.completed` (passed or failed) and `qa.failed` (error or skipped) carry the run summary and links. New QA findings also emit `finding.created`.
+
+## Lint
+
+A profile with `lint: {"tools": [...]}` adds a **lint run** after each successful assessment of a matching ref (with `auto_run`), and `POST /assets/{id}/qa/runs {"kind":"lint"}` starts one on demand. Entries are report-only: they never change a verdict.
+
+| Tool | Language | Reads | Severity |
+|---|---|---|---|
+| `ruff` | Python style and errors | `ruff.toml`, `pyproject.toml` | medium for rules that usually mean a runtime error (`F82x`, `F63x`, `F7xx`, `E9xx`, `PLE`), high for a syntax error, otherwise low |
+| `mypy` | Python types | `mypy.ini`, `pyproject.toml`, `setup.cfg` | high for a syntax error, otherwise medium (type errors) |
+| `bandit` | Python security | `pyproject.toml` (`[tool.bandit]`) | bandit's own severity (high, medium, low), with the CWE in the message; a file bandit could not parse is a medium `not-scanned` issue |
+| `pylint` | Python code quality | `.pylintrc`, `pyproject.toml`, `setup.cfg` | high for a syntax error or fatal, medium for an error, low for warnings, refactor hints and conventions |
+| `phpstan` | PHP static analysis | `phpstan.neon`, `phpstan.neon.dist`, `composer.json` | high for a parse error, otherwise medium |
+| `phpcs` | PHP code style | `phpcs.xml`, `.phpcs.xml`, `phpcs.xml.dist` | low (a coding standard), medium for a file phpcs could not read |
+| `clang-tidy` | C and C++ | `.clang-tidy` | medium for the static analyzer, `bugprone-*`, `cert-*` and compile errors, otherwise low |
+| `golangci-lint` | Go | `.golangci.yml`, `go.mod` | medium for `govet`, `staticcheck`, `errcheck`, `gosec`, `ineffassign`, `typecheck` and similar, otherwise low |
+| `eslint` | JavaScript, TypeScript | `eslint.config.*` | high for a parse failure, medium for an error, low for a warning |
+| `ktlint` | Kotlin | `.editorconfig` | low |
+| `swiftlint` | Swift | `.swiftlint.yml` | medium for an error, low for a warning |
+| `dart-analyze` | Dart, Flutter | `analysis_options.yaml`, `pubspec.yaml` | high for a compile-time error, medium for a warning, low for a hint or lint |
+
+**A profile that only lints** sets `functional: false` and needs no `base_url`: SCRS then queues no Karate run after an assessment, so there is no "no tests" `qa_config` entry. A profile with `functional` true (the default) or `perf` still needs a `base_url`.
+
+How it runs:
+- **Bundle.** The worker downloads the assessed commit and sends only the files the requested linters read (their sources plus their configuration, `go.mod`, `package.json` and lockfile, `pubspec.yaml`), never `node_modules`, `Pods`, `.dart_tool` or `.git`. Files over 2 MiB are left out. The limits are 20000 files, 96 MiB, and 32 MiB compressed; a source tree over them is linted in part, and a `qa_lint_config` entry says how many files were left out.
+- **Command lines are fixed.** The runner runs each tool with its own arguments, as the job user (uid 10001), and writes the report to a file it chooses. A repository can configure rules (`ruff.toml`, `.golangci.yml`, an ESLint config, `.editorconfig`, `.swiftlint.yml`, `analysis_options.yaml`) but cannot change how the tool is run. Linter configurations can run repository code (an ESLint config is JavaScript), so lint jobs follow the same host rules as the rest of this page.
+- **Projects in a monorepo.** Go is linted per module (every directory with a `go.mod`, up to 20, never `vendor` or `testdata`), ESLint per directory holding an `eslint.config.*` (the outer one covers nested ones), and Dart per package (`pubspec.yaml`). Paths in the results are relative to the repository. A repository with no ESLint config is linted with the runner's own (ESLint's recommended rules for JavaScript and TypeScript, Node and browser globals); one with a config always uses its own.
+- **Dependencies.** Without them a linter can resolve only the standard library. With `SCRS_QA_RUNNER_LINT_DEPS=true` the runner fetches a project's dependencies first: `go mod download` (unless `vendor/` exists), `npm ci --ignore-scripts` (only with a `package-lock.json`), `dart pub get`, and `composer install --no-scripts --no-plugins` (only with a `composer.lock`, so only the pinned versions, and not if `vendor/` is committed) for each Composer project, which PHPStan then uses. Composer ignores platform requirements (PHP version and extensions), because the runner's PHP is not the application's. The Python and C/C++ tools never install dependencies. That needs outbound access to the package hosts (Go proxy, npm registry, pub.dev, Packagist and the hosts of the packages), so it is off by default; leave it off and vendor Go modules and commit lockfiles if the runner has no network. When a fetch fails, the tool still runs and a `qa_lint_config` entry says its result may be incomplete.
+- **A silent or broken tool is not a clean one.** A tool that is not installed, cannot start, exits with a failure code or writes an unreadable report is an `error` (or `unavailable`) in `report.lint.tools` and gets a `qa_lint_config` entry. An entry is closed by absence only when every requested linter ran completely and the issue list was not cut at 5000 issues.
+- **SwiftLint on Linux** is the release's static build, which needs no Swift toolchain. It skips the few rules that need SourceKit (it says so on stderr, kept in `console.log`), and it cannot compile iOS code, so rules that need type information do not run. Treat its results as a style and common-mistake check.
+- **Python tools overlap on purpose.** ruff is fast and covers style and obvious errors; mypy checks types; bandit looks for security problems (shell calls, weak hashes, hard-coded passwords); pylint is slower and stricter. The same line can appear under several tools, each as its own entry. The repository's dependencies are never installed for them, so mypy runs with `--ignore-missing-imports` (a call into an untyped or missing package is not checked) and pylint has `import-error` and `no-name-in-module` off. Without the packages the checks that need them are weaker. pylint is noisy on a repository that has no `.pylintrc` (docstring and naming rules): set the rules in the repository, or request only the tools you want in `lint.tools`. A mypy or pylint configuration can load plugins, which run repository code, like an ESLint config.
+- **PHP.** PHPStan uses the repository's `phpstan.neon` (paths and level); without one it analyses the source at level 5, without `vendor/`. phpcs uses the repository's `phpcs.xml`; without one it applies PSR-12. Without dependencies PHPStan cannot see classes from Composer packages and reports them as unknown (`class.notFound`); turn on the dependency step below to resolve them. The runner loads the `vendor/autoload.php` of every Composer project it finds, also when the repository commits its `vendor/`.
+- **C and C++ (best effort).** clang-tidy needs the compiler flags of a build, which the runner does not have (a committed `compile_commands.json` points at another machine). The runner compiles each `.c`, `.cc`, `.cpp` and `.cxx` file on its own, with every directory that holds a header on the include path, in batches of 25 files (up to 3000 files). Project headers resolve, and the static analyzer finds leaks, null dereferences and similar. A third-party or generated header does not resolve: clang-tidy stops at that include, those sources are only partly analysed, and the tool's note says how many includes were not found, so its entries are never closed by absence. A repository's `.clang-tidy` is used; without one the runner applies `clang-analyzer-*` and `bugprone-*`. Defines and language standards from the build (`-D`, `-std`) are not known.
+- **ktlint** reports style rules from `.editorconfig` (the standard rule set); it does not check Gradle or Android lint.
+- **AI code review.** A review of the same assessment shows the model each file's lint findings next to the static-analysis findings, so it builds on them instead of repeating them.
+- **Results.** The run's `summary.lint` has the issue count, files, and counts by tool and severity. `qa.completed` and `finding.created` carry the run and new entries.
+
+**Images.** The slim `base` image (`--target base`) ships `ruff` only. The default build, the full image that `make release-qa-runner` publishes, adds the rest, every download checked against a pinned SHA-256 (ESLint from a lockfile with integrity hashes, installed without scripts; mypy, bandit and pylint from `deploy/karate-runner/lint/requirements.txt`, which pins every file by hash and installs from wheels only):
+
+```bash
+make qa-runner-lint-image            # the full runner, every linter (the default build of the Dockerfile)
+make release-qa-runner               # publishes that same full image for the Dokploy stack
+# or: docker build -f deploy/karate-runner/Dockerfile --target base -t <tag> .   (slim, ruff only)
+```
+
+It adds Python with mypy, bandit and pylint, PHP with PHPStan, phpcs and Composer (pinned phars), clang-tidy with the C and C++ headers (Debian package), the Go toolchain with golangci-lint, Node with ESLint, ktlint, SwiftLint and the Dart SDK; the image is about 2 GB larger than the runner. `GET /qa/runner` lists the linters it finds (`lint_tools`). Set `SCRS_QA_RUNNER_LINT_<TOOL>` (`RUFF`, `MYPY`, `BANDIT`, `PYLINT`, `PHPSTAN`, `PHPCS`, `CLANG_TIDY`, `GOLANGCI_LINT`, `ESLINT`, `KTLINT`, `SWIFTLINT`, `DART_ANALYZE` with `dart` as the executable) to use another executable. To check a runner, point `SCRS_TEST_RUNNER_URL` and `SCRS_TEST_RUNNER_TOKEN` at it and run `go test ./internal/qarunner -run TestRealRunnerLint -v`; with dependency installs on, add `SCRS_TEST_DEPS_DIR` and run `TestRealRunnerLintDeps`.
+
+## AI triage of QA results
+
+SCRS can ask a model to turn a finished run into something an engineer can act on. For each run it writes:
+- **A run summary** in the asset's chronicle (kind `qa_summary`): a headline, a risk level for shipping the commit, what failed and what it probably means, and up to eight priorities. It supersedes the previous one.
+- **An advisory per important entry** (up to 15), stored against the register entry: what went wrong, the most likely cause, whether the application, the test or the linter configuration is the likelier thing to change, the concrete steps to fix it, and an urgency.
+
+What the model is shown: the entry's title and severity, the feature, scenario and tag, the first 700 characters of the failure text, the load threshold and its measured value, and for lint the tool, rule, file, number of occurrences and up to five messages. It is never shown source code, request or response bodies or the profile's variables. Everything goes through the same guard as other model calls (credentials, secrets and exfiltration markup are removed; answers are validated, links are removed, and an advisory for an entry that was not sent is dropped).
+
+Because file paths, test names and failure text can carry sensitive data (a failing assertion may echo what the target returned), a triage follows the **source-code rule** of AI code review: the provider must be self-hosted, or hosted with `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` and an acknowledgement. It is checked when queued and again when the job runs.
+
+How to use it:
+- **Automatically.** Set `llm_provider_id` and `ai_triage: true` on the profile. After each finished run with entries to describe, SCRS queues a triage. It is off by default, because `llm_provider_id` may have been set for test generation only.
+- **On request.** `POST /qa/runs/{id}/triage` (optionally with `provider_id`) answers `202` with a `job_id`; poll `GET /summary-jobs/{id}`. `GET /qa/runs/{id}/triage` lists the run's jobs.
+- **Limits.** The assessment's token budget and the provider's monthly cap apply, and a cut-off answer is never stored as complete. Texts are marked as written by a model and not verified, and never change a verdict or an entry's status.
 
 ## Test generation with an LLM (bring your own key)
 
@@ -244,15 +327,15 @@ How the provider connection is handled:
 | Route | Scope |
 |---|---|
 | `GET/PUT/DELETE /assets/{id}/qa/profile` | read / admin / admin |
-| `GET/POST /assets/{id}/qa/runs` | read / write or trigger (`include_drafts` admin) |
-| `GET /assets/{id}/qa/coverage`, `/qa/suites`, `/qa/generations` | read |
+| `GET/POST /assets/{id}/qa/runs` | read or qa / write, trigger or qa (`include_drafts` admin) |
+| `GET /assets/{id}/qa/coverage`, `/qa/suites`, `/qa/generations` | read or qa |
 | `POST /assets/{id}/qa/generations` | write |
-| `GET /assessments/{id}/qa` | read |
-| `GET /qa/runs/{id}`, `/scenarios`, `/coverage`, `/report` | read |
-| `POST /qa/runs/{id}:cancel` | write or trigger |
-| `GET /qa/generations/{id}`, `/files`; `GET /qa/suites/{id}` | read |
+| `GET /assessments/{id}/qa` | read, trigger or qa |
+| `GET /qa/runs/{id}`, `/scenarios`, `/coverage`, `/report` | read, trigger or qa |
+| `POST /qa/runs/{id}:cancel` | write, trigger or qa |
+| `GET /qa/generations/{id}`, `/files`; `GET /qa/suites/{id}` | read, trigger or qa |
 | `POST /qa/suites/{id}:approve` / `:reject` | admin / write |
-| `GET /qa/runner` | read |
+| `GET /qa/runner` | read, trigger or qa |
 | `GET /llm/presets`, `GET /llm/providers[/{id}]` | read |
 | `POST/PATCH/DELETE /llm/providers[/{id}]`, `POST /llm/providers/{id}:test` | admin |
 

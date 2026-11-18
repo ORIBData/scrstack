@@ -43,7 +43,7 @@ func TestOpenAPIOperationsDeclareScopes(t *testing.T) {
 	if err := yaml.Unmarshal(OpenAPI, &contract); err != nil {
 		t.Fatal(err)
 	}
-	valid := map[string]bool{"read": true, "write": true, "trigger": true, "ingest:relay": true, "admin": true}
+	valid := map[string]bool{"read": true, "write": true, "trigger": true, "qa": true, "ingest:relay": true, "admin": true}
 	sentence := regexp.MustCompile("[Ss]copes? ((?:`[^`]+`(?:,? (?:or |and )?)?)+)")
 	operations := 0
 	for path, item := range contract.Paths {

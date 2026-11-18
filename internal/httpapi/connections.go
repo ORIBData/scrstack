@@ -261,6 +261,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// writeJob answers an operation that runs as a job: the body gains `job_id`
+// and `status_url` (GET /jobs/{id}), so a client can poll any long operation
+// the same way. Anything that is not an object is written as it is.
+func writeJob(w http.ResponseWriter, status int, id uuid.UUID, value any) {
+	raw, err := json.Marshal(value)
+	var body map[string]any
+	if err == nil && json.Unmarshal(raw, &body) == nil && body != nil {
+		body["job_id"] = id
+		body["status_url"] = BasePath + "/jobs/" + id.String()
+		value = body
+	}
+	writeJSON(w, status, value)
+}
+
 func writeError(w http.ResponseWriter, status int, message string) {
 	if message == "" {
 		message = "request failed"

@@ -271,6 +271,16 @@ func TestPostgresQAAndLLMProviderAPI(t *testing.T) {
 	for _, bad := range []string{`{"base_url":"ftp://x"}`, `{"base_url":"https://x","test_path":"../etc"}`, `{"base_url":"https://x","tags":["smoke"]}`, `{"base_url":"https://x","auth":{"header":"Authorization","variable":"MISSING"}}`, `{"base_url":"https://x","variables":{"bad name":"v"}}`} {
 		must(call("PUT", base, admin, bad, map[string]string{"If-Match": `"2"`}), 400)
 	}
+	// Lint settings and AI triage are part of the profile.
+	withLint := strings.Replace(keep, `"perf":`, fmt.Sprintf(`"lint":{"tools":["ruff"]},"ai_triage":true,"perf":`), 1)
+	for _, bad := range []string{strings.Replace(keep, `"perf":`, `"lint":{"tools":["rm"]},"perf":`, 1), strings.Replace(keep, `"perf":`, `"lint":{"tools":[]},"perf":`, 1), strings.Replace(strings.Replace(keep, fmt.Sprintf(`"llm_provider_id":%q,`, p.ID), "", 1), `"perf":`, `"ai_triage":true,"perf":`, 1)} {
+		must(call("PUT", base, admin, bad, map[string]string{"If-Match": `"2"`}), 400)
+	}
+	must(call("PUT", base, admin, withLint, map[string]string{"If-Match": `"2"`}), 200)
+	_ = json.Unmarshal(must(call("GET", base, reader, "", nil), 200).Body.Bytes(), &got)
+	if got.Lint == nil || len(got.Lint.Tools) != 1 || got.Lint.Tools[0] != "ruff" || !got.AITriage {
+		t.Fatalf("lint settings %+v", got)
+	}
 	notRepo := "/assets/" + uuid.NewString() + "/qa/profile"
 	must(call("PUT", notRepo, admin, `{"base_url":"https://x"}`, nil), 404)
 
@@ -282,6 +292,10 @@ func TestPostgresQAAndLLMProviderAPI(t *testing.T) {
 	}
 	must(call("POST", runs, writer, `{"include_drafts":true}`, nil), 403)
 	must(call("POST", runs, writer, `{"kind":"stress"}`, nil), 400)
+	// A lint run is a known kind: it is refused only for want of an assessment.
+	if body := must(call("POST", runs, writer, `{"kind":"lint"}`, nil), 409).Body.String(); !strings.Contains(body, "run one first") {
+		t.Fatal(body)
+	}
 	must(call("POST", "/assets/"+asset.String()+"/qa/generations", writer, `{"kind":"unit"}`, nil), 409)
 	must(call("POST", "/assets/"+asset.String()+"/qa/generations", writer, `{"kind":"api","max_operations":500}`, nil), 400)
 	must(call("GET", runs, reader, "", nil), 200)
@@ -289,12 +303,65 @@ func TestPostgresQAAndLLMProviderAPI(t *testing.T) {
 	must(call("GET", "/assets/"+asset.String()+"/qa/suites?kind=api", reader, "", nil), 200)
 	must(call("GET", "/assets/"+asset.String()+"/qa/generations", reader, "", nil), 200)
 	must(call("GET", "/assessments/"+uuid.NewString()+"/qa", trigger, "", nil), 200)
+
+	// A qa token starts and reads QA and reaches nothing else. The default
+	// gate still wants an assessment; gate none (admin only) does not.
+	_, qaToken, err := store.CreateToken(ctx, connections.Token{Name: "qa-pipeline", Scopes: []string{"qa"}}, uuid.Nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateToken(ctx, connections.Token{Name: "bad", Scopes: []string{"quality"}}, uuid.Nil); err == nil {
+		t.Fatal("an unknown scope was accepted")
+	}
+	must(call("GET", base, qaToken, "", nil), 200)
+	must(call("GET", runs, qaToken, "", nil), 200)
+	must(call("GET", "/qa/runner", qaToken, "", nil), 200)
+	if body := must(call("POST", runs, qaToken, `{"kind":"full"}`, nil), 409).Body.String(); !strings.Contains(body, "run one first") {
+		t.Fatal(body)
+	}
+	must(call("PUT", base, qaToken, withLint, map[string]string{"If-Match": `"3"`}), 403)
+	must(call("POST", "/assessments", qaToken, `{"target":{"type":"git","repository":"org/repo","ref":"main"}}`, nil), 403)
+	must(call("GET", "/assessments", qaToken, "", nil), 403)
+	must(call("GET", "/assets", qaToken, "", nil), 403)
+	must(call("POST", "/qa/runs/"+uuid.NewString()+"/triage", qaToken, `{}`, nil), 403)
+	must(call("POST", "/assets/"+asset.String()+"/qa/generations", qaToken, `{"kind":"unit"}`, nil), 403)
+	must(call("POST", "/assets/"+asset.String()+"/ai-reviews", qaToken, `{}`, nil), 403)
+	ungated := strings.Replace(withLint, "{", `{"gate":"none",`, 1)
+	must(call("PUT", base, writer, ungated, map[string]string{"If-Match": `"3"`}), 403)
+	must(call("PUT", base, admin, strings.Replace(withLint, "{", `{"gate":"sometimes",`, 1), map[string]string{"If-Match": `"3"`}), 400)
+	if body := must(call("PUT", base, admin, ungated, map[string]string{"If-Match": `"3"`}), 200).Body.String(); !strings.Contains(body, `"gate":"none"`) {
+		t.Fatal(body)
+	}
+	must(call("POST", runs, qaToken, `{"kind":"lint","ref":"feature/x"}`, nil), 400) // outside the profile's refs
+	full := must(call("POST", runs, qaToken, `{"kind":"full","ref":"main"}`, nil), 202)
+	var started struct {
+		Runs []struct {
+			ID          string `json:"id"`
+			Kind        string `json:"kind"`
+			Ref         string `json:"ref"`
+			RequestedBy string `json:"requested_by"`
+		} `json:"runs"`
+		JobID string `json:"job_id"`
+	}
+	if err := json.Unmarshal(full.Body.Bytes(), &started); err != nil || len(started.Runs) != 3 || started.Runs[0].Kind != "functional" || started.Runs[2].Kind != "lint" || started.JobID == "" || started.Runs[0].ID != started.JobID || started.Runs[0].Ref != "main" || started.Runs[0].RequestedBy != "qa-pipeline" || !strings.HasSuffix(full.Header().Get("Location"), started.JobID) {
+		t.Fatal(full.Body, err)
+	}
+	one := must(call("POST", runs, qaToken, `{"kind":"lint"}`, nil), 202).Body.String()
+	if !strings.Contains(one, `"assessment_id":null`) || !strings.Contains(one, `"job_id"`) || strings.Contains(one, `"runs"`) {
+		t.Fatal(one)
+	}
+	must(call("POST", "/qa/runs/"+started.JobID+":cancel", qaToken, "", nil), 200)
+	must(call("GET", "/qa/runs/"+started.JobID, qaToken, "", nil), 200)
 	if body := must(call("GET", "/qa/runner", reader, "", nil), 200).Body.String(); !strings.Contains(body, `"configured":false`) {
 		t.Fatal(body)
 	}
 	must(call("GET", "/qa/runs/"+uuid.NewString(), reader, "", nil), 404)
 	must(call("POST", "/qa/runs/"+uuid.NewString()+":cancel", reader, "", nil), 403)
 	must(call("POST", "/qa/runs/"+uuid.NewString()+":cancel", trigger, "", nil), 404)
+	must(call("POST", "/qa/runs/"+uuid.NewString()+"/triage", reader, `{}`, nil), 403)
+	must(call("POST", "/qa/runs/"+uuid.NewString()+"/triage", writer, `{}`, nil), 404)
+	must(call("POST", "/qa/runs/"+uuid.NewString()+"/triage", writer, `{"provider_id":"not-a-uuid"}`, nil), 400)
+	must(call("GET", "/qa/runs/"+uuid.NewString()+"/triage", reader, "", nil), 404)
 	must(call("POST", "/qa/suites/"+uuid.NewString()+":approve", writer, `{}`, nil), 403)
 	must(call("GET", "/qa/generations/"+uuid.NewString()+"/files", reader, "", nil), 404)
 

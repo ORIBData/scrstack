@@ -1,0 +1,29 @@
+[
+  {
+    "character" : 11,
+    "file" : "/s/swift/main.swift",
+    "line" : 3,
+    "reason" : "Force casts should be avoided",
+    "rule_id" : "force_cast",
+    "severity" : "Error",
+    "type" : "Force Cast"
+  },
+  {
+    "character" : 5,
+    "file" : "/s/swift/main.swift",
+    "line" : 2,
+    "reason" : "Variable name 'a' should be between 3 and 40 characters long",
+    "rule_id" : "identifier_name",
+    "severity" : "Error",
+    "type" : "Identifier Name"
+  },
+  {
+    "character" : 5,
+    "file" : "/s/swift/main.swift",
+    "line" : 3,
+    "reason" : "Variable name 'b' should be between 3 and 40 characters long",
+    "rule_id" : "identifier_name",
+    "severity" : "Error",
+    "type" : "Identifier Name"
+  }
+]

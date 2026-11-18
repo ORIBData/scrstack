@@ -42,6 +42,15 @@ type Config struct {
 	// performance jobs.
 	Java          string
 	PerfClasspath string
+	// LintDeps lets lint jobs install the project's dependencies first (go mod
+	// download, npm ci without scripts, dart pub get). It needs network access
+	// to the package hosts, for example through SCRS_QA_RUNNER_PASS_ENV proxies.
+	LintDeps bool
+	// ESLintFallback is the ESLint config used for a repository that has none.
+	ESLintFallback string
+	// Lint maps a linter name (see qa.LintTools) to its executable; only
+	// installed linters appear, and /v1/info lists them.
+	Lint map[string]string
 	// KarateVersion is reported by /v1/info.
 	KarateVersion string
 	// JobUID and JobGID, when non-zero, run test processes as another user
@@ -62,6 +71,11 @@ type job struct {
 	cancel     context.CancelFunc
 	cancelled  bool
 	finishedAt time.Time
+	// extraEnv is added to a test process's environment (lint jobs).
+	extraEnv []string
+	// stdout, when set, receives a test process's standard output instead of
+	// the console (tools that print their report there).
+	stdout io.Writer
 }
 
 // Server holds the job table.
@@ -223,7 +237,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	info := qa.Info{Karate: s.cfg.KarateVersion, Gatling: s.cfg.PerfClasspath != "", Slots: s.cfg.Slots}
+	info := qa.Info{Karate: s.cfg.KarateVersion, Gatling: s.cfg.PerfClasspath != "", LintTools: s.lintTools(), Slots: s.cfg.Slots}
 	for _, j := range s.jobs {
 		switch j.status.State {
 		case qa.StateQueued:
@@ -272,6 +286,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(bundle) == 0 {
 		writeJSON(w, 400, map[string]string{"error": "bundle required"})
+		return
+	}
+	if spec.Kind == qa.KindLint && len(s.cfg.Lint) == 0 {
+		writeJSON(w, 422, map[string]string{"error": "this runner has no linters installed; lint jobs are disabled"})
 		return
 	}
 	if spec.Kind == qa.KindPerformance && s.cfg.PerfClasspath == "" {
@@ -337,7 +355,12 @@ func (s *Server) prepare(j *job, bundle []byte) error {
 			return err
 		}
 	}
-	if err := qa.Unpack(bytes.NewReader(bundle), filepath.Join(j.dir, "bundle"), 5000, 128<<20); err != nil {
+	// A source tree for linting has many more small files than a test suite.
+	maxFiles := 5000
+	if j.spec.Kind == qa.KindLint {
+		maxFiles = 25000
+	}
+	if err := qa.Unpack(bytes.NewReader(bundle), filepath.Join(j.dir, "bundle"), maxFiles, 128<<20); err != nil {
 		return err
 	}
 	return s.handOver(j.dir)
@@ -422,7 +445,9 @@ func (s *Server) execute(parent context.Context, j *job) {
 	console := newCapture(1<<20, 7<<20)
 	var state, failure string
 	var exit *int
-	if j.spec.Kind == qa.KindPerformance {
+	if j.spec.Kind == qa.KindLint {
+		state, exit, failure = s.runLint(ctx, j, console)
+	} else if j.spec.Kind == qa.KindPerformance {
 		state, exit, failure = s.runPerf(ctx, j, console)
 	} else {
 		state, exit, failure = s.runFunctional(ctx, j, console)
@@ -472,6 +497,7 @@ func (s *Server) environment(j *job) []string {
 			env = append(env, name+"="+value)
 		}
 	}
+	env = append(env, j.extraEnv...)
 	names := make([]string, 0, len(j.spec.Variables))
 	for name := range j.spec.Variables {
 		names = append(names, name)
@@ -571,3 +597,6 @@ func (s *Server) runPerf(ctx context.Context, j *job, console *capture) (string,
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }
+
+// lookPath finds an executable on the runner's PATH.
+func lookPath(name string) (string, error) { return exec.LookPath(name) }

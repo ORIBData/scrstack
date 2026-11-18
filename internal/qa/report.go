@@ -45,6 +45,8 @@ type Summary struct {
 	Skipped        int    `json:"skipped"`
 	DurationMillis int64  `json:"duration_ms"`
 	Karate         string `json:"karate_version,omitempty"`
+	// Lint counts a lint run's issues; it is empty for other kinds.
+	Lint *LintSummary `json:"lint,omitempty"`
 }
 
 // Assertion is one Gatling threshold and whether it held.
@@ -72,11 +74,12 @@ type PerfStats struct {
 
 // Report is everything SCRS reads from a runner's report archive.
 type Report struct {
-	Status    JobStatus  `json:"status"`
-	Summary   Summary    `json:"summary"`
-	Scenarios []Scenario `json:"scenarios"`
-	Calls     []Call     `json:"calls"`
-	Perf      *PerfStats `json:"perf,omitempty"`
+	Status    JobStatus   `json:"status"`
+	Summary   Summary     `json:"summary"`
+	Scenarios []Scenario  `json:"scenarios"`
+	Calls     []Call      `json:"calls"`
+	Perf      *PerfStats  `json:"perf,omitempty"`
+	Lint      *LintReport `json:"lint,omitempty"`
 }
 
 // Report archive limits: scenarios and distinct calls kept per run.
@@ -91,6 +94,8 @@ func ParseReport(archive []byte) (Report, error) {
 	junit := map[string][][]byte{}
 	events := map[string][]byte{}
 	var console []byte
+	lintOut := map[string][]byte{}
+	lintMeta := map[string]LintMeta{}
 	haveResult := false
 	err := Walk(bytes.NewReader(archive), 20000, 512<<20, func(name string, size int64, body io.Reader) error {
 		read := func(limit int64) ([]byte, error) {
@@ -113,6 +118,21 @@ func ParseReport(archive []byte) (Report, error) {
 				return err
 			}
 			console = data
+		case strings.HasPrefix(name, "lint/") && strings.HasSuffix(name, ".meta.json"):
+			data, err := read(1 << 20)
+			if err != nil {
+				return err
+			}
+			var m LintMeta
+			if json.Unmarshal(data, &m) == nil && LintTools[m.Tool] != "" {
+				lintMeta[m.Tool] = m
+			}
+		case strings.HasPrefix(name, "lint/") && strings.HasSuffix(name, ".json"):
+			data, err := read(128 << 20)
+			if err != nil {
+				return err
+			}
+			lintOut[strings.TrimSuffix(strings.TrimPrefix(name, "lint/"), ".json")] = data
 		case strings.HasPrefix(name, "reports/") && rest == "karate-json/karate-events.jsonl":
 			data, err := read(256 << 20)
 			if err != nil {
@@ -195,6 +215,12 @@ func ParseReport(archive []byte) (Report, error) {
 		}
 		return a.Status < b.Status
 	})
+	if r.Status.Kind == KindLint {
+		lint := parseLint(lintOut, lintMeta)
+		r.Lint = &lint
+		summary := lint.Summarize()
+		r.Summary.Lint = &summary
+	}
 	if r.Status.Kind == KindPerformance {
 		perf := ParseGatling(console)
 		r.Perf = &perf
@@ -459,4 +485,44 @@ func ParseGatling(console []byte) PerfStats {
 		p.Assertions = []Assertion{}
 	}
 	return p
+}
+
+// parseLint turns a lint job's tool outputs into a report. A tool whose
+// output cannot be read is reported as an error, not as a clean result.
+func parseLint(outputs map[string][]byte, metas map[string]LintMeta) LintReport {
+	var r LintReport
+	for _, tool := range LintToolNames() {
+		meta, ok := metas[tool]
+		if !ok {
+			continue
+		}
+		res := LintToolResult{Tool: tool, Status: meta.Status, Error: clipText(meta.Error, 500), Note: clipText(meta.Note, 500)}
+		if meta.Status == "ran" {
+			issues, err := LintParsers[tool](outputs[tool])
+			if err != nil {
+				res.Status, res.Error = "error", err.Error()
+			} else {
+				res.Issues = len(issues)
+				for _, i := range issues {
+					if len(r.Issues) >= MaxLintIssues {
+						r.Truncated = true
+						break
+					}
+					r.Issues = append(r.Issues, i)
+				}
+			}
+		}
+		r.Tools = append(r.Tools, res)
+	}
+	sort.SliceStable(r.Issues, func(i, j int) bool {
+		a, b := r.Issues[i], r.Issues[j]
+		if a.Path != b.Path {
+			return a.Path < b.Path
+		}
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		return a.Rule < b.Rule
+	})
+	return r
 }

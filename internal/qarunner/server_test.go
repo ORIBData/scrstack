@@ -370,3 +370,203 @@ func TestHealthzChecksPrerequisites(t *testing.T) {
 		t.Fatal("health result not cached")
 	}
 }
+
+// fakeRuff stands in for ruff: it writes one issue to --output-file and
+// exits 1, the way ruff does when it finds something. A directory named
+// "clean" in src makes it report nothing and exit 0.
+const fakeRuff = `#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in --output-file) out="$2"; shift;; esac
+  shift
+done
+if [ -d clean ]; then echo '[]' > "$out"; exit 0; fi
+printf '[{"code":"F401","filename":"%s/a.py","fix":null,"location":{"row":1,"column":1},"message":"unused import"}]\n' "$(pwd)" > "$out"
+exit 1
+`
+
+const brokenEslint = `#!/bin/sh
+echo "config error" >&2
+exit 2
+`
+
+func newLintRunner(t *testing.T, tools map[string]string) *qa.Runner {
+	t.Helper()
+	server, err := New(Config{Token: token, WorkDir: t.TempDir(), Slots: 1, MaxQueued: 2, Lint: tools, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go server.Run(ctx)
+	h := httptest.NewServer(server.Handler())
+	t.Cleanup(h.Close)
+	client, err := qa.NewRunner(h.URL, token, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func TestRunnerLint(t *testing.T) {
+	dir := t.TempDir()
+	ruff, eslint := filepath.Join(dir, "ruff"), filepath.Join(dir, "eslint")
+	if err := os.WriteFile(ruff, []byte(fakeRuff), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(eslint, []byte(brokenEslint), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	client := newLintRunner(t, map[string]string{"ruff": ruff, "eslint": eslint})
+	ctx := context.Background()
+	info, err := client.Info(ctx)
+	if err != nil || len(info.LintTools) != 2 || info.LintTools[0] != "eslint" {
+		t.Fatal(info, err)
+	}
+	spec := func(tools ...string) qa.JobSpec {
+		return qa.JobSpec{ID: uuid.NewString(), Kind: qa.KindLint, Threads: 1, TimeoutSeconds: 60, Lint: &qa.Lint{Tools: tools}}
+	}
+	// Issues found: the job fails, and the report carries them with the
+	// tool that was not installed and the one that broke.
+	dirty, _ := qa.Pack([]qa.File{{Path: "src/a.py", Data: []byte("import os\n")}})
+	s := spec("ruff", "eslint", "golangci-lint")
+	if _, err := client.Submit(ctx, s, dirty); err != nil {
+		t.Fatal(err)
+	}
+	status := wait(t, client, s.ID)
+	if status.State != qa.StateFailed || status.ReportSHA256 == "" {
+		t.Fatalf("%+v", status)
+	}
+	archive, err := client.Report(ctx, s.ID, status.ReportSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report, err := qa.ParseReport(archive)
+	if err != nil || report.Lint == nil {
+		t.Fatal(report, err)
+	}
+	if len(report.Lint.Issues) != 1 || report.Lint.Issues[0].Path != "a.py" || report.Lint.Issues[0].Rule != "F401" {
+		t.Fatalf("%+v", report.Lint.Issues)
+	}
+	states := map[string]string{}
+	for _, tr := range report.Lint.Tools {
+		states[tr.Tool] = tr.Status
+	}
+	if states["ruff"] != "ran" || states["eslint"] != "error" || states["golangci-lint"] != "unavailable" || report.Summary.Lint == nil || report.Summary.Lint.Issues != 1 {
+		t.Fatalf("%v %+v", states, report.Summary)
+	}
+	// A clean tree passes.
+	clean, _ := qa.Pack([]qa.File{{Path: "src/clean/ok.py", Data: []byte("x = 1\n")}})
+	c := spec("ruff")
+	if _, err := client.Submit(ctx, c, clean); err != nil {
+		t.Fatal(err)
+	}
+	if status := wait(t, client, c.ID); status.State != qa.StatePassed {
+		t.Fatalf("%+v", status)
+	}
+	// When no requested tool runs, the job is an error, never a pass.
+	none := spec("golangci-lint")
+	if _, err := client.Submit(ctx, none, dirty); err != nil {
+		t.Fatal(err)
+	}
+	if status := wait(t, client, none.ID); status.State != qa.StateError || !strings.Contains(status.Error, "no requested linter") {
+		t.Fatalf("%+v", status)
+	}
+	// A bundle without src is an error.
+	nosrc, _ := qa.Pack([]qa.File{{Path: "repo/x.txt", Data: []byte("x")}})
+	n := spec("ruff")
+	if _, err := client.Submit(ctx, n, nosrc); err != nil {
+		t.Fatal(err)
+	}
+	if status := wait(t, client, n.ID); status.State != qa.StateError {
+		t.Fatalf("%+v", status)
+	}
+}
+
+func TestRunnerLintDisabledWithoutTools(t *testing.T) {
+	client := newLintRunner(t, nil)
+	bundle, _ := qa.Pack([]qa.File{{Path: "src/a.py", Data: []byte("x")}})
+	s := qa.JobSpec{ID: uuid.NewString(), Kind: qa.KindLint, Threads: 1, TimeoutSeconds: 60, Lint: &qa.Lint{Tools: []string{"ruff"}}}
+	if _, err := client.Submit(context.Background(), s, bundle); err == nil || !strings.Contains(err.Error(), "lint jobs are disabled") {
+		t.Fatal(err)
+	}
+}
+
+func TestProjectRoots(t *testing.T) {
+	dir := t.TempDir()
+	touch := func(rel string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"svc/a/go.mod", "svc/b/go.mod", "svc/b/tools/go.mod", "vendor/x/go.mod", "web/eslint.config.js", "web/inner/eslint.config.js", "app/pubspec.yaml", "app/example/pubspec.yaml", "testdata/go.mod"} {
+		touch(f)
+	}
+	got := func(tool string) string { return strings.Join(projectRoots(tool, dir), ",") }
+	// Go modules are independent; vendored and test data trees are skipped.
+	if g := got("golangci-lint"); g != "svc/a,svc/b,svc/b/tools" {
+		t.Fatal(g)
+	}
+	// ESLint and Dart cover a nested project from the outer one.
+	if g := got("eslint"); g != "web" {
+		t.Fatal(g)
+	}
+	if g := got("dart-analyze"); g != "app" {
+		t.Fatal(g)
+	}
+	// Without a marker, the repository root.
+	if g := strings.Join(projectRoots("golangci-lint", t.TempDir()), ","); g != "." {
+		t.Fatal(g)
+	}
+}
+
+func TestPythonLintCommands(t *testing.T) {
+	s := &Server{}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte("[tool.bandit]\nskips = [\"B101\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mypy := s.lintCommand("mypy", dir, "out", false)
+	if !mypy.stdout || !mypy.accepts(1) || mypy.accepts(2) || !mypy.acceptsWithOutput(2) {
+		t.Fatalf("mypy exit 2 counts only with a report: %+v", mypy)
+	}
+	pylint := s.lintCommand("pylint", dir, "out", false)
+	if !pylint.accepts(22) || pylint.accepts(32) {
+		t.Fatalf("pylint exit codes are a bit mask below 32: %+v", pylint)
+	}
+	if args := strings.Join(s.lintCommand("bandit", dir, "out", false).args, " "); !strings.Contains(args, "-c pyproject.toml") {
+		t.Fatal(args)
+	}
+	if args := strings.Join(s.lintCommand("bandit", t.TempDir(), "out", false).args, " "); strings.Contains(args, "-c") {
+		t.Fatal(args)
+	}
+}
+
+func TestPHPLintCommands(t *testing.T) {
+	s := &Server{}
+	plain, withConfig := t.TempDir(), t.TempDir()
+	for _, name := range []string{"phpstan.neon", "phpcs.xml"} {
+		if err := os.WriteFile(filepath.Join(withConfig, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	join := func(tool, dir string) string {
+		return strings.Join(s.lintCommand(tool, dir, "/o/phpstan.json", false).args, " ")
+	}
+	if args := join("phpstan", plain); !strings.Contains(args, "--configuration=/o/phpstan.neon") {
+		t.Fatal("without a config the runner's applies:", args)
+	}
+	if args := join("phpstan", withConfig); strings.Contains(args, "--configuration") {
+		t.Fatal("a repository's phpstan.neon is found by phpstan itself:", args)
+	}
+	if args := join("phpcs", plain); !strings.Contains(args, "--standard=PSR12") {
+		t.Fatal(args)
+	}
+	if args := join("phpcs", withConfig); strings.Contains(args, "--standard") {
+		t.Fatal("a repository's phpcs.xml sets the standard:", args)
+	}
+}

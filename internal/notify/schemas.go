@@ -68,6 +68,9 @@ var eventData = map[string]map[string]any{
 	"finding.status_changed": object([]string{"finding_id", "status"}, map[string]any{
 		"finding_id": str(), "asset_id": str(), "previous_status": str(), "status": str(), "waiver_until": nullable("string"), "actor_id": str(), "link": str(),
 	}),
+	"finding.assigned": object([]string{"finding_id", "assignee"}, map[string]any{
+		"finding_id": str(), "asset_id": str(), "assignee": str(), "previous_assignee": str(), "by": str(), "actor_id": str(), "link": str(),
+	}),
 	"integrity.alert": object([]string{"repository"}, map[string]any{
 		"source": str(), "kind": str(), "severity": str(), "title": str(), "repository": str(), "ref": str(), "asset_id": str(), "finding_id": str(), "findings": array(findingBriefSchema), "link": str(),
 	}),

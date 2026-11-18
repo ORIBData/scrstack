@@ -42,7 +42,7 @@ func qaError(w http.ResponseWriter, err error) {
 		writeError(w, 403, err.Error())
 	case errors.Is(err, errNoSealer):
 		writeError(w, 503, err.Error())
-	case errors.Is(err, assessments.ErrQAProfile), errors.Is(err, assessments.ErrQANoAssessment), errors.Is(err, assessments.ErrQABlocked), errors.Is(err, assessments.ErrQAProvider), errors.Is(err, assessments.ErrQASource):
+	case errors.Is(err, assessments.ErrQAProfile), errors.Is(err, assessments.ErrQANoAssessment), errors.Is(err, assessments.ErrQABlocked), errors.Is(err, assessments.ErrQAProvider), errors.Is(err, assessments.ErrQASource), errors.Is(err, assessments.ErrAISummaryProvider), errors.Is(err, assessments.ErrQATriageUnassessed):
 		writeError(w, 409, err.Error())
 	case errors.Is(err, assessments.ErrQAState):
 		writeError(w, 409, "not allowed in the current state")
@@ -111,6 +111,7 @@ func (h qaHandler) asset(ctx context.Context, w http.ResponseWriter, r *http.Req
 			Kind          string     `json:"kind"`
 			AssessmentID  *uuid.UUID `json:"assessment_id"`
 			IncludeDrafts bool       `json:"include_drafts"`
+			Ref           string     `json:"ref"`
 		}
 		if !readBody(w, r, &input) {
 			return
@@ -122,13 +123,17 @@ func (h qaHandler) asset(ctx context.Context, w http.ResponseWriter, r *http.Req
 			qaError(w, errQAAdmin)
 			return
 		}
-		run, err := h.store.EnqueueQARun(ctx, asset, input.AssessmentID, input.Kind, input.IncludeDrafts, principal.Name)
+		runs, err := h.store.EnqueueQA(ctx, assessments.QAEnqueue{Asset: asset, Assessment: input.AssessmentID, Kind: input.Kind, IncludeDrafts: input.IncludeDrafts, Ref: input.Ref, By: principal.Name})
 		if err != nil {
 			qaError(w, err)
 			return
 		}
-		w.Header().Set("Location", BasePath+"/qa/runs/"+run.ID.String())
-		writeJSON(w, 202, run)
+		w.Header().Set("Location", BasePath+"/qa/runs/"+runs[0].ID.String())
+		if input.Kind == assessments.QAKindFull {
+			writeJob(w, 202, runs[0].ID, map[string]any{"runs": runs})
+			return
+		}
+		writeJob(w, 202, runs[0].ID, runs[0])
 	case "runs GET":
 		filter := assessments.QARunFilter{Asset: asset, Kind: query.Get("kind"), Status: query.Get("status"), Limit: 50}
 		if raw := query.Get("before"); raw != "" {
@@ -184,7 +189,7 @@ func (h qaHandler) asset(ctx context.Context, w http.ResponseWriter, r *http.Req
 			return
 		}
 		w.Header().Set("Location", BasePath+"/qa/generations/"+g.ID.String())
-		writeJSON(w, 202, g)
+		writeJob(w, 202, g.ID, g)
 	case "generations GET":
 		items, err := h.store.QAGenerations(ctx, asset, 50)
 		if err != nil {
@@ -222,6 +227,10 @@ type profileInput struct {
 	Perf              *assessments.QAPerf `json:"perf"`
 	LLMProviderID     *uuid.UUID          `json:"llm_provider_id"`
 	AllowSourceUpload bool                `json:"allow_source_upload"`
+	Lint              *qa.Lint            `json:"lint"`
+	AITriage          bool                `json:"ai_triage"`
+	Functional        *bool               `json:"functional"`
+	Gate              string              `json:"gate"`
 }
 
 func (h qaHandler) putProfile(ctx context.Context, w http.ResponseWriter, r *http.Request, principal connections.Token, asset uuid.UUID) {
@@ -242,12 +251,15 @@ func (h qaHandler) putProfile(ctx context.Context, w http.ResponseWriter, r *htt
 		qaError(w, err)
 		return
 	}
-	p := assessments.QAProfile{AssetID: asset, Enabled: true, AutoRun: true, Refs: input.Refs, BaseURL: input.BaseURL, Environment: input.Environment, Tags: input.Tags, Threads: input.Threads, TimeoutSeconds: input.TimeoutSeconds, TestPath: "karate", OpenAPIPath: input.OpenAPIPath, Auth: input.Auth, Perf: input.Perf, LLMProviderID: input.LLMProviderID, AllowSourceUpload: input.AllowSourceUpload, VariableNames: existing.VariableNames}
+	p := assessments.QAProfile{AssetID: asset, Enabled: true, AutoRun: true, Functional: true, Refs: input.Refs, BaseURL: input.BaseURL, Environment: input.Environment, Tags: input.Tags, Threads: input.Threads, TimeoutSeconds: input.TimeoutSeconds, TestPath: "karate", OpenAPIPath: input.OpenAPIPath, Auth: input.Auth, Perf: input.Perf, Lint: input.Lint, AITriage: input.AITriage, LLMProviderID: input.LLMProviderID, AllowSourceUpload: input.AllowSourceUpload, Gate: input.Gate, VariableNames: existing.VariableNames}
 	if input.Enabled != nil {
 		p.Enabled = *input.Enabled
 	}
 	if input.AutoRun != nil {
 		p.AutoRun = *input.AutoRun
+	}
+	if input.Functional != nil {
+		p.Functional = *input.Functional
 	}
 	if input.TestPath != nil {
 		p.TestPath = strings.Trim(*input.TestPath, "/")
@@ -317,7 +329,7 @@ func (h qaHandler) item(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		writeError(w, 404, "not found")
 		return
 	}
-	if r.Method != http.MethodGet && !principal.Allows("write") && !(collection == "runs" && action == "cancel" && principal.Allows("trigger")) {
+	if r.Method != http.MethodGet && !principal.Allows("write") && !(collection == "runs" && action == "cancel" && (principal.Allows("trigger") || principal.Allows("qa"))) {
 		writeError(w, 403, "write scope required")
 		return
 	}
@@ -360,6 +372,50 @@ func (h qaHandler) item(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		writeJSON(w, 200, body)
 	case "runs/report: GET":
 		h.report(ctx, w, id)
+	case "runs/triage: POST":
+		var input struct {
+			ProviderID *uuid.UUID `json:"provider_id"`
+		}
+		if !readBody(w, r, &input) {
+			return
+		}
+		run, err := h.store.QARunByID(ctx, id)
+		if err != nil {
+			qaError(w, err)
+			return
+		}
+		provider := input.ProviderID
+		if provider == nil {
+			// Default to the provider the profile names.
+			p, err := h.store.QAProfileFor(ctx, run.AssetID)
+			if err != nil || p.LLMProviderID == nil {
+				writeError(w, 400, "provider_id is required: the asset's QA profile names no llm_provider_id (see GET /llm/providers)")
+				return
+			}
+			provider = p.LLMProviderID
+		}
+		policy := llm.SourcePolicy{Private: h.llmHosts, AllowHosted: h.allowSource}
+		job, err := h.store.EnqueueQATriage(ctx, id, *provider, principal.Name, func(p assessments.LLMProvider) bool {
+			_, ok := policy.Check(llmSettings(p), p.SourceAckAt != nil)
+			return ok
+		})
+		if err != nil {
+			qaError(w, err)
+			return
+		}
+		w.Header().Set("Location", BasePath+"/summary-jobs/"+job.ID.String())
+		writeJob(w, 202, job.ID, job)
+	case "runs/triage: GET":
+		if _, err := h.store.QARunByID(ctx, id); err != nil {
+			qaError(w, err)
+			return
+		}
+		items, err := h.store.QATriages(ctx, id)
+		if err != nil {
+			qaError(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"items": items})
 	case "runs/:cancel POST":
 		run, err := h.store.CancelQARun(ctx, id, principal.Name)
 		if err != nil {

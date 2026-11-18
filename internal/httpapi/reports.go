@@ -129,7 +129,7 @@ func (h reportHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Location", BasePath+"/reports/"+job.ID.String())
 		w.Header().Set("Retry-After", "5")
-		writeJSON(w, 202, job)
+		writeJob(w, 202, job.ID, job)
 	case path == "/reports" && r.Method == http.MethodGet:
 		before, err := pageUUID(r, "cursor")
 		if err != nil {

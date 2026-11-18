@@ -55,7 +55,7 @@ func (h mirrorHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !created {
 			status = 200
 		}
-		writeJSON(w, status, m)
+		writeJob(w, status, m.ID, m)
 		return
 	}
 	items, err := h.store.Mirrors(ctx, asset)

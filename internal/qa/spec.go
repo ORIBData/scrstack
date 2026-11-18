@@ -21,6 +21,8 @@ const (
 	KindPerformance = "performance"
 )
 
+// KindLint is declared in lint.go.
+
 // Runner job states. Passed and failed mean the tests ran and reports
 // exist; error means they could not run.
 const (
@@ -69,6 +71,7 @@ type JobSpec struct {
 	Suites         []Suite           `json:"suites"`
 	Variables      map[string]string `json:"variables,omitempty"`
 	Perf           *Perf             `json:"perf,omitempty"`
+	Lint           *Lint             `json:"lint,omitempty"`
 }
 
 var (
@@ -128,16 +131,28 @@ func (s JobSpec) Validate() error {
 	switch {
 	case !jobID.MatchString(s.ID):
 		return errors.New("id must be a lower-case UUID")
-	case s.Kind != KindFunctional && s.Kind != KindPerformance:
-		return errors.New("kind must be functional or performance")
+	case s.Kind != KindFunctional && s.Kind != KindPerformance && s.Kind != KindLint:
+		return errors.New("kind must be functional, performance or lint")
 	case s.Env != "" && !envName.MatchString(s.Env):
 		return errors.New("env must be a short lower-case name")
 	case s.Threads < 1 || s.Threads > 16:
 		return errors.New("threads must be 1 to 16")
 	case s.TimeoutSeconds < 30 || s.TimeoutSeconds > 7200:
 		return errors.New("timeout_seconds must be 30 to 7200")
-	case len(s.Suites) == 0 || len(s.Suites) > 4:
+	case s.Kind != KindLint && (len(s.Suites) == 0 || len(s.Suites) > 4):
 		return errors.New("one to four suites")
+	}
+	if s.Kind == KindLint {
+		switch {
+		case s.Lint == nil:
+			return errors.New("a lint job needs lint settings")
+		case len(s.Suites) > 0 || len(s.Variables) > 0 || s.Perf != nil || s.BaseURL != "":
+			return errors.New("lint jobs take no suites, variables, perf settings or base_url")
+		}
+		return s.Lint.Validate()
+	}
+	if s.Lint != nil {
+		return errors.New("lint settings belong to lint jobs")
 	}
 	if err := ValidBaseURL(s.BaseURL); err != nil {
 		return err
@@ -212,9 +227,11 @@ type JobStatus struct {
 type Info struct {
 	Karate  string `json:"karate"`
 	Gatling bool   `json:"gatling"`
-	Slots   int    `json:"slots"`
-	Queued  int    `json:"queued"`
-	Running int    `json:"running"`
+	// LintTools are the linters installed on the runner.
+	LintTools []string `json:"lint_tools"`
+	Slots     int      `json:"slots"`
+	Queued    int      `json:"queued"`
+	Running   int      `json:"running"`
 }
 
 // MaxBundleBytes and MaxReportBytes bound the archives on the wire.

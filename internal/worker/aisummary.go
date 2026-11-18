@@ -169,6 +169,14 @@ func (w Worker) aiSummary(ctx context.Context, j assessments.AISummary) (assessm
 	if err != nil {
 		return res, false, errors.New("LLM provider settings invalid: " + err.Error())
 	}
+	if j.Options.QARunID != nil {
+		// QA entries carry paths and failure text: checked again here, as
+		// for a code review, in case the provider changed since queueing.
+		if _, ok := w.sourcePolicy().Check(settings, provider.SourceAckAt != nil); !ok {
+			return res, false, assessments.ErrQASource
+		}
+		return w.aiQATriage(ctx, j, provider, settings, client)
+	}
 	a, err := w.Store.Get(ctx, j.AssessmentID)
 	if err != nil {
 		return res, true, err

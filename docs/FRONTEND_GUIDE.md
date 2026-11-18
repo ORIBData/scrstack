@@ -33,6 +33,7 @@ what the token cannot do.
 | `write` | Also trigger assessments, triage findings, edit assets and owners, request reports, edit QA, SAST and local advisories. |
 | `admin` | Also manage tokens, connections, webhooks, retention, waivers (`accepted`, `suppressed`, `false_positive`), LLM providers, integrations, the audit log. |
 | `trigger` | Queue assessments and QA runs only (automation, not a person). |
+| `qa` | Only the QA screens: read QA profiles, runs, reports and coverage, start or cancel runs. It cannot see assessments, findings or assets, so it suits a QA pipeline or a QA-only back-office role. |
 
 Give a browser session a `read` or `write` token, never `admin`, unless it is the
 operator console. `POST /tokens` (admin) returns the secret once; store it only in memory
@@ -162,7 +163,35 @@ the per-kind endpoints, which carry the results. It lists work, not schedules:
   from) and queues fresh scans; `GET /incidents/{id}` shows the report with the live state of those scans.
   The sweep only reads: containment is manual.
 
-### Reports, licences, SAST, QA, AI
+### QA screens
+
+QA runs functional (Karate), load (Gatling) and lint checks against a deployed environment. Results never
+change a verdict.
+
+- **Profile page** (per repository): `GET`/`PUT /assets/{id}/qa/profile` (`PUT` needs `admin` and `If-Match`).
+  Fields to show: `base_url`, `refs`, `auto_run`, `functional`, `lint.tools`, `perf`, `ai_triage` and `gate`.
+  Build the linter picker from `GET /qa/runner` (`runner.lint_tools`: only the linters installed on the runner).
+  `gate: assessment` (default) tests commits that passed a security assessment; `gate: none` lets QA run on
+  its own, so label it clearly ("runs without a security scan").
+- **Run list:** `GET /assets/{id}/qa/runs` with `kind` and `status` filters; page with `before` and
+  `next_before`. On an assessment page use `GET /assessments/{id}/qa`.
+- **Start a run:** `POST /assets/{id}/qa/runs` with `kind` `full`, `functional`, `performance` or `lint`.
+  With `gate: none` add `ref` (a branch the profile covers; empty is the default branch). `full` answers
+  `{runs: [...]}`; the others answer one run. Show the `409` message (no enabled profile, no assessed commit,
+  or a `fail` verdict) and the `400` message (what the profile still lacks).
+- **Run detail:** poll `GET /qa/runs/{id}` until `status` is final (`passed`, `failed`, `error`, `cancelled`,
+  `skipped`). A run with `assessment_id: null` was not tied to an assessment; `commit` fills in when the worker
+  starts it. Then `GET /qa/runs/{id}/scenarios?status=failed`, `/coverage` and `/report` (download).
+- **Trend:** `GET /assets/{id}/qa/coverage` is one point per finished functional run.
+- **Lint results** are register entries: `GET /register?type=qa_lint` (one per tool, rule and file; `evidence`
+  lists the lines). `type=qa_lint_config` means a linter could not run or its result is incomplete, so show it as
+  a setup warning rather than a code problem.
+- **AI triage** (`ai_triage` on the profile) writes a summary to the asset's chronicle, but only for runs tied
+  to an assessment; a run without one answers `409` on `POST /qa/runs/{id}/triage`.
+- **Security-only assessment.** `skip_qa: true` on `POST /assessments` keeps QA out of that assessment. Offer it
+  as a checkbox on the "Assess now" dialog.
+
+### Reports, licences, SAST, AI
 
 - Ask the chronicle: `GET /assets/{id}/chronicle/search?q=...` returns the nearest chunks of the asset's
   advisories, summaries and reviews with a `score`; show `unindexed_documents` as "N documents not searchable yet"

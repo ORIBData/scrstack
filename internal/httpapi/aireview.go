@@ -64,7 +64,7 @@ func (h aiReviewHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Location", BasePath+"/ai-reviews/"+review.ID.String())
-		writeJSON(w, 202, review)
+		writeJob(w, 202, review.ID, review)
 	case r.Method == http.MethodGet && r.URL.Path == BasePath+"/assets/"+id.String()+"/ai-reviews":
 		items, err := h.store.AIReviews(ctx, id, 50)
 		if err != nil {

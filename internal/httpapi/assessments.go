@@ -155,7 +155,7 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Idempotent-Replayed", "true")
 		}
 		w.Header().Set("Location", BasePath+"/assessments/"+a.ID.String())
-		writeJSON(w, status, a)
+		writeJob(w, status, a.ID, a)
 		return
 	}
 	if r.URL.Path == BasePath+"/assessments" {
@@ -185,7 +185,7 @@ func (h assessmentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Location", BasePath+"/assessments/"+a.ID.String())
 			w.Header().Set("Retry-After", "5")
-			writeJSON(w, status, a)
+			writeJob(w, status, a.ID, a)
 			return
 		}
 		q := r.URL.Query()
@@ -557,7 +557,7 @@ func (h assessmentHandler) batch(ctx context.Context, w http.ResponseWriter, r *
 		if replayed {
 			status = 200
 		}
-		results = append(results, map[string]any{"index": i, "status": status, "assessment_id": a.ID, "location": BasePath + "/assessments/" + a.ID.String()})
+		results = append(results, map[string]any{"index": i, "status": status, "assessment_id": a.ID, "job_id": a.ID, "status_url": BasePath + "/jobs/" + a.ID.String(), "location": BasePath + "/assessments/" + a.ID.String()})
 	}
 	writeJSON(w, 207, map[string]any{"items": results})
 }

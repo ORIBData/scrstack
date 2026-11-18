@@ -132,7 +132,7 @@ func TestPostgresContractScopesMatchRouter(t *testing.T) {
 	// for trigger tokens, admin for source archives), so an unknown id answers
 	// 404 to a token that is refused on a real one.
 	afterLookup := map[string]bool{"GET /assessments/{id}/snapshot": true, "DELETE /assessments/{id}": true}
-	scopes := []string{"read", "write", "trigger", "ingest:relay", "admin"}
+	scopes := []string{"read", "write", "trigger", "qa", "ingest:relay", "admin"}
 	var tokens map[string]string
 	issue := func() {
 		tokens = map[string]string{}
