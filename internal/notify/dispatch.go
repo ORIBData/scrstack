@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ORIBData/scrstack/internal/mailer"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/google/uuid"
 )
@@ -67,7 +68,10 @@ type Dispatcher struct {
 	// Document optionally replaces an assessment event's data with a richer
 	// profile document (full/agent). It must apply that profile's safeguards.
 	Document func(ctx context.Context, assessment uuid.UUID, sub Subscription) (json.RawMessage, error)
-	client   *http.Client
+	// Mail delivers subscriptions whose url is mailto:. Nil or disabled makes
+	// them fail with a clear reason instead of being dropped.
+	Mail   mailer.Sender
+	client *http.Client
 }
 
 // SafeClient connects only to addresses it validated itself, so DNS cannot
@@ -179,6 +183,9 @@ func (d *Dispatcher) send(ctx context.Context, c claimed) (int, string) {
 	}
 	if !sub.Enabled {
 		return 0, "subscription disabled"
+	}
+	if IsMail(sub.URL) {
+		return d.sendMail(ctx, c, sub)
 	}
 	secret, err := s.open(sub.ID, ciphertext)
 	if err != nil {

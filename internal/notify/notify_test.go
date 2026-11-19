@@ -3,6 +3,7 @@ package notify
 import (
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,5 +49,32 @@ func TestSubscriptionURLPolicy(t *testing.T) {
 	}
 	if !validEvents([]string{"assessment.completed", "integrity.alert"}) || validEvents([]string{"assessment.completed", "assessment.completed"}) || validEvents([]string{"made.up"}) || validEvents(nil) {
 		t.Fatal("event filter validation wrong")
+	}
+}
+
+func TestMailDestinationPolicyAndRendering(t *testing.T) {
+	s := &Store{MailEnabled: true}
+	for raw, want := range map[string]bool{
+		"mailto:ops@example.com":                  true,
+		"mailto:ops@example.com, sec@example.com": true,
+		"mailto:":                              false,
+		"mailto:ops@example.com?bcc=x@y.z":     false, // no headers or body from the url
+		"mailto:Ops <ops@example.com>":         false,
+		"mailto:nope":                          false,
+		"mailto:ops@example.com\r\nBcc: x@y.z": false,
+	} {
+		if got := s.validDestination(raw, "summary"); got != want {
+			t.Errorf("%q: got %v want %v", raw, got, want)
+		}
+	}
+	if s.validDestination("mailto:ops@example.com", "full") || s.validDestination("mailto:ops@example.com", "agent") {
+		t.Error("full and agent profiles must not be mailed")
+	}
+	if (&Store{}).validDestination("mailto:ops@example.com", "summary") {
+		t.Error("email accepted while SMTP is not configured")
+	}
+	subject, text := renderMail("qa.failed", []byte(`{"event":{"id":"e1","time":"t"},"data":{"qa_run":{"kind":"lint","status":"failed","error":"boom"}}}`))
+	if subject != "[SCRS] QA run failed: lint" || !strings.Contains(text, "boom") {
+		t.Errorf("render: %q %q", subject, text)
 	}
 }

@@ -40,6 +40,14 @@ services:
       SCRS_RELAY_ENABLED: ${SCRS_RELAY_ENABLED:-false}
       SCRS_MASS_DELETION_FILES: ${SCRS_MASS_DELETION_FILES:-50}
       SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
+      # Transactional email (any SMTP provider). Unset SMTP_HOST disables it.
+      SMTP_DRIVER: ${SMTP_DRIVER:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
       SCRS_WEBHOOK_PRIVATE_HOSTS: ${SCRS_WEBHOOK_PRIVATE_HOSTS:-}
       # TAXII feed hosts allowed to resolve to private addresses (feed checks).
       SCRS_TAXII_PRIVATE_HOSTS: ${SCRS_TAXII_PRIVATE_HOSTS:-}
@@ -222,6 +230,14 @@ services:
       SCRS_SCANNER_API_TOKEN: ${SCRS_SCANNER_API_TOKEN:?Set a separate random scanner service token}
       # Outbound webhooks are delivered from the worker (OUT-001/002).
       SCRS_PUBLIC_BASE_URL: ${SCRS_PUBLIC_BASE_URL:-}
+      # Transactional email (any SMTP provider). Unset SMTP_HOST disables it.
+      SMTP_DRIVER: ${SMTP_DRIVER:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
       SCRS_WEBHOOK_PRIVATE_HOSTS: ${SCRS_WEBHOOK_PRIVATE_HOSTS:-}
       SCRS_EVENT_MAX_BYTES: ${SCRS_EVENT_MAX_BYTES:-1048576}
       SCRS_EVENT_FIELD_MAX: ${SCRS_EVENT_FIELD_MAX:-512}

@@ -8,7 +8,7 @@ Every path is relative to `/scrs/v1`. A token needs **any one** of the scopes in
 
 Health, readiness, metrics, platform status and this documentation.
 
-`GET /system/healthz` and `/system/readyz` are public probes for load balancers. `GET /system/status` (token) rolls up every dependency (database, Redis, storage, scanner, SAST, QA runner) for a status banner; changes arrive as `system.degraded` and `system.recovered` events.
+`GET /system/healthz` and `/system/readyz` are public probes for load balancers. `GET /system/status` (token) rolls up the database, Redis, storage, scanner, SAST and QA runner for a status banner; each component is `ok`, `degraded`, `down` or `not_configured`. Changes arrive as `system.degraded` and `system.recovered` events.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -25,7 +25,7 @@ Health, readiness, metrics, platform status and this documentation.
 
 Create, list and revoke API tokens (admin).
 
-A token has one or more scopes (`read`, `write`, `trigger`, `qa`, `ingest:relay`, `admin`), an optional IP allow-list and an optional expiry. The secret is returned once, by `POST /tokens`. Give each integration its own token so the audit log and `requested_by` say who did what.
+A token has scopes (`read`, `write`, `trigger`, `qa`, `ingest:relay`, `admin`), an optional IP allow-list and an optional expiry. The secret is returned once, by `POST /tokens`. Give each integration its own token so the audit log and `requested_by` say who did what.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -37,7 +37,7 @@ A token has one or more scopes (`read`, `write`, `trigger`, `qa`, `ingest:relay`
 
 Accounts SCRS reads from: GitHub, GitLab, Docker Hub, Google Artifact Registry, Harbor and any OCI registry (admin).
 
-Set-up order: `POST /connections` (credential is write-only), `POST /connections/{id}:test` to check it, `POST /connections/{id}:discover` to list what it can see, `POST /connections/{id}:webhook` to get the receiver URL and secret for inbound webhooks. The connection `scope` (include and exclude patterns) decides which discovered assets are assessed.
+Set-up order: `POST /connections` (credential is write-only), `POST /connections/{id}:test`, `POST /connections/{id}:discover`, then `POST /connections/{id}:webhook` for the receiver URL and secret. The connection `scope` (include and exclude patterns) decides which discovered assets are assessed.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -55,7 +55,7 @@ Set-up order: `POST /connections` (credential is write-only), `POST /connections
 
 The repositories, images and uploaded archives SCRS knows about, with the business context you give them.
 
-Discovery fills the list; `PATCH /assets/{id}` sets owner, environment, criticality, exposure and labels (needs `If-Match`). Add something discovery does not list with `POST /assets`, `POST /assets:import` or `POST /uploads`. Per asset you also find its revisions, SBOM diff, licences, links between an image and its repository, GitHub Actions check, QA and SAST settings, and AI reviews.
+Discovery fills the list; `PATCH /assets/{id}` sets owner, environment, criticality, exposure and labels (needs `If-Match`). Add what discovery does not list with `POST /assets`, `POST /assets:import` or `POST /uploads`. Per asset you also find revisions, SBOM diff, links between an image and its repository and the GitHub Actions check. Owners are under `/owners`.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -94,7 +94,9 @@ Git history bundles of repository assets, kept so a repository can be restored a
 
 Start, follow and list assessments.
 
-`POST /assessments` queues one (answers `202`). Follow it with `GET /assessments/{id}?wait=30` or an `assessment.completed` event. `POST /assessments:batch` starts many with one result each. Set `skip_qa` to keep QA out of an assessment. Results are under **Assessment results**.
+**Recipe (n8n, CI).** `POST /assessments` with `{"target": {"type": "git", "repository": "acme/api", "ref": "main"}, "trigger": {"origin": "n8n"}}` and an `Idempotency-Key` (a `trigger` token is enough). It answers `202`. Wait with `GET /assessments/{id}?wait=30`, or subscribe to `assessment.completed`. `POST /assessments:batch` starts many. Send `skip_qa` to keep QA out.
+
+**States.** `status`: `queued`, `running`, `succeeded` (a verdict exists), `failed`, `cancelled`. `verdict`, worst first: `fail`, `incomplete` (a stage could not finish), `warn`, `pass`. A partial scan is never `pass`.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -132,11 +134,37 @@ Record a report from another scanner (Trivy JSON or SARIF) as an assessment, so 
 | --- | --- | --- | --- |
 | POST | `/assessments:import` | `write` or `trigger` | Import a Trivy or SARIF report |
 
+## Jobs
+
+The one place to follow any long-running work: assessments, QA runs and generations, AI summaries and reviews, reports, mirrors and Dependency-Track uploads.
+
+The starting call answers `202` with a `Location`, a `job_id` and a `status_url`. Then either wait on the resource (`GET /assessments/{id}?wait=30`), poll `GET /jobs/{job_id}` (same shape for every kind: `queued`, `running`, then `succeeded`, `failed` or `cancelled`), or be told by an event (`POST /webhooks`, or `GET /events` in a browser). Cancel with `POST /jobs/{id}:cancel`.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/jobs` | `read` or `write` | List background jobs |
+| GET | `/jobs/{id}` | `read` or `write` | Read one job |
+| POST | `/jobs/{id}:cancel` | `admin` | Cancel a job |
+
+## Live events
+
+Server-sent events for a browser UI: short notices that something changed (`GET /events`).
+
+Events carry ids to fetch, not full payloads, and missed events are not replayed: reload the screen when you connect and on `resync`. Webhooks remain the guaranteed delivery path. A browser `EventSource` cannot send an `Authorization` header, so read the stream with `fetch`.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/events` | `read` or `write` | Stream live events |
+
 ## Risk register
 
 One list of findings across all assessments, deduplicated, with their triage lifecycle.
 
-Screens: `GET /register` (filter by asset, status, severity, type, assignee), `GET /register/summary`, `/timeseries` and `/top-assets` for dashboards, `GET /register/export` for a download. Work on an entry: `PATCH /register/{id}` (status with a reason), `PUT /register/{id}/assignee`, `POST /register/{id}/comments`, and read `GET /register/{id}/events` for its history.
+**Screens.** `GET /register` (filter by asset, status, severity, type, assignee), `GET /register/summary`, `/timeseries` and `/top-assets` for the dashboard, `GET /register/export` for a download.
+
+**Triage.** `PATCH /register/{id}` (status plus a `reason` of 8 to 2000 characters; waiving needs `admin`), `PUT /register/{id}/assignee`, `POST /register/{id}/comments`, history in `GET /register/{id}/events`.
+
+**States.** `severity`: `critical`, `high`, `medium`, `low`, `info`, `unknown`. `status`: `open`, `triaged`, `in_progress`, `accepted` (until `waiver_until`), `suppressed`, `false_positive`, `fixed`.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
@@ -164,151 +192,64 @@ Guided fix plans for npm (`package-lock.json`) and Maven (`pom.xml`) manifests. 
 | POST | `/assets/{id}/remediations` | `write` | Request a fix plan |
 | GET | `/remediation/capabilities` | `read` or `write` | Supported fix-plan ecosystems |
 
-## Ingest
+## Advisories and summaries
 
-Where GitHub, GitLab and registries send events (push, pull request, image push).
+A language model writes an **assessment summary** (headline, risk level, priorities) and an **advisory** (explanation, action, urgency) for an assessment's most important findings. It sees findings and advisory text only, never code.
 
-Each connection has its own receiver (`/ingest/<provider>/<connection>`), checked by signature or secret. Automation such as n8n can forward the unchanged body with an `ingest:relay` token instead. These calls queue assessments; a person does not call them.
+Flow: `POST /assessments/{id}/summaries` with a `provider_id`, poll `GET /summary-jobs/{id}`, then read `GET /assets/{id}/chronicle`. The chronicle is the asset's history of written documents, oldest first; a new one *supersedes* the old (`superseded_at`, `supersedes`). Every document has `origin: llm` and a `provenance` (model, provider, prompt version, what the guard removed), and is not verified.
 
-| Method | Path | Access | What it does |
-| --- | --- | --- | --- |
-| POST | `/ingest/github` | signature or secret, or `ingest:relay` | GitHub events (direct or relay) |
-| POST | `/ingest/github/{connection}` | signature or secret, or `ingest:relay` | GitHub events for one connection |
-| POST | `/ingest/gitlab` | signature or secret, or `ingest:relay` | GitLab events (direct or relay) |
-| POST | `/ingest/gitlab/{connection}` | signature or secret, or `ingest:relay` | GitLab events for one connection |
-| POST | `/ingest/registry/{provider}` | `ingest:relay` | Registry push events |
-| POST | `/ingest/registry/{provider}/{connection}` | signature or secret | Registry push events for one connection |
-| POST | `/webhooks/github` | signature or secret | GitHub webhook (direct) |
-
-## Webhook subscriptions
-
-Outbound webhooks: SCRS sends signed events to your URL (admin).
-
-Create one with `POST /webhooks`, choose events and a payload profile, and keep the secret and `X-SCRS-Auth` value shown once. `POST /webhooks/{id}:test` sends a `ping`. The delivery log shows each attempt, and a `dead` delivery can be redelivered.
+Described: vulnerabilities (SCRS's own and Dependency-Track's), malicious dependencies, licence, integrity and configuration findings. Only counted, not described: code analysis (SAST), secret detection, AI review entries, malware, YARA and IOC matches, and QA entries.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/schemas/events` | `read` or `write` or `trigger` | List event schemas |
-| GET | `/schemas/events/{type}/{version}` | `read` or `write` or `trigger` | Get one event JSON Schema |
-| GET | `/webhooks` | `admin` | List subscriptions |
-| POST | `/webhooks` | `admin` | Create a subscription |
-| DELETE | `/webhooks/{id}` | `admin` | Disable a subscription |
-| GET | `/webhooks/{id}` | `admin` | Get a subscription |
-| PATCH | `/webhooks/{id}` | `admin` | Update a subscription |
-| GET | `/webhooks/{id}/deliveries` | `admin` | Delivery log |
-| GET | `/webhooks/{id}/deliveries/{delivery}` | `admin` | Get one delivery |
-| POST | `/webhooks/{id}/deliveries/{delivery}:redeliver` | `admin` | Redeliver an event |
-| POST | `/webhooks/{id}:rotate-secret` | `admin` | Rotate the signing secret |
-| POST | `/webhooks/{id}:test` | `admin` | Send a ping event |
+| GET | `/assessments/{id}/summaries` | `read` or `write` | List an assessment's summary jobs |
+| POST | `/assessments/{id}/summaries` | `write` or `trigger` | Write advisories and a summary for an assessment |
+| GET | `/assets/{id}/chronicle` | `read` or `write` | The asset's chronicle of advisories, summaries and reviews |
+| GET | `/assets/{id}/chronicle/search` | `read` or `write` | Search the chronicle by meaning |
+| POST | `/knowledge:backfill` | `admin` | Index documents that have no vectors |
+| GET | `/summary-jobs/{id}` | `read` or `write` | Get a summary job |
 
-## Threat intelligence
+## AI review
 
-Threat data SCRS matches against what it scans: indicators of compromise (manual, STIX or a TAXII feed), YARA rulesets, advisory and malicious-package feeds, local advisories and imported VEX documents.
+A language model reads the source of an assessed commit and reports risks and bugs as report-only register entries of type `ai_review`, marked `unverified`. They never change a verdict.
 
-Sources and rulesets have a mode: `hunt` records matches without changing a verdict, `alert` gates by severity, `block` fails the verdict on any match. `alert` and `block` need `admin`.
+Source goes only to a provider whose `source_allowed` is true (see **LLM providers**). Flow: `POST /assets/{id}/ai-reviews`, poll `GET /ai-reviews/{id}`, then list entries with `GET /register?asset_id=&type=ai_review`.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/advisories` | `read` or `write` | Search advisories |
-| POST | `/advisories` | `write` | Create a local advisory |
-| GET | `/advisories/{id}` | `read` or `write` | Read one advisory |
-| GET | `/advisories/{id}/affected` | `read` or `write` | Components a local advisory names |
-| POST | `/advisories/{id}:withdraw` | `write` | Withdraw a local advisory |
-| GET | `/feeds/indicators` | `admin` | Active indicator bundle |
-| PUT | `/feeds/indicators` | `admin` | Import and activate an indicator bundle |
-| GET | `/intel/indicator-sources` | `read` or `write` | Indicator sources |
-| POST | `/intel/indicator-sources` | `write` | Create an indicator source |
-| DELETE | `/intel/indicator-sources/{id}` | `write` | Delete an indicator source |
-| GET | `/intel/indicator-sources/{id}` | `read` or `write` | Indicator source |
-| PATCH | `/intel/indicator-sources/{id}` | `write` | Change an indicator source |
-| GET | `/intel/indicator-sources/{id}/indicators` | `read` or `write` | A source's indicators |
-| PUT | `/intel/indicator-sources/{id}/indicators` | `write` | Replace a source's indicators |
-| GET | `/intel/indicator-sources/{id}/taxii` | `read` or `write` | TAXII feed settings and poll state |
-| PATCH | `/intel/indicator-sources/{id}/taxii` | `admin` | Change a TAXII feed |
-| POST | `/intel/indicator-sources/{id}:hunt` | `write` | Retro-hunt with a source |
-| POST | `/intel/indicator-sources/{id}:import-csv` | `write` | Import indicators from CSV |
-| POST | `/intel/indicator-sources/{id}:import-stix` | `write` | Upload a STIX 2.1 bundle |
-| POST | `/intel/indicator-sources/{id}:poll` | `admin` | Poll a TAXII feed now |
-| POST | `/intel/indicator-sources/{id}:test` | `admin` | Check a TAXII feed's settings |
-| GET | `/intel/vex-documents` | `read` or `write` | List imported VEX documents |
-| POST | `/intel/vex-documents` | `write` | Import a VEX document |
-| DELETE | `/intel/vex-documents/{id}` | `admin` | Delete a VEX document |
-| GET | `/intel/vex-statements` | `read` or `write` | Find vendor statements |
-| GET | `/intel/vulnerabilities/{id}` | `read` or `write` | Everything known about a vulnerability |
-| GET | `/intel/vulnerability-sources` | `read` or `write` | List vulnerability and advisory sources |
-| GET | `/intel/vulnerability-sources/{key}` | `read` or `write` | Get one advisory source |
-| PATCH | `/intel/vulnerability-sources/{key}` | `admin` | Enable, disable or reschedule a source |
-| POST | `/intel/vulnerability-sources/{key}:sync` | `admin` | Sync an advisory source now |
-| GET | `/intel/yara-rulesets` | `read` or `write` | YARA rulesets |
-| POST | `/intel/yara-rulesets` | `write` | Create a YARA ruleset |
-| DELETE | `/intel/yara-rulesets/{id}` | `write` | Delete a YARA ruleset |
-| GET | `/intel/yara-rulesets/{id}` | `read` or `write` | YARA ruleset with its rules |
-| PATCH | `/intel/yara-rulesets/{id}` | `write` | Change a YARA ruleset |
-| POST | `/intel/yara-rulesets/{id}:hunt` | `write` | Retro-hunt with a ruleset |
-| POST | `/intel/yara-rulesets:validate` | `write` | Compile YARA rules without saving |
-| GET | `/policies/dependencies` | `read` or `write` | Dependency checks policy |
-| PUT | `/policies/dependencies` | `admin` | Change the dependency checks |
-| GET | `/policies/integrity` | `read` or `write` | Behavioural and size signals policy |
-| PUT | `/policies/integrity` | `admin` | Change the integrity signals |
+| GET | `/ai-reviews/{id}` | `read` or `write` | Get an AI code review |
+| GET | `/assets/{id}/ai-reviews` | `read` or `write` | List an asset's AI code reviews |
+| POST | `/assets/{id}/ai-reviews` | `write` or `trigger` | Review the code with a self-hosted model |
 
-## Operations
+## QA setup
 
-Running the platform (admin): maintenance jobs, the inbound event log, retention of each data class, scheduled work, versions and the audit log.
+Where and how a repository is tested. `PUT /assets/{id}/qa/profile` sets the environment, what to run (functional, performance, lint with `lint.tools`) and `auto_run`. `GET /qa/runner` lists what the QA runner has installed.
 
-Retention changes can be previewed with `POST /settings/retention:preview` before they are saved.
+The profile `gate` (admin) decides whether manual QA needs a passed assessment (`assessment`, default) or runs on its own against a ref (`none`). A token with only the `qa` scope can start and read QA and nothing else.
+
+The QA runner is a separate service with its own token. `GET /qa/runner` says whether it is reachable and which linters it has. It does no vulnerability, malware or SBOM work.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/audit` | `admin` | Query the audit log |
-| GET | `/events/inbound` | `admin` | Inbound event log |
-| GET | `/events/inbound/{id}` | `admin` | Get an inbound event |
-| POST | `/events/inbound/{id}:replay` | `admin` | Replay an event's assessment |
-| GET | `/incidents` | `read` or `write` | List incidents |
-| POST | `/incidents` | `admin` | Sweep what an account touched |
-| GET | `/incidents/{id}` | `read` or `write` | Read an incident |
-| GET | `/jobs` | `read` or `write` | List background jobs |
-| GET | `/jobs/{id}` | `read` or `write` | Read one job |
-| POST | `/jobs/{id}:cancel` | `admin` | Cancel a job |
-| POST | `/maintenance/rebuild` | `admin` | Re-assess current revisions |
-| POST | `/maintenance/redeliver-dead` | `admin` | Requeue all dead deliveries |
-| POST | `/maintenance/rescan` | `admin` | Rescan default branches |
-| POST | `/maintenance/reset` | `admin` | Reset one scope of data |
-| POST | `/maintenance/run` | `admin` | Run maintenance now |
-| GET | `/maintenance/schedule` | `admin` | Scheduled jobs and their last runs |
-| POST | `/maintenance/update-sensors` | `admin` | Refresh feeds now |
-| GET | `/maintenance/versions` | `admin` | Platform versions and update check |
-| GET | `/settings/retention` | `admin` | Get the retention policy |
-| PUT | `/settings/retention` | `admin` | Set the retention policy |
-| POST | `/settings/retention:preview` | `admin` | Preview what a retention change deletes |
-| POST | `/settings/retention:purge` | `admin` | Apply the retention policy now |
+| DELETE | `/assets/{id}/qa/profile` | `admin` | Remove a repository's QA profile |
+| GET | `/assets/{id}/qa/profile` | `read` or `write` or `qa` | Get a repository's QA profile |
+| PUT | `/assets/{id}/qa/profile` | `admin` | Create or replace a repository's QA profile |
+| GET | `/qa/runner` | `read` or `write` or `trigger` or `qa` | Karate runner status |
 
-## E2E QA
+## QA runs
 
-Functional (Karate), load (Gatling) and lint QA of a repository against its deployed environment, with API coverage, report-only findings and AI-drafted tests.
+Start, follow and read QA runs.
 
-**Runs.** A profile (`PUT /assets/{id}/qa/profile`) says where to test and what to run. Runs start two ways: automatically when an assessment finishes (profile `auto_run`), or on request with `POST /assets/{id}/qa/runs`. `kind: full` runs everything the profile configures. A run is a job: poll `GET /qa/runs/{id}`, then read scenarios, coverage and the report. Lint and test failures become `qa_*` entries in the risk register; they never change a verdict.
+**Recipe: QA without a security assessment.** An admin sets `"gate": "none"` in the profile. Then `POST /assets/{id}/qa/runs` with `{"kind": "full", "ref": "main"}` (`full` runs everything the profile configures and answers with the runs). Poll `GET /qa/runs/{id}`, then read `/scenarios`, `/coverage` and `/report`. Lint and test failures become `qa_*` entries in the risk register and never change a verdict.
 
-**With or without a security assessment.** By default a manual run tests a commit that passed an assessment, and a `fail` verdict blocks it. An admin can set the profile `gate` to `none` so QA runs on its own against the head of a ref. To keep QA out of one assessment, send `skip_qa` on `POST /assessments`. A token with only the `qa` scope can start and read QA and nothing else.
-
-**Lint.** The profile's `lint.tools` choose among ruff, mypy, bandit, pylint, phpstan, phpcs, clang-tidy, golangci-lint, eslint, ktlint, swiftlint and dart-analyze. `GET /qa/runner` lists what the runner has installed.
-
-**Runner.** The QA runner is a separate service on its own host, with its own token. An operator can also call it directly (`POST /v1/jobs`) for jobs that are not stored here. The runner does no vulnerability, malware or SBOM work. Details: `docs/QA_TESTING.md`.
+**States.** `queued`, `submitted`, `running`, then `passed` or `failed` (tests ran), `error` (could not run), `cancelled`, `skipped` (the assessment verdict was `fail`).
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
 | GET | `/assessments/{id}/qa` | `read` or `write` or `trigger` or `qa` | QA runs of an assessment |
 | GET | `/assets/{id}/qa/coverage` | `read` or `write` or `qa` | API coverage history of a repository |
-| GET | `/assets/{id}/qa/generations` | `read` or `write` or `qa` | List a repository's test generations |
-| POST | `/assets/{id}/qa/generations` | `write` | Draft tests with the profile's LLM |
-| DELETE | `/assets/{id}/qa/profile` | `admin` | Remove a repository's QA profile |
-| GET | `/assets/{id}/qa/profile` | `read` or `write` or `qa` | Get a repository's QA profile |
-| PUT | `/assets/{id}/qa/profile` | `admin` | Create or replace a repository's QA profile |
 | GET | `/assets/{id}/qa/runs` | `read` or `write` or `qa` | List a repository's QA runs |
 | POST | `/assets/{id}/qa/runs` | `write` or `trigger` or `qa` | Run QA tests now |
-| GET | `/assets/{id}/qa/suites` | `read` or `write` or `qa` | List generated test files |
-| GET | `/qa/generations/{id}` | `read` or `write` or `trigger` or `qa` | Get a test generation and its files |
-| GET | `/qa/generations/{id}/files` | `read` or `write` or `trigger` or `qa` | Download a generation's files |
-| GET | `/qa/runner` | `read` or `write` or `trigger` or `qa` | Karate runner status |
 | GET | `/qa/runs/{id}` | `read` or `write` or `trigger` or `qa` | Get a QA run |
 | GET | `/qa/runs/{id}/coverage` | `read` or `write` or `trigger` or `qa` | API coverage of a QA run |
 | GET | `/qa/runs/{id}/report` | `read` or `write` or `trigger` or `qa` | Download a QA run's reports |
@@ -316,9 +257,38 @@ Functional (Karate), load (Gatling) and lint QA of a repository against its depl
 | GET | `/qa/runs/{id}/triage` | `read` or `write` or `trigger` or `qa` | Triage jobs of a QA run |
 | POST | `/qa/runs/{id}/triage` | `write` | Ask a model to triage a finished QA run |
 | POST | `/qa/runs/{id}:cancel` | `write` or `trigger` or `qa` | Cancel a QA run |
+
+## QA test generation
+
+Tests drafted by the profile's LLM provider. `POST /assets/{id}/qa/generations` drafts Karate API features from the OpenAPI document (`api`) or unit tests for source files that have none (`unit`). Review each file, then `POST /qa/suites/{id}:approve` (admin) or `:reject`. Drafts never run; approved API features run in every later functional run.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/assets/{id}/qa/generations` | `read` or `write` or `qa` | List a repository's test generations |
+| POST | `/assets/{id}/qa/generations` | `write` | Draft tests with the profile's LLM |
+| GET | `/assets/{id}/qa/suites` | `read` or `write` or `qa` | List generated test files |
+| GET | `/qa/generations/{id}` | `read` or `write` or `trigger` or `qa` | Get a test generation and its files |
+| GET | `/qa/generations/{id}/files` | `read` or `write` or `trigger` or `qa` | Download a generation's files |
 | GET | `/qa/suites/{id}` | `read` or `write` or `trigger` or `qa` | Get a generated test file |
 | POST | `/qa/suites/{id}:approve` | `admin` | Approve a generated test file |
 | POST | `/qa/suites/{id}:reject` | `write` | Reject a generated test file |
+
+## SAST
+
+Static analysis of repository source with bundled analyzers (gosec, Bandit, OpenGrep, Bearer), Go call-graph reachability and npm and PyPI import-level reachability. They run in an isolated container without SCRS secrets. Settings apply platform-wide and per asset.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/assets/{id}/sast` | `read` or `write` | Asset SAST settings |
+| PUT | `/assets/{id}/sast` | `write` | Replace asset SAST settings |
+| GET | `/reachability/capabilities` | `read` or `write` | Reachability capabilities |
+| GET | `/sast/analyzers` | `read` or `write` | Bundled analyzers |
+| GET | `/sast/rulesets` | `read` or `write` | Custom OpenGrep rulesets |
+| POST | `/sast/rulesets` | `write` | Upload a custom ruleset |
+| DELETE | `/sast/rulesets/{id}` | `admin` | Delete a ruleset |
+| GET | `/sast/rulesets/{id}` | `read` or `write` | Get a ruleset |
+| GET | `/sast/settings` | `read` or `write` | Deployment SAST settings |
+| PUT | `/sast/settings` | `admin` | Replace deployment SAST settings |
 
 ## Licences
 
@@ -356,6 +326,45 @@ Flow: `GET /reports/frameworks`, then `POST /reports` with a framework and a sco
 | GET | `/reports/{id}` | `read` or `write` | Get a report job |
 | GET | `/reports/{id}/download` | `read` or `write` | Download a report |
 
+## Webhook subscriptions
+
+Outbound webhooks: SCRS sends signed events to your URL (admin).
+
+**Recipe (n8n).** `POST /webhooks` with the events you want and an HTTPS URL. Keep the signing secret and the `X-SCRS-Auth` value shown once. Each delivery carries `X-SCRS-Signature` (`sha256=` HMAC of the exact body), `X-SCRS-Auth` (for n8n Header Auth), `X-SCRS-Event` and `Idempotency-Key`. Profile `summary` sends ids and counts; `full` and `agent` send the whole context.
+
+**Email.** A `mailto:` URL sends the same events as email (summary profile, SMTP configured). `POST /webhooks/{id}:test` sends a `ping`; a `dead` delivery can be redelivered.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/schemas/events` | `read` or `write` or `trigger` | List event schemas |
+| GET | `/schemas/events/{type}/{version}` | `read` or `write` or `trigger` | Get one event JSON Schema |
+| GET | `/webhooks` | `admin` | List subscriptions |
+| POST | `/webhooks` | `admin` | Create a subscription |
+| DELETE | `/webhooks/{id}` | `admin` | Disable a subscription |
+| GET | `/webhooks/{id}` | `admin` | Get a subscription |
+| PATCH | `/webhooks/{id}` | `admin` | Update a subscription |
+| GET | `/webhooks/{id}/deliveries` | `admin` | Delivery log |
+| GET | `/webhooks/{id}/deliveries/{delivery}` | `admin` | Get one delivery |
+| POST | `/webhooks/{id}/deliveries/{delivery}:redeliver` | `admin` | Redeliver an event |
+| POST | `/webhooks/{id}:rotate-secret` | `admin` | Rotate the signing secret |
+| POST | `/webhooks/{id}:test` | `admin` | Send a ping event |
+
+## Ingest
+
+Where GitHub, GitLab and registries send events (push, pull request, image push). These calls queue assessments; a person does not call them.
+
+Each connection has its own receiver (`/ingest/<provider>/<connection>`; registries `/ingest/registry/<provider>/<connection>`), set up with `POST /connections/{id}:webhook` and checked by signature or secret. Automation such as n8n can forward the unchanged body with an `ingest:relay` token.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| POST | `/ingest/github` | signature or secret, or `ingest:relay` | GitHub events (direct or relay) |
+| POST | `/ingest/github/{connection}` | signature or secret, or `ingest:relay` | GitHub events for one connection |
+| POST | `/ingest/gitlab` | signature or secret, or `ingest:relay` | GitLab events (direct or relay) |
+| POST | `/ingest/gitlab/{connection}` | signature or secret, or `ingest:relay` | GitLab events for one connection |
+| POST | `/ingest/registry/{provider}` | `ingest:relay` | Registry push events |
+| POST | `/ingest/registry/{provider}/{connection}` | signature or secret | Registry push events for one connection |
+| POST | `/webhooks/github` | signature or secret | GitHub webhook (direct) |
+
 ## Integrations
 
 Optional two-way link to OWASP Dependency-Track. SCRS uploads each SBOM and, when enabled, reads back what Dependency-Track found and shares triage decisions. SCRS never depends on it being reachable.
@@ -370,38 +379,82 @@ Optional two-way link to OWASP Dependency-Track. SCRS uploads each SBOM and, whe
 | POST | `/integrations/dependency-track:sync` | `admin` | Read Dependency-Track findings now |
 | POST | `/integrations/dependency-track:test` | `admin` | Test the Dependency-Track connection |
 
-## Live events
+## Indicators of compromise
 
-Server-sent events for a browser UI: short notices that something changed (`GET /events`).
+Indicators SCRS matches against what it scans, from manual lists, STIX or CSV files or a TAXII feed.
 
-Events carry ids to fetch, not full payloads, and missed events are not replayed: reload the screen when you connect and on `resync`. Webhooks remain the guaranteed delivery path. A browser `EventSource` cannot send an `Authorization` header, so read the stream with `fetch`.
-
-| Method | Path | Access | What it does |
-| --- | --- | --- | --- |
-| GET | `/events` | `read` or `write` | Stream live events |
-
-## SAST
-
-Static analysis of repository source with bundled analyzers (gosec, Bandit, OpenGrep, Bearer), Go call-graph reachability and npm and PyPI import-level reachability. They run in an isolated container without SCRS secrets. Settings apply platform-wide and per asset.
+Each source has a mode: `hunt` records matches without changing a verdict, `alert` gates by severity, `block` fails the verdict on any match. `alert` and `block` need `admin`. Order: create a source, import or poll it, then `:hunt` to rescan every in-scope repository against it.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/assets/{id}/sast` | `read` or `write` | Asset SAST settings |
-| PUT | `/assets/{id}/sast` | `write` | Replace asset SAST settings |
-| GET | `/reachability/capabilities` | `read` or `write` | Reachability capabilities |
-| GET | `/sast/analyzers` | `read` or `write` | Bundled analyzers |
-| GET | `/sast/rulesets` | `read` or `write` | Custom OpenGrep rulesets |
-| POST | `/sast/rulesets` | `write` | Upload a custom ruleset |
-| DELETE | `/sast/rulesets/{id}` | `admin` | Delete a ruleset |
-| GET | `/sast/rulesets/{id}` | `read` or `write` | Get a ruleset |
-| GET | `/sast/settings` | `read` or `write` | Deployment SAST settings |
-| PUT | `/sast/settings` | `admin` | Replace deployment SAST settings |
+| GET | `/feeds/indicators` | `admin` | Active indicator bundle |
+| PUT | `/feeds/indicators` | `admin` | Import and activate an indicator bundle |
+| GET | `/intel/indicator-sources` | `read` or `write` | Indicator sources |
+| POST | `/intel/indicator-sources` | `write` | Create an indicator source |
+| DELETE | `/intel/indicator-sources/{id}` | `write` | Delete an indicator source |
+| GET | `/intel/indicator-sources/{id}` | `read` or `write` | Indicator source |
+| PATCH | `/intel/indicator-sources/{id}` | `write` | Change an indicator source |
+| GET | `/intel/indicator-sources/{id}/indicators` | `read` or `write` | A source's indicators |
+| PUT | `/intel/indicator-sources/{id}/indicators` | `write` | Replace a source's indicators |
+| GET | `/intel/indicator-sources/{id}/taxii` | `read` or `write` | TAXII feed settings and poll state |
+| PATCH | `/intel/indicator-sources/{id}/taxii` | `admin` | Change a TAXII feed |
+| POST | `/intel/indicator-sources/{id}:hunt` | `write` | Retro-hunt with a source |
+| POST | `/intel/indicator-sources/{id}:import-csv` | `write` | Import indicators from CSV |
+| POST | `/intel/indicator-sources/{id}:import-stix` | `write` | Upload a STIX 2.1 bundle |
+| POST | `/intel/indicator-sources/{id}:poll` | `admin` | Poll a TAXII feed now |
+| POST | `/intel/indicator-sources/{id}:test` | `admin` | Check a TAXII feed's settings |
+
+## YARA rulesets
+
+Rules that run with YARA-X on every repository file and container image layer file. Check rules with `POST /intel/yara-rulesets:validate`, save them, and use `:hunt` to rescan every in-scope repository with them. Rulesets have the same `hunt`, `alert` and `block` modes as indicator sources.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/intel/yara-rulesets` | `read` or `write` | YARA rulesets |
+| POST | `/intel/yara-rulesets` | `write` | Create a YARA ruleset |
+| DELETE | `/intel/yara-rulesets/{id}` | `write` | Delete a YARA ruleset |
+| GET | `/intel/yara-rulesets/{id}` | `read` or `write` | YARA ruleset with its rules |
+| PATCH | `/intel/yara-rulesets/{id}` | `write` | Change a YARA ruleset |
+| POST | `/intel/yara-rulesets/{id}:hunt` | `write` | Retro-hunt with a ruleset |
+| POST | `/intel/yara-rulesets:validate` | `write` | Compile YARA rules without saving |
+
+## Vulnerability data and VEX
+
+Where vulnerability and advisory data comes from. Check sources and trigger a sync (`/intel/vulnerability-sources`), write local advisories for your own packages (`/advisories`), and import VEX documents that mark findings as not affected (`/intel/vex-documents`).
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/advisories` | `read` or `write` | Search advisories |
+| POST | `/advisories` | `write` | Create a local advisory |
+| GET | `/advisories/{id}` | `read` or `write` | Read one advisory |
+| GET | `/advisories/{id}/affected` | `read` or `write` | Components a local advisory names |
+| POST | `/advisories/{id}:withdraw` | `write` | Withdraw a local advisory |
+| GET | `/intel/vex-documents` | `read` or `write` | List imported VEX documents |
+| POST | `/intel/vex-documents` | `write` | Import a VEX document |
+| DELETE | `/intel/vex-documents/{id}` | `admin` | Delete a VEX document |
+| GET | `/intel/vex-statements` | `read` or `write` | Find vendor statements |
+| GET | `/intel/vulnerabilities/{id}` | `read` or `write` | Everything known about a vulnerability |
+| GET | `/intel/vulnerability-sources` | `read` or `write` | List vulnerability and advisory sources |
+| GET | `/intel/vulnerability-sources/{key}` | `read` or `write` | Get one advisory source |
+| PATCH | `/intel/vulnerability-sources/{key}` | `admin` | Enable, disable or reschedule a source |
+| POST | `/intel/vulnerability-sources/{key}:sync` | `admin` | Sync an advisory source now |
+
+## Policies
+
+Optional checks applied to every assessment (admin). `/policies/dependencies` flags very new packages and look-alike package names. `/policies/integrity` sets the behavioural and size signals that raise an integrity alert from pushes. Both start off and change from the next assessment.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/policies/dependencies` | `read` or `write` | Dependency checks policy |
+| PUT | `/policies/dependencies` | `admin` | Change the dependency checks |
+| GET | `/policies/integrity` | `read` or `write` | Behavioural and size signals policy |
+| PUT | `/policies/integrity` | `admin` | Change the integrity signals |
 
 ## LLM providers
 
 Model services that draft QA tests, summarise assessments and review code (admin): OpenAI, Anthropic, Gemini, Azure OpenAI, Mistral, Groq, DeepSeek, xAI, OpenRouter, Together, Ollama or any OpenAI-compatible server. `GET /llm/presets` lists known services.
 
-**Where code may go.** Each provider has a read-only `locality`: `local` is a model server you run (its host is in `SCRS_LLM_PRIVATE_HOSTS`), `hosted` is any other. `source_allowed` says whether it may be sent **source code** (AI review, unit-test generation). A `local` provider always may. A `hosted` provider may only after the platform switch `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` is on and an administrator has called `POST /llm/providers/{id}:allow-source` with a `note` that records why; `:revoke-source` withdraws it, and so does changing the provider's `base_url`. Both steps are audited. Summaries and advisories need neither: the model sees only finding IDs, titles, severities, package names and versions, fixed versions and upstream advisory text, never code, evidence, file paths, secrets or AI review entries.
+**Where code may go.** `locality` is `local` (a model server you run; its host is in `SCRS_LLM_PRIVATE_HOSTS`) or `hosted`. `source_allowed` says whether source code may be sent. A `local` provider always may. A `hosted` one may only after the platform switch `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` is on and an administrator has called `POST /llm/providers/{id}:allow-source` with a `note` that records why. `:revoke-source` withdraws it, and so does changing the provider's `base_url`. Both steps are audited. Summaries and advisories never send code: the model sees only finding IDs, titles, severities, package names and versions, fixed versions and upstream advisory text.
 
 **Declared in the environment.** Providers can be declared at deploy time (`SCRS_LLM_PROVIDERS`, `SCRS_LLM_PROVIDER_<NAME>_*`). They show `managed_by_environment: true`; an administrator can only enable or disable them here.
 
@@ -421,34 +474,50 @@ Model services that draft QA tests, summarise assessments and review code (admin
 | POST | `/llm/providers/{id}:revoke-source` | `admin` | Withdraw the source-code acknowledgement |
 | POST | `/llm/providers/{id}:test` | `admin` | Check an LLM provider |
 
-## Advisories and summaries
+## Incidents
 
-A language model writes an **assessment summary** (headline, risk level, priorities, progress since the last summary) and an **advisory** (explanation, recommended action, urgency) for the most important findings of an assessment. Use any provider; the model sees only findings and advisory text, never code (see the data policy in the API overview).
-
-Flow: `POST /assessments/{id}/summaries` with a `provider_id`, poll `GET /summary-jobs/{id}` until `status` is `succeeded` or `failed`, then read the results in the asset's chronicle: `GET /assets/{id}/chronicle`.
-
-**The chronicle** is the history of an asset's written advisories, summaries and reviews, oldest first. A new summary or advisory *supersedes* the one before it: the old one is kept, marked with `superseded_at`, and the new one names it in `supersedes`, so you can follow a risk from first advisory to fix. Every document has `origin: llm` when a model wrote it, and `provenance` (model, provider, prompt version, what the guard removed). Texts are written by a model from the findings and are not verified.
-
-Which findings are described: vulnerabilities (SCRS's own and Dependency-Track's), malicious dependencies, licence, integrity and configuration findings. Not described, only counted: code analysis (SAST), secret detection, AI code review entries, malware, YARA and IOC matches, QA entries.
+Evidence for a suspected account compromise. `POST /incidents` takes one to twenty logins and a time window, collects the branches, pull requests and signals they touched (read-only) and by default queues fresh scans. It contains nothing: suspending accounts and rotating secrets stay manual.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/assessments/{id}/summaries` | `read` or `write` | List an assessment's summary jobs |
-| POST | `/assessments/{id}/summaries` | `write` or `trigger` | Write advisories and a summary for an assessment |
-| GET | `/assets/{id}/chronicle` | `read` or `write` | The asset's chronicle of advisories, summaries and reviews |
-| GET | `/assets/{id}/chronicle/search` | `read` or `write` | Search the chronicle by meaning |
-| POST | `/knowledge:backfill` | `admin` | Index documents that have no vectors |
-| GET | `/summary-jobs/{id}` | `read` or `write` | Get a summary job |
+| GET | `/incidents` | `read` or `write` | List incidents |
+| POST | `/incidents` | `admin` | Sweep what an account touched |
+| GET | `/incidents/{id}` | `read` or `write` | Read an incident |
 
-## AI review
+## Maintenance
 
-A language model reads the source of an assessed commit and reports production risks, logic bugs, lint-class problems, security weaknesses and performance problems as report-only register entries of type `ai_review`.
-
-**Source code goes to a provider whose `source_allowed` is true**: a self-hosted model (`locality` `local`), or a hosted provider the platform and an administrator have both opted in (see the data policy in the API overview). Each review records where its source went in `locality`. The review is advisory: entries are marked `unverified`, never change a verdict, and carry the file, lines, category, confidence, a plain explanation and a suggested fix, never code. Each review also writes a summary to the asset's chronicle (`GET /assets/{id}/chronicle`). Flow: `POST /assets/{id}/ai-reviews`, poll `GET /ai-reviews/{id}` until `status` is `succeeded` or `failed`, then list the entries with `GET /register?asset_id=` and look for `type: ai_review`. The QA runner's lint entries (`qa_lint`) are separate, and the review shows the model each file's lint findings as context.
+Platform upkeep (admin): run retention now, rescan default branches, re-assess current revisions, requeue dead webhook deliveries, refresh feeds, reset one scope of data, and read the job schedule and component versions.
 
 | Method | Path | Access | What it does |
 | --- | --- | --- | --- |
-| GET | `/ai-reviews/{id}` | `read` or `write` | Get an AI code review |
-| GET | `/assets/{id}/ai-reviews` | `read` or `write` | List an asset's AI code reviews |
-| POST | `/assets/{id}/ai-reviews` | `write` or `trigger` | Review the code with a self-hosted model |
+| POST | `/maintenance/rebuild` | `admin` | Re-assess current revisions |
+| POST | `/maintenance/redeliver-dead` | `admin` | Requeue all dead deliveries |
+| POST | `/maintenance/rescan` | `admin` | Rescan default branches |
+| POST | `/maintenance/reset` | `admin` | Reset one scope of data |
+| POST | `/maintenance/run` | `admin` | Run maintenance now |
+| GET | `/maintenance/schedule` | `admin` | Scheduled jobs and their last runs |
+| POST | `/maintenance/update-sensors` | `admin` | Refresh feeds now |
+| GET | `/maintenance/versions` | `admin` | Platform versions and update check |
+
+## Retention
+
+How long each kind of data is kept (admin). Read and change with `GET` and `PUT /settings/retention`; preview what a change would remove with `POST /settings/retention:preview` before saving or purging.
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/settings/retention` | `admin` | Get the retention policy |
+| PUT | `/settings/retention` | `admin` | Set the retention policy |
+| POST | `/settings/retention:preview` | `admin` | Preview what a retention change deletes |
+| POST | `/settings/retention:purge` | `admin` | Apply the retention policy now |
+
+## Audit and inbound events
+
+The audit log of administrative actions (`GET /audit`) and the log of provider webhooks SCRS received, with replay (`/events/inbound`).
+
+| Method | Path | Access | What it does |
+| --- | --- | --- | --- |
+| GET | `/audit` | `admin` | Query the audit log |
+| GET | `/events/inbound` | `admin` | Inbound event log |
+| GET | `/events/inbound/{id}` | `admin` | Get an inbound event |
+| POST | `/events/inbound/{id}:replay` | `admin` | Replay an event's assessment |
 

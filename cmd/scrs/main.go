@@ -20,6 +20,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/embed"
 	"github.com/ORIBData/scrstack/internal/httpapi"
 	"github.com/ORIBData/scrstack/internal/llm"
+	"github.com/ORIBData/scrstack/internal/mailer"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/storage"
@@ -98,6 +99,11 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	mail, err := newMailer()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	bootstrapToken := os.Getenv("SCRS_BOOTSTRAP_API_TOKEN")
 	if bootstrapToken != "" && len(bootstrapToken) < 32 {
 		fmt.Fprintln(os.Stderr, "SCRS_BOOTSTRAP_API_TOKEN must be at least 32 characters")
@@ -127,6 +133,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "notification store unavailable")
 		os.Exit(1)
 	}
+	events.MailEnabled = mailer.Enabled(mail)
 	defer events.Close()
 	authCtx, authCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	generated, err := store.SyncBootstrap(authCtx, bootstrapToken)

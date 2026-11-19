@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -287,5 +288,145 @@ func TestOpenAPIMediaExamplesAreValid(t *testing.T) {
 	}
 	if checked < 40 {
 		t.Errorf("only %d request and response examples were checked", checked)
+	}
+}
+
+// A response a designer cannot picture is a response they will guess at. Most
+// JSON success responses show an example, either on the response or on the
+// schema it points to. The count of those without one may only go down: when
+// you add an example, lower this number; when you add an operation, give its
+// response one.
+const maxJSONResponsesWithoutExample = 2
+
+func TestOpenAPIJSONResponsesHaveExamples(t *testing.T) {
+	doc, _ := loadContract(t)
+	var missing []string
+	for name, op := range operations(doc) {
+		responses, _ := op["responses"].(map[string]any)
+		for code, r := range responses {
+			if !strings.HasPrefix(code, "2") {
+				continue
+			}
+			rm, ok := r.(map[string]any)
+			if !ok || rm["$ref"] != nil {
+				continue
+			}
+			media := mediaOf(rm)["application/json"]
+			if media == nil || media["example"] != nil || media["examples"] != nil {
+				continue
+			}
+			if ref := str(mapOf(media["schema"])["$ref"]); ref != "" {
+				if mapOf(doc.Components.Schemas[strings.TrimPrefix(ref, "#/components/schemas/")])["example"] != nil {
+					continue
+				}
+			}
+			missing = append(missing, name+" "+code)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > maxJSONResponsesWithoutExample {
+		t.Errorf("%d JSON responses have no example (allowed %d). Add an example to the response or its schema:\n  %s",
+			len(missing), maxJSONResponsesWithoutExample, strings.Join(missing, "\n  "))
+	}
+}
+
+// A description with an unquoted comma or colon inside a one-line mapping is
+// cut at that point and the rest becomes stray keys ("opened and closed in
+// window: null"). The page then shows a truncated sentence. Real keywords only.
+var schemaKeywords = map[string]bool{
+	"type": true, "description": true, "properties": true, "items": true, "required": true, "enum": true, "format": true,
+	"example": true, "examples": true, "default": true, "$ref": true, "additionalProperties": true, "allOf": true,
+	"oneOf": true, "anyOf": true, "const": true, "minimum": true, "maximum": true, "minLength": true, "maxLength": true,
+	"pattern": true, "minItems": true, "maxItems": true, "readOnly": true, "writeOnly": true, "title": true,
+	"deprecated": true, "uniqueItems": true, "not": true, "exclusiveMinimum": true, "exclusiveMaximum": true,
+	"multipleOf": true, "discriminator": true, "unevaluatedProperties": true, "minProperties": true, "maxProperties": true,
+	"patternProperties": true, "propertyNames": true, "contentMediaType": true,
+}
+
+func strayKeys(schema any, path string, report func(string)) {
+	s, ok := schema.(map[string]any)
+	if !ok {
+		return
+	}
+	for k, v := range s {
+		if !schemaKeywords[k] && !strings.HasPrefix(k, "x-") {
+			report(path + ": unknown key " + k)
+			continue
+		}
+		switch k {
+		case "properties", "patternProperties":
+			for name, child := range mapOf(v) {
+				strayKeys(child, path+"."+name, report)
+			}
+		case "items", "additionalProperties", "not", "propertyNames", "unevaluatedProperties":
+			strayKeys(v, path+"[]", report)
+		case "allOf", "oneOf", "anyOf":
+			for _, child := range anyList(v) {
+				strayKeys(child, path, report)
+			}
+		}
+	}
+}
+
+func TestOpenAPIHasNoStrayKeysFromBrokenDescriptions(t *testing.T) {
+	doc, _ := loadContract(t)
+	var problems []string
+	add := func(p string) { problems = append(problems, p) }
+	for name, schema := range doc.Components.Schemas {
+		strayKeys(schema, "schema "+name, add)
+	}
+	known := map[string]bool{"description": true, "content": true, "headers": true, "$ref": true, "required": true, "links": true}
+	paramKeys := map[string]bool{"name": true, "in": true, "required": true, "description": true, "schema": true, "$ref": true, "example": true, "examples": true, "deprecated": true, "style": true, "explode": true, "allowEmptyValue": true}
+	for name, op := range operations(doc) {
+		for _, p := range anyList(op["parameters"]) {
+			for k := range mapOf(p) {
+				if !paramKeys[k] {
+					add(name + ": parameter has unknown key " + k)
+				}
+			}
+			strayKeys(mapOf(p)["schema"], name+" parameter", add)
+		}
+		holders := map[string]any{"requestBody": op["requestBody"]}
+		for code, r := range mapOf(op["responses"]) {
+			holders["response "+code] = r
+		}
+		for where, h := range holders {
+			for k := range mapOf(h) {
+				if !known[k] {
+					add(name + " " + where + ": unknown key " + k)
+				}
+			}
+			for ct, media := range mediaOf(mapOf(h)) {
+				strayKeys(media["schema"], name+" "+where+" "+ct, add)
+			}
+		}
+	}
+	sort.Strings(problems)
+	for _, p := range problems {
+		t.Error(p)
+	}
+}
+
+// The contract is published to designers and integrators, so it describes the
+// API only. It never links to the source repository or points at files in it.
+func TestOpenAPIDoesNotExposeTheRepository(t *testing.T) {
+	text := string(OpenAPI)
+	for _, forbidden := range []string{"ORIBData", "scrstack", "github.com/ORIB"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("the contract mentions %q; keep repository names and links out of it", forbidden)
+		}
+	}
+	for _, token := range regexp.MustCompile(`[A-Za-z0-9_./-]+\.md\b`).FindAllString(text, -1) {
+		t.Errorf("the contract points at the repository file %q; put the detail in the contract instead", token)
+	}
+	var raw map[string]any
+	if err := yaml.Unmarshal(OpenAPI, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["externalDocs"]; ok {
+		t.Error("externalDocs links outside the API; remove it")
+	}
+	if contact, ok := mapOf(raw["info"])["contact"]; ok {
+		t.Errorf("info.contact is set (%v); leave it out", contact)
 	}
 }

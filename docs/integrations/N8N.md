@@ -213,3 +213,21 @@ branch of every in-scope repository not assessed recently. Alternatively set
 `SCRS_RESCAN_INTERVAL_HOURS` and let the worker do it. To re-assess specific
 targets from n8n, use `POST /scrs/v1/assessments:batch` with up to 100 items,
 each with its own `idempotency_key`; the response reports each item's status.
+
+## Email alerts without n8n
+
+When SMTP is configured (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
+`SMTP_FROM`, `SMTP_USE_TLS`), a webhook subscription can send events as email.
+Set its `url` to `mailto:` plus up to 10 comma-separated addresses:
+
+```json
+{"name":"oncall-email","url":"mailto:oncall@example.com,sec@example.com","events":["assessment.failed","qa.failed","system.degraded"]}
+```
+
+- Only the `summary` profile can be mailed, and the URL takes no query string.
+- Messages carry the event type, repository, ref, status, error and a link to the
+  assessment or QA run. They never carry findings or evidence.
+- Retries, the dead-letter list, redelivery and `POST /webhooks/{id}:test` work as
+  for any subscription. The delivery error says `email delivery failed`; the
+  provider's reply is only in the worker log.
+- Creating a `mailto:` subscription is refused (400) while `SMTP_HOST` is unset.

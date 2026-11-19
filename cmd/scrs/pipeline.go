@@ -17,6 +17,7 @@ import (
 	"github.com/ORIBData/scrstack/internal/connections"
 	"github.com/ORIBData/scrstack/internal/depsdev"
 	"github.com/ORIBData/scrstack/internal/llm"
+	"github.com/ORIBData/scrstack/internal/mailer"
 	"github.com/ORIBData/scrstack/internal/netguard"
 	"github.com/ORIBData/scrstack/internal/notify"
 	"github.com/ORIBData/scrstack/internal/qa"
@@ -211,6 +212,10 @@ func pipelineCommand() error {
 			return err
 		}
 		defer store.Close()
+		mail, err := newMailer()
+		if err != nil {
+			return err
+		}
 		providers, err := connections.Open(ctx, cfg.DatabaseURL, cfg.DatabaseSchema, os.Getenv("SCRS_MASTER_KEY"))
 		if err != nil {
 			return err
@@ -224,6 +229,7 @@ func pipelineCommand() error {
 		if err != nil {
 			return err
 		}
+		events.MailEnabled = mailer.Enabled(mail)
 		defer events.Close()
 		store.UseObjects(artifacts)
 		w := worker.Worker{AutoRemediation: os.Getenv("SCRS_REMEDIATION_ENABLED") == "true", Store: store, Connections: providers, Artifacts: artifacts, ScannerURL: setting("SCRS_SCANNER_URL", "http://scrs-scanner:8081/scan"), ScannerToken: os.Getenv("SCRS_SCANNER_API_TOKEN"), Logger: logger, Notify: events}
@@ -240,7 +246,7 @@ func pipelineCommand() error {
 		if w.RemediationURL != "" && len(w.RemediationToken) < 32 {
 			return errors.New("set a random SCRS_REMEDIATION_API_TOKEN of at least 32 characters, separate from the scanner token, when SCRS_REMEDIATION_URL is set")
 		}
-		dispatcher := &notify.Dispatcher{Store: events, Logger: logger, Document: store.ProfileDocument}
+		dispatcher := &notify.Dispatcher{Store: events, Logger: logger, Document: store.ProfileDocument, Mail: mail}
 		go dispatcher.Run(ctx)
 		go w.MonitorFeeds(ctx, 5*time.Minute)
 		rescan := time.Duration(0)

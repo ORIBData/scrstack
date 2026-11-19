@@ -164,6 +164,8 @@ type Store struct {
 	// an n8n container on the same Docker network). Everything else must be
 	// https to a public address.
 	PrivateHosts map[string]bool
+	// MailEnabled allows mailto: destinations; set when SMTP is configured.
+	MailEnabled bool
 }
 
 func Open(ctx context.Context, databaseURL, schema, masterKey string) (*Store, error) {
@@ -301,7 +303,7 @@ func (s *Store) Create(ctx context.Context, in Subscription, actor uuid.UUID) (S
 	if in.Profile == "" {
 		in.Profile = "summary"
 	}
-	if len(in.Name) < 1 || len(in.Name) > 100 || !s.validURL(in.URL) || !validEvents(in.Events) || (in.Profile != "summary" && in.Profile != "full" && in.Profile != "agent") || (in.Profile == "agent" && !in.EgressAck) {
+	if len(in.Name) < 1 || len(in.Name) > 100 || !s.validDestination(in.URL, in.Profile) || !validEvents(in.Events) || (in.Profile != "summary" && in.Profile != "full" && in.Profile != "agent") || (in.Profile == "agent" && !in.EgressAck) {
 		return Subscription{}, "", ErrInput
 	}
 	secret, err := newSecret()
@@ -434,7 +436,7 @@ func (s *Store) Update(ctx context.Context, id uuid.UUID, expected int64, c Chan
 			return Subscription{}, err
 		}
 	}
-	if !s.validURL(sub.URL) || !validEvents(sub.Events) || (sub.Profile != "summary" && sub.Profile != "full" && sub.Profile != "agent") || (sub.Profile == "agent" && !sub.EgressAck) {
+	if !s.validDestination(sub.URL, sub.Profile) || !validEvents(sub.Events) || (sub.Profile != "summary" && sub.Profile != "full" && sub.Profile != "agent") || (sub.Profile == "agent" && !sub.EgressAck) {
 		return Subscription{}, ErrInput
 	}
 	events, _ := json.Marshal(sub.Events)

@@ -234,6 +234,9 @@ change a verdict.
 - **Secrets are never returned.** Connection credentials, provider API keys, webhook secrets
   and token secrets are write-only. Show `has_api_key`, `webhook.configured` and `prefix`.
 - **Times.** RFC 3339 UTC. Dates only (`day`) in timeseries.
+- **Empty lists, not 404.** A list under an asset or assessment that does not exist (qa runs, mirrors,
+  chronicle, revisions, webhook deliveries and similar) answers `200` with empty `items`. A single
+  resource, such as `GET /assessments/{id}/findings`, answers `404`. Check the parent when you need to tell them apart.
 - **Unknown fields.** Ignore properties you do not know; new ones are added without a version
   change.
 
@@ -241,3 +244,23 @@ change a verdict.
 
 These have no endpoint, so do not design screens that depend on them: comment editing, and finding assignment notifications. See `docs/PRD_PROGRESS_AND_AUDIT.md` for the
 full list.
+
+## 8. Finding things in the API docs
+
+The docs page (`/scrs/v1/docs`) opens with every area collapsed. Use the filter box to find an
+operation by name or path, or open an area. Each area starts with the flow its screens follow, the
+states to show and, where one helps, a recipe:
+
+| Building | Open |
+| --- | --- |
+| Dashboard and risk screens | **Risk register**, **Assets**, **Assessments**, **Assessment results**, **System** |
+| Following any long-running work | **Jobs** (poll one place for assessments, QA, AI work, reports and mirrors) |
+| QA screens | **QA setup**, **QA runs**, **QA test generation** |
+| Automation and n8n | **Assessments**, **Webhook subscriptions** (including email), **Ingest**, **Jobs** |
+| Threat data | **Indicators of compromise**, **YARA rulesets**, **Vulnerability data and VEX**, **Policies** |
+| Administration | **Connections**, **Tokens**, **Maintenance**, **Retention**, **Audit and inbound events**, **Incidents** |
+
+Every JSON response carries an example. Responses that have none yet are tracked by the quality
+gate in `api/docs_quality_test.go`, which only lets that number go down. The schemas section at the
+bottom of the docs page lists every type for client generation. The page is read-only on purpose
+(no "Try it out"): call the API from your own client with a token of the narrowest scope.

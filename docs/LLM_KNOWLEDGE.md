@@ -122,3 +122,19 @@ Real linters run in the QA runner as a lint job kind ([QA_TESTING.md](QA_TESTING
 7. **pgvector backend**, if your server has it.
 
 **Static analysis in the review.** Each file's prompt now lists what the static analyzers (gosec, Bandit, OpenGrep, Bearer) already reported for it in the assessment under review (up to 15 notes, most severe first, skipping lines suppressed in code), inside an untrusted-data block, with the instruction not to repeat them and to look for what they missed. They are the linters this stack has; running dedicated linters (ESLint, Ruff, golangci-lint) in the QA runner remains unbuilt.
+
+## Data policy, screening and budgets (API reference)
+
+This is the full text behind the short **LLM providers**, **Advisories and summaries** and **AI review** sections of the API contract.
+
+**Where code may go.** Each provider has a read-only `locality`: `local` is a model server you run (its host is in `SCRS_LLM_PRIVATE_HOSTS`), `hosted` is any other. `source_allowed` says whether it may be sent **source code** (AI review, unit-test generation). A `local` provider always may. A `hosted` provider may only after the platform switch `SCRS_LLM_ALLOW_SOURCE_TO_HOSTED=true` is on and an administrator has called `POST /llm/providers/{id}:allow-source` with a `note` that records why; `:revoke-source` withdraws it, and so does changing the provider's `base_url`. Both steps are audited. Summaries and advisories need neither: the model sees only finding IDs, titles, severities, package names and versions, fixed versions and upstream advisory text, never code, evidence, file paths, secrets or AI review entries.
+
+**Declared in the environment.** Providers can be declared at deploy time (`SCRS_LLM_PROVIDERS`, `SCRS_LLM_PROVIDER_<NAME>_*`). They show `managed_by_environment: true`; an administrator can only enable or disable them through the API.
+
+**Screening and trust.** Every prompt and answer passes a guard that redacts credentials, keys, tokens and the platform's own secrets and removes images, scripts and tracking links from answers. It is a safety net, not a guarantee. Model output is not verified: findings are report-only `ai_review` entries marked `unverified` and never change a verdict.
+
+**Budget.** Model work stops at the assessment's token ceiling (`SCRS_LLM_ASSESSMENT_INPUT_TOKENS`, `SCRS_LLM_ASSESSMENT_OUTPUT_TOKENS`) and says so in `incomplete`. A hosted provider, billed per token, also has a monthly cap across all its work (`SCRS_LLM_MONTHLY_INPUT_TOKENS`, `SCRS_LLM_MONTHLY_OUTPUT_TOKENS`, calendar month UTC); work resumes next month or when you raise it. A self-hosted provider has no cap. An answer cut off at the provider's `max_tokens` does not count as a review of that file.
+
+**The chronicle.** `GET /assets/{id}/chronicle` is the history of an asset's written advisories, summaries and reviews, oldest first. A new summary or advisory supersedes the one before it: the old one is kept, marked with `superseded_at`, and the new one names it in `supersedes`. Every document has `origin: llm` when a model wrote it and a `provenance` (model, provider, prompt version, what the guard removed).
+
+**What is described.** Vulnerabilities (SCRS's own and Dependency-Track's), malicious dependencies, licence, integrity and configuration findings. Not described, only counted: code analysis (SAST), secret detection, AI code review entries, malware, YARA and IOC matches, QA entries.

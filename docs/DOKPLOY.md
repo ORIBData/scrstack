@@ -182,6 +182,8 @@ outages never block scanning; the previous copy is carried forward.
 | `SCRS_RELAY_ENABLED` | API | Accept n8n relay deliveries (bearer `ingest:relay` token) on the GitHub, GitLab and shared registry receivers. Per-connection registry receivers do not need it |
 | `SCRS_PUBLIC_BASE_URL` | API, worker | Absolute links in webhook payloads; deployment acceptance |
 | `SCRS_WEBHOOK_PRIVATE_HOSTS` | API, worker | Hostnames allowed as http or private-address webhook targets |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, `SMTP_USE_TLS` | API, worker | Transactional email through any SMTP provider. Empty `SMTP_HOST` disables it. Port 465 with `SMTP_USE_TLS=true` is implicit TLS, otherwise STARTTLS. Needed on both: the API accepts `mailto:` subscriptions and the worker sends them |
+| `SMTP_DRIVER` | API, worker | Optional: `smtp` (default when `SMTP_HOST` is set), `log` (discards, for development) or `none` |
 | `SCRS_TAXII_PRIVATE_HOSTS` | API, worker | TAXII server hostnames allowed to resolve to private addresses, such as an OpenCTI on the same network |
 | `SCRS_EVENT_MAX_BYTES`, `SCRS_EVENT_FIELD_MAX`, `SCRS_EVENT_REDACT` | API, worker | Context-document limits and JSON Pointer redaction |
 | `SCRS_MASS_DELETION_FILES` | API | Mass-deletion alert threshold (default 50 files) |
